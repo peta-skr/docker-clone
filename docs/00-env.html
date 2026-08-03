@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第00章 Linux の中に入る — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第00章 / 全10章 · 層: ENV · 読了目安 2〜3時間</div>
+    <div class="eyebrow"><span>Env</span><span class="depth">— 地面を用意する</span></div>
+    <h1>Linux の中に入る</h1>
+    <p class="lede">はっきり言います。<strong>この教材の最大のリスクは、技術ではなく開発環境です。</strong> <code>pivot_root</code> より、namespace より、cgroup より、「特権付きの Linux をどう用意するか」でつまずく人のほうが多い。だからこの章を独立した 1 章として立てました。地面をならし、そのうえで<strong>実装を 1 行も書く前に</strong>、この環境で何ができて何ができないかを実際にコマンドを打って確かめます。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p>特権付きの Linux 開発環境を用意し、その中で <strong>7 つの疎通実験</strong>を自分の手で走らせて、次の 5 つに自分の環境で答えを出すこと。</p>
+      <ol>
+        <li>namespace は作れるか（作れなければ、この教材は成立しない）</li>
+        <li>cgroup は書けるか。そして<strong>書けたとして本当に効くか</strong></li>
+        <li>overlayfs はマウントできるか</li>
+        <li>レジストリに届くか</li>
+        <li>実験したあと、環境を<strong>元通りに片付けられるか</strong></li>
+      </ol>
+      <p>仕上げに、実験の痕跡が 1 つも残っていないことを確認出力で確かめます。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#risk">なぜ環境が最大のリスクなのか</a></li>
+        <li><a href="#nest">「Docker を作るために Docker を使う」</a></li>
+        <li><a href="#plans">案A（特権 Docker）と案B（WSL2）</a></li>
+        <li><a href="#step-1">Step 1 · カーネルと cgroup のバージョンを見る</a></li>
+        <li><a href="#step-2">Step 2 · namespace が作れるか（生命線）</a></li>
+        <li><a href="#step-3">Step 3 · cgroup の正体を暴く（hybrid 構成の発見）</a></li>
+        <li><a href="#step-4">Step 4 · 上限は「書けた」ではなく「効く」か</a></li>
+        <li><a href="#step-5">Step 5 · overlayfs をマウントする</a></li>
+        <li><a href="#step-6">Step 6 · レジストリのトークンを取る</a></li>
+        <li><a href="#step-7">Step 7 · ⚠ 後片付け（ここが本題）</a></li>
+        <li><a href="#compose">docker-compose.yml を逐行で読む</a></li>
+        <li><a href="#gomod">go.mod — require が空であること</a></li>
+        <li><a href="#verdict">判定と縮退 — この教材のスコープを確定する</a></li>
+      </ol>
+    </div>
+
+    <h2 id="risk">なぜ環境が最大のリスクなのか</h2>
+
+    <p>序章で「コンテナはただのプロセスだ」と書きました。裏を返すと、<strong>コンテナを作る道具はすべて Linux カーネルの中にある</strong>ということです。namespace も、cgroup も、overlayfs も、<code>pivot_root</code> も、カーネルが提供している機能そのものです。ライブラリでも、フレームワークでも、エミュレータでもありません。</p>
+
+    <p>ということは、<strong>Linux カーネルが無いところでは 1 行も動きません。</strong> Windows でも macOS でも、ネイティブには動きません。「Go はクロスプラットフォームだから」は関係ありません。Go のコードはコンパイルできますが、<code>syscall.Mount</code> を呼んだ相手がいません。</p>
+
+    <p>しかも、Linux ならどこでも同じというわけでもありません。ここが厄介です。</p>
+
+    <ul>
+      <li><strong>特権が要ります。</strong> <code>mount</code>、<code>pivot_root</code>、<code>/sys/fs/cgroup</code> への書き込みは、いずれも <code>CAP_SYS_ADMIN</code> 相当を必要とします。一般ユーザ権限だと <code>EPERM</code>（Operation not permitted）で落ちます。</li>
+      <li><strong>cgroup には v1 と v2 があります。</strong> どちらが有効かは環境で違います。しかも<strong>混在している環境</strong>（hybrid 構成）もあります。実際、この教材を書いた環境がそれでした。</li>
+      <li><strong>v2 が動いていても、使いたいコントローラが v2 側にあるとは限りません。</strong> これは Step 3 で実際に踏みます。</li>
+      <li><strong>ネットワークの出口が塞がれていることがあります。</strong> 会社や学校のネットワークでは、レジストリのレイヤ配信ドメインだけが通らない、ということが実際に起きます。これも踏みました。</li>
+    </ul>
+
+    <div class="ascii">この教材が要求するもの
+
+  ┌────────────────────────────────────────────┐
+  │  Linux カーネル                              │  ← 必須。エミュレータ不可
+  │    + 特権（CAP_SYS_ADMIN 相当）               │  ← 必須。無いと全部 EPERM
+  │    + cgroup（v2 または v1）                   │  ← 04章。どちらでもよい
+  │    + overlayfs                              │  ← 06章。無ければ縮退できる
+  │    + レジストリへの HTTPS                     │  ← 05章。無ければ縮退できる
+  └────────────────────────────────────────────┘
+
+  上2つが無いと教材が成立しない。下3つは無くても迂回路がある。
+  ★どれが有るかを「前提にせず、確かめる」のがこの章の仕事。</div>
+
+    <p>この章の姿勢を一言で書くと、<strong>「前提にせず、確かめる」</strong>です。ドキュメントに「cgroup v2 が使えます」と書いてあっても信じません。実際にディレクトリを作り、値を書き、<strong>超過させて殺されるところまで見ます</strong>。ここを飛ばすと、第04章まで進んでから「この環境では上限が効かない」と気づくことになります。そのときの手戻りは、この章に費やす 2〜3 時間よりずっと大きくなります。</p>
+
+    <h2 id="nest">「Docker を作るために Docker を使う」</h2>
+
+    <p>さて、Windows や macOS を使っている読者はどうするか。答えは愉快です。<strong>Docker で特権付きの Linux コンテナを 1 つ立てて、その中で開発します。</strong></p>
+
+    <p>読み返してください。<strong>Docker を作るために Docker を使う</strong>のです。しかもその中で、さらにコンテナを起動します。三重の入れ子です。</p>
+
+    <div class="ascii">入れ子の構造
+
+  ┌─ あなたの PC（Windows / macOS / Linux）────────────┐
+  │                                                    │
+  │  ┌─ Docker Desktop の Linux ─────────────────────┐ │
+  │  │                                                │ │
+  │  │  ┌─ 特権コンテナ「dev」（golang:1.24-bookworm）─┐ │ │
+  │  │  │   ここで開発・ビルド・テストをする            │ │ │
+  │  │  │                                            │ │ │
+  │  │  │   ┌─ mydocker が起動するコンテナ ─────────┐  │ │ │
+  │  │  │   │  自作ランタイムが作った alpine        │  │ │ │
+  │  │  │   └──────────────────────────────────────┘  │ │ │
+  │  │  └────────────────────────────────────────────┘ │ │
+  │  └────────────────────────────────────────────────┘ │
+  └────────────────────────────────────────────────────┘
+
+  ★内側の2枚は、どちらも「namespace で区切られたプロセス」でしかない。</div>
+
+    <p>ふざけているように見えますが、これは実務でも普通に使われる手です。ビルド環境をコンテナに閉じ込めておくと、「自分の PC では動くのに」問題が起きません。<code>golang:1.24-bookworm</code> という公式イメージを使えば、Go のバージョンまで全員そろいます。</p>
+
+    <p>そして教育的にも良い入れ子です。<strong>いちばん外側の「dev コンテナ」も、いちばん内側の「mydocker が起動したコンテナ」も、原理はまったく同じ</strong>だからです。どちらも namespace で区切られ、cgroup で締められ、根を挿げ替えられたプロセスです。違いは、片方を Docker が作り、もう片方をあなたが作る、というだけです。この章の終わりには、外側の箱の中身が全部見えるようになっています。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · 特権（privileged）とは何を意味するか</div>
+      <p>Linux では root の権限が <strong>capability</strong> という単位に細分化されています。<code>CAP_SYS_ADMIN</code>（mount や pivot_root ができる）、<code>CAP_NET_ADMIN</code>（ネットワーク設定ができる）、<code>CAP_SYS_BOOT</code>（再起動できる）など、40 個ほどあります。</p>
+      <p>通常の Docker コンテナには、この一部しか与えられません。だから <code>docker run ubuntu mount ...</code> は失敗します。<code>--privileged</code>（compose では <code>privileged: true</code>）を付けると<strong>ほぼ全部が与えられ</strong>、ホストとほぼ同等の権限になります。便利ですが、<strong>コンテナの隔離はほぼ無くなります</strong>。開発用途に限って使ってください。本番で <code>--privileged</code> を見かけたら、それは事故です。</p>
+    </div>
+
+    <h2 id="plans">案A（特権 Docker）と案B（WSL2）</h2>
+
+    <p>環境の用意には 2 つの道があります。<strong>案A を推奨します</strong>が、理由も含めて比べます。</p>
+
+    <table>
+      <tr><th>観点</th><th>案A · 特権 Docker コンテナ（推奨）</th><th>案B · WSL2 の Linux を直接使う</th></tr>
+      <tr><td>使える OS</td><td>Windows / macOS / Linux。Docker が動けばどこでも</td><td>Windows のみ</td></tr>
+      <tr><td>用意の手間</td><td><code>docker compose run --rm dev</code> の 1 行</td><td>WSL2 と Go の導入が別途必要</td></tr>
+      <tr><td>Go のバージョン</td><td><code>golang:1.24-bookworm</code> で固定される</td><td>自分で入れる。ディストリの都合でずれることがある</td></tr>
+      <tr><td>cgroup</td><td><code>cgroup: host</code> でホストの階層をそのまま使う</td><td>⚠ <strong>環境によって v2 の有効/無効も、使えるコントローラも違う</strong></td></tr>
+      <tr><td>実験で汚したときの復旧</td><td>コンテナを捨てれば終わり</td><td>自分の Linux が汚れる。<code>rmdir</code> し忘れが残る</td></tr>
+      <tr><td>ホストへの影響</td><td>マウントの伝播を切っていれば基本的に無い</td><td>直接触るので影響が出うる</td></tr>
+      <tr><td>速度</td><td>macOS / Windows では VM 越しになるぶん遅い</td><td>ネイティブに近く、速い</td></tr>
+    </table>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 案B は「たぶん v2 が使える」で始めてはいけない</div>
+      <p>WSL2 の cgroup まわりは、Windows のバージョン、WSL のカーネル、<code>/etc/wsl.conf</code> や <code>.wslconfig</code> の設定によって<strong>有効なバージョンもコントローラも変わります</strong>。「WSL2 は cgroup v2 です」と書いてある記事を読んで前提にすると、第04章で静かに失敗します。</p>
+      <p>案B を選ぶなら、<strong>この章の Step 3 と Step 4 を必ず自分の環境で走らせてください。</strong> 走らせて答えが出れば、それが v1 でも v2 でも問題ありません。この教材の実装は両方に対応しています。困るのは「確かめずに前提にすること」だけです。</p>
+    </div>
+
+    <p>なお、すでに Linux マシンを root で使えるなら、<strong>案A の中身をそのまま自分の Linux で実行しても構いません</strong>。実際、この教材の実測はそうやって取りました。作業していた環境がすでに特権付きの Linux コンテナの中で、<code>unshare</code> も <code>mount -t overlay</code> も <code>mkdir /sys/fs/cgroup/...</code> もそのまま通ったからです。つまり案A が要求する条件を最初から満たしていました。それでも読者が同じ環境を再現できるように、案A そのものである <code>docker-compose.yml</code> を成果物として用意してあります。この章の後半で全文を読みます。</p>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>カーネルと cgroup のバージョンを見る</h2>
+
+    <p>環境に入ったら、最初にやることは自己紹介です。カーネルは何か、自分は root か、cgroup はどのバージョンか。3 行で済みます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>この 3 つを打ってください。値はあなたの環境で違って構いません。<strong>大事なのは「見た」ことです。</strong></p>
+      <pre class="term"><code><span class="ps">$</span> uname -r
+<span class="out">6.18.5</span>
+<span class="ps">$</span> stat -fc %T /sys/fs/cgroup/
+<span class="out">tmpfs</span>
+<span class="ps">$</span> id
+<span class="out">uid=0(root) gid=0(root) groups=0(root)</span></code></pre>
+    </div>
+
+    <p>1 行目、カーネルは <strong>6.18.5</strong>。namespace も cgroup v2 も overlayfs も、とっくに入っている世代です。3 行目、<code>uid=0(root)</code>。root です。ここが root でなければ、この先ほぼ全部 <code>EPERM</code> で落ちるので、環境の用意に戻ってください。</p>
+
+    <p>問題は 2 行目です。<strong><code>stat -fc %T /sys/fs/cgroup/</code> が <code>tmpfs</code> を返しました。</strong></p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · stat -fc %T が何を答えているか</div>
+      <p><code>stat -f</code> は、指定したパスが<strong>どのファイルシステムの上に載っているか</strong>を調べます。<code>%T</code> はその種別を人間が読める名前で出す指定です。</p>
+      <p>cgroup v2 が素直に有効な環境では、<code>/sys/fs/cgroup</code> は cgroup2 ファイルシステムそのものなので <code>cgroup2fs</code> と返ります。v1 だけの環境では、<code>/sys/fs/cgroup</code> 自体は単なる置き場（tmpfs）で、その下にコントローラごとのディレクトリが別々にマウントされるので <code>tmpfs</code> と返ります。</p>
+      <p>つまりこの 1 行は「v2 か、そうでないか」の<strong>目安</strong>になります。目安です。断定ではありません。その理由を Step 3 で見ます。</p>
+    </div>
+
+    <p>素直に読むと「この環境は cgroup v2 ではない」となります。多くの手順書はここで「v2 が使えないので cgroup 機能は諦める」という分岐に倒れます。<strong>しかしこれで結論を出すのは早すぎます。</strong> 実際この環境は、v1 と v2 が<em>同時に</em>存在する hybrid 構成でした。Step 3 で掘ります。</p>
+
+    <p>ついでに、これから使う道具のバージョンも見ておきます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> go version
+<span class="out">go version go1.24.7 linux/amd64</span>
+<span class="ps">$</span> python3 --version
+<span class="out">Python 3.11.15</span></code></pre>
+      <p>Go は実装に、Python は疎通実験と E2E テストに使います。Python は標準ライブラリしか使いません。</p>
+    </div>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>namespace が作れるか（生命線）</h2>
+
+    <p>ここが生命線です。<strong>namespace が作れなければ、この教材は 1 章目から成立しません。</strong> 逆にここさえ通れば、あとは全部なんとかなります。</p>
+
+    <p>いきなり Go を書く必要はありません。<code>unshare</code> というコマンドが最初から入っていて、これが「新しい名前空間を作ってからコマンドを実行する」道具です。まず PID 名前空間だけを作ってみます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>まず <code>--fork</code> を付けずに。<code>$$</code> はシェルが自分の PID に展開します。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 25171</span></code></pre>
+      <p>次に <code>--fork</code> を付けて。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 1</span></code></pre>
+    </div>
+
+    <p><strong>PID が 1 になりました。</strong> 名前空間が効いています。そして <code>--fork</code> の有無で結果が変わったことに注目してください。ここが PID 名前空間の独特なところです。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · PID 名前空間は「次の子」から効く</div>
+      <p><code>unshare(CLONE_NEWPID)</code> を呼んだプロセス<strong>自身</strong>は、新しい PID 名前空間には移りません。移るのは<strong>そのあとに作られる子プロセス</strong>です。だから <code>--fork</code> 無しだと、呼んだ本人は元の名前空間に残ったままで、PID は 25171 のような普通の値になります。</p>
+      <p><code>--fork</code> を付けると <code>unshare</code> が自分で <code>fork</code> し、その子の中でコマンドを実行します。この子は新しい名前空間の最初の住人なので、PID 1 を名乗ります。</p>
+      <p><strong>この癖は第01章で正面から効いてきます。</strong> Go で名前空間を作るときも「自分を作り直す」必要があり、それが <code>/proc/self/exe</code> による re-exec という手法につながります。今は「PID 名前空間は次の子から効く」とだけ覚えてください。</p>
+    </div>
+
+    <p>では、その名前空間の中でプロセス一覧を見てみます。ここで<strong>この章でいちばん驚く結果</strong>が出ます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>PID 名前空間の中で、プロセスの個数を数えます。ホスト側と比べてください。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork sh -c 'ps -e --no-headers | wc -l'
+<span class="out">87</span>
+<span class="ps">$</span> ps -e --no-headers | wc -l
+<span class="out">85</span></code></pre>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 隔離したのに、ホストより多い</div>
+      <p>名前空間の中で <strong>87 個</strong>、ホスト側で <strong>85 個</strong>。隔離したはずが<strong>増えました</strong>。「隔離に失敗している」ように見えますが、そうではありません。名前空間は正しく作られています。</p>
+      <p>犯人は <code>/proc</code> です。<code>ps</code> は <code>/proc</code> 以下のディレクトリを読んでプロセス一覧を作ります。<code>unshare --pid</code> は PID 名前空間を作りますが、<strong><code>/proc</code> は貼り替えません</strong>。だから <code>ps</code> はホストの <code>/proc</code> を読み、ホストのプロセスを列挙します。増えているのは <code>unshare</code> 自身と <code>sh</code> が加わったぶんです。</p>
+      <p><strong>これがこの教材でいちばん重要な壊れ方です。</strong> 第03章で正面から扱います。「名前空間が効いていないのではなく、<code>/proc</code> が古い」という切り分けができるかどうかが、この教材の中盤の分かれ目になります。</p>
+    </div>
+
+    <p>解決策も先に見ておきます。<code>--mount-proc</code> を付けると、<code>unshare</code> が新しいマウント名前空間の中で <code>/proc</code> を貼り直してくれます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork --mount-proc sh -c 'ps -e --no-headers | wc -l'
+<span class="out">3</span>
+<span class="ps">$</span> unshare --pid --fork --mount-proc ps aux
+<span class="out">USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.0   7900  3932 ?        R    22:14   0:00 ps aux</span></code></pre>
+    </div>
+
+    <p><strong>通りました。</strong> <code>ps aux</code> が、自分自身を PID 1 として 1 行だけ表示しています。85 個のプロセスが動いている同じマシンで、です。視界が区切られていることが目で見えました。</p>
+
+    <p>→ <strong>namespace による隔離は Must のまま進められます。この教材が成立します。</strong></p>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>cgroup の正体を暴く（hybrid 構成の発見）</h2>
+
+    <p>Step 1 で <code>stat</code> が <code>tmpfs</code> を返しました。素直に v2 を見にいって、そこから掘っていきます。この Step は<strong>推理小説のように進みます</strong>ので、順番に読んでください。</p>
+
+    <h3>3.1 まず素直に v2 を見る（→ 失敗）</h3>
+
+    <p>cgroup v2 では、<code>/sys/fs/cgroup/cgroup.controllers</code> に「この階層で使えるコントローラ」が一覧されます。まずそれを読みます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> cat /sys/fs/cgroup/cgroup.controllers
+<span class="out">cat: /sys/fs/cgroup/cgroup.controllers: No such file or directory</span>
+<span class="ps">$</span> cat /sys/fs/cgroup/cgroup.subtree_control
+<span class="out">cat: /sys/fs/cgroup/cgroup.subtree_control: No such file or directory</span></code></pre>
+    </div>
+
+    <p>そもそもファイルがありません。<code>/sys/fs/cgroup</code> が cgroup2fs ではなく tmpfs だからです。<strong>ここで「v2 は無い」と結論して先へ進みたくなります。まだです。</strong></p>
+
+    <h3>3.2 何がマウントされているのか調べる</h3>
+
+    <p><code>/sys/fs/cgroup</code> が tmpfs なら、その下に何か置かれているはずです。見ます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> ls -la /sys/fs/cgroup/
+<span class="out">total 0
+drwxrwxrwt 10 root root 200 Aug  2 07:26 .
+drwxr-xr-x 11 root root   0 Aug  2 07:26 ..
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 blkio
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 cpu
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 cpuacct
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 devices
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 freezer
+dr-xr-xr-x  3 root root   0 Aug  2 07:26 memory
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 pids
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 unified</span></code></pre>
+      <p>コントローラの名前がディレクトリとして並んでいます。そして最後に <code>unified</code> という見慣れないものがあります。マウントの一覧を見ると正体が分かります。</p>
+      <pre class="term"><code><span class="ps">$</span> mount | grep cgroup
+<span class="out">tmpfs on /sys/fs/cgroup type tmpfs (rw,relatime)
+cgroup on /sys/fs/cgroup/cpu type cgroup (rw,relatime,cpu)
+cgroup on /sys/fs/cgroup/cpuacct type cgroup (rw,relatime,cpuacct)
+cgroup on /sys/fs/cgroup/memory type cgroup (rw,relatime,memory)
+cgroup on /sys/fs/cgroup/devices type cgroup (rw,relatime,devices)
+cgroup on /sys/fs/cgroup/freezer type cgroup (rw,relatime,freezer)
+cgroup on /sys/fs/cgroup/blkio type cgroup (rw,relatime,blkio)
+cgroup on /sys/fs/cgroup/pids type cgroup (rw,relatime,pids)
+cgroup2 on /sys/fs/cgroup/unified type cgroup2 (rw,relatime)</span></code></pre>
+    </div>
+
+    <p>謎が解けました。<strong><code>/sys/fs/cgroup</code> は tmpfs の「置き場」で、その下に v1 のコントローラが 1 つずつ別々にマウントされ、さらに <code>unified/</code> に cgroup2 も<em>同時に</em>マウントされています。</strong> v1 と v2 が同居しています。これが典型的な <strong>hybrid 構成</strong>です。</p>
+
+    <div class="ascii">この環境の cgroup 配置
+
+  /sys/fs/cgroup/            ← tmpfs（ただの置き場。cgroup ではない）
+    ├─ cpu/       ← cgroup  v1
+    ├─ cpuacct/   ← cgroup  v1
+    ├─ memory/    ← cgroup  v1   ★上限を書けるのはここ
+    ├─ devices/   ← cgroup  v1
+    ├─ freezer/   ← cgroup  v1
+    ├─ blkio/     ← cgroup  v1
+    ├─ pids/      ← cgroup  v1
+    └─ unified/   ← cgroup2 v2   ★あるが memory は見えない
+
+  stat -fc %T /sys/fs/cgroup/ は一番上の tmpfs だけを見ている。
+  → 「v2 が無い」ようにも「v2 がある」ようにも見えない。だから掘る。</div>
+
+    <p><code>/proc/self/cgroup</code> を読むと、同じことがプロセスの側から見えます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> cat /proc/self/cgroup
+<span class="out">7:pids:/
+6:blkio:/
+5:freezer:/
+4:devices:/
+3:memory:/process_api/019fc9b0-aeea-7122-9c35-01e1302d5859
+2:cpuacct:/
+1:cpu:/
+0::/</span></code></pre>
+      <p>数字付きの行が v1、<code>0::/</code> の行が v2 です。<strong>両方あります。</strong></p>
+    </div>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · cgroup v1 と v2 の違い、そして hybrid</div>
+      <p><strong>v1</strong> は「コントローラごとに独立した階層」を作ります。<code>memory</code> の木、<code>cpu</code> の木、<code>pids</code> の木がそれぞれ別にあり、1 つのプロセスが木ごとに違う位置にいられます。柔軟ですが、整合を取るのが大変でした。</p>
+      <p><strong>v2</strong> は「階層は 1 本（統一階層 / unified hierarchy）、その各ノードで使うコントローラを選ぶ」形に整理されました。ファイル名も <code>memory.max</code>、<code>cpu.max</code>、<code>pids.max</code> と揃っています。</p>
+      <p><strong>hybrid</strong> は移行期の構成で、両方が同時にマウントされています。ここで重要なのが次の一文です — <strong>1 つのコントローラは、v1 か v2 のどちらか一方にしか結び付けられません。</strong> <code>memory</code> を v1 が握っていたら、v2 側からは <code>memory</code> は見えません。次でこれを確かめます。</p>
+    </div>
+
+    <h3>3.3 v2 側で memory / cpu / pids が使えるか（→ 使えない）</h3>
+
+    <p><code>unified/</code> に cgroup2 があるなら、そこで <code>memory.max</code> を使えばよさそうです。使えるコントローラの一覧を読みます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> cat /sys/fs/cgroup/unified/cgroup.controllers
+<span class="out">cpuset hugetlb</span></code></pre>
+      <p>念のため、自分で新しい cgroup2 をマウントして同じか確かめます。</p>
+      <pre class="term"><code><span class="ps">$</span> mkdir -p /tmp/cg2 &amp;&amp; mount -t cgroup2 none /tmp/cg2
+<span class="ps">$</span> cat /tmp/cg2/cgroup.controllers
+<span class="out">cpuset hugetlb</span></code></pre>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · cgroup2 がマウントできても memory が使えるとは限らない</div>
+      <p><strong>この章でいちばん重要な発見です。</strong> cgroup2 自体はマウントできます。<code>cgroup.controllers</code> も読めます。しかし中身は <code>cpuset hugetlb</code> の 2 つだけで、<strong><code>memory</code> も <code>cpu</code> も <code>pids</code> も v2 側には見えません</strong>。</p>
+      <p>理由は上の LINUX メモのとおりです。この環境では <code>memory</code> / <code>cpu</code> / <code>pids</code> が v1 に取られているので、v2 からは使えません。</p>
+      <p>怖いのは<strong>失敗の仕方</strong>です。v2 だけを前提に書いた実装は、この環境では例外を投げません。<code>mkdir</code> は成功し、しかし <code>memory.max</code> というファイルがそもそも作られないので、書き込もうとした時点で初めて気づきます。あるいは、書き込みエラーを握りつぶしていると<strong>「上限を設定したつもりで、まったく効いていないコンテナ」</strong>ができあがります。静かな失敗です。</p>
+    </div>
+
+    <h3>3.4 v1 側なら書けるか（→ 書ける）</h3>
+
+    <p>v2 が駄目でも、v1 の <code>memory</code> は目の前にあります。実際に書けるか試します。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>ディレクトリを 1 つ作るだけで、その中に制御用のファイルがカーネルによって自動的に生えます。</p>
+      <pre class="term"><code><span class="ps">$</span> mkdir -p /sys/fs/cgroup/memory/smoketest
+<span class="ps">$</span> echo 10485760 &gt; /sys/fs/cgroup/memory/smoketest/memory.limit_in_bytes
+<span class="ps">$</span> cat /sys/fs/cgroup/memory/smoketest/memory.limit_in_bytes
+<span class="out">10485760</span>
+<span class="ps">$</span> mkdir -p /sys/fs/cgroup/pids/smoketest
+<span class="ps">$</span> echo 64 &gt; /sys/fs/cgroup/pids/smoketest/pids.max
+<span class="ps">$</span> cat /sys/fs/cgroup/pids/smoketest/pids.max
+<span class="out">64</span></code></pre>
+    </div>
+
+    <p>書けました。10485760 は 10 MiB です。<code>memory</code> ディレクトリの中身も見ておきます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> ls /sys/fs/cgroup/memory/
+<span class="out">cgroup.clone_children  memory.limit_in_bytes      memory.stat
+cgroup.event_control   memory.max_usage_in_bytes  memory.swappiness
+cgroup.procs           memory.memsw.limit_in_bytes memory.usage_in_bytes
+memory.failcnt         memory.oom_control         memory.use_hierarchy
+...</span></code></pre>
+      <p><code>cpu</code> のほうも、CPU 制限に必要な <code>cpu.cfs_quota_us</code> と <code>cpu.cfs_period_us</code> が揃っています。</p>
+      <pre class="term"><code><span class="out">cgroup.clone_children
+cgroup.procs
+cgroup.sane_behavior
+cpu.cfs_burst_us
+cpu.cfs_period_us
+cpu.cfs_quota_us
+cpu.idle
+cpu.rt_period_us
+cpu.rt_runtime_us
+cpu.shares</span></code></pre>
+    </div>
+
+    <p>この一覧のうち、第04章で使うのは <code>memory.limit_in_bytes</code>（メモリ上限）、<code>cpu.cfs_quota_us</code> と <code>cpu.cfs_period_us</code>（CPU 上限）、<code>pids.max</code>（プロセス数上限）、そして<strong><code>cgroup.procs</code></strong> です。最後の <code>cgroup.procs</code> がいちばん大事で、ここに PID を書いて初めて上限が「そのプロセスに」効きます。<strong>ディレクトリを作って値を書いただけでは、誰にも効いていません。</strong></p>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>上限は「書けた」ではなく「効く」か</h2>
+
+    <p>ここがこの章でいちばん大事な Step です。</p>
+
+    <p><strong><code>cat memory.limit_in_bytes</code> が 10485760 を返すことは、上限が効いている証拠にはなりません。</strong> それは「ファイルに値が書かれた」ことの証拠にすぎません。カーネルが本当にその上限で殺しにくるかどうかは、別の話です。</p>
+
+    <p>確かめる方法は 1 つしかありません。<strong>超過させて、殺されるところを見る</strong>ことです。10 MB 制限の cgroup に自分を入れて、200 MB 確保しにいく Python を書きます。</p>
+
+    <div class="file-tag">/tmp/hog.py</div>
+<pre><code><span class="kw">import</span> os
+<span class="ty">open</span>(<span class="st">"/sys/fs/cgroup/memory/smoketest/cgroup.procs"</span>,<span class="st">"w"</span>).write(<span class="ty">str</span>(os.getpid()))
+b = <span class="ty">bytearray</span>()
+<span class="kw">for</span> i <span class="kw">in</span> <span class="ty">range</span>(<span class="st">200</span>):
+    b += <span class="ty">bytearray</span>(<span class="st">1024</span>*<span class="st">1024</span>)
+<span class="kw">print</span>(<span class="st">"allocated"</span>, <span class="kw">len</span>(b))</code></pre>
+
+    <p>ポイントは 2 つです。<strong>①自分の PID を <code>cgroup.procs</code> に書く</strong>こと。これをしないと、いくら上限を設定しても自分には関係ありません。<strong>②最後に <code>print</code> する</strong>こと。上限が効いていれば、この行には到達しません。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>走らせて、終了コードと <code>memory.failcnt</code> を見ます。</p>
+      <pre class="term"><code><span class="ps">$</span> python3 /tmp/hog.py; echo "exit=$?"
+<span class="out">/bin/bash: line 32:  5187 Killed                  python3 /tmp/hog.py
+exit=137</span>
+<span class="ps">$</span> cat /sys/fs/cgroup/memory/smoketest/memory.failcnt
+<span class="out">37</span></code></pre>
+    </div>
+
+    <p><strong>効きました。</strong> 読み取るべきことが 3 つあります。</p>
+
+    <ul>
+      <li><strong><code>allocated ...</code> が印字されていません。</strong> 200 MB 確保しきる前に殺されました。</li>
+      <li><strong><code>Killed</code> / <code>exit=137</code>。</strong> 137 は 128 + 9、つまり SIGKILL で殺されたという意味です。カーネルの OOM killer が仕事をしました。お願いではなく強制である、というのがこの数字です。</li>
+      <li><strong><code>memory.failcnt</code> が 37。</strong> 上限に当たった回数がカーネル側にも記録されています。プロセスの外側からも「効いた」ことが確認できます。</li>
+    </ul>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · 終了コード 137 の読み方</div>
+      <p>シグナルで終了したプロセスの終了コードは、シェルの慣習で <strong>128 + シグナル番号</strong>になります。<code>SIGKILL</code> は 9 番なので 128 + 9 = <strong>137</strong>。<code>SIGTERM</code>（15 番）なら 143 です。</p>
+      <p>この 137 は第04章でもう一度出てきます。<code>mydocker run --memory 10m</code> で起動したコンテナが上限を超えると、<code>mydocker</code> の終了コードも 137 になります。<strong>E2E テストは「設定値が読めること」ではなく「exit 137 になること」で合格を判定します。</strong> 同じ思想です。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · cat が期待値を返しても、効いている証明にはならない</div>
+      <p>もう一度書きます。<code>cat memory.limit_in_bytes</code> が <code>10485760</code> を返しても、それは値が書かれたことの証拠にすぎません。</p>
+      <p>実際、次のどれか 1 つでも欠けていると、値は読めるのに上限は効きません。<strong>①<code>cgroup.procs</code> に PID を書き忘れている</strong>／<strong>②親の cgroup で <code>subtree_control</code> にコントローラを有効化していない（v2）</strong>／<strong>③そもそもそのコントローラが別バージョンに取られている（Step 3.3）</strong>。</p>
+      <p>だから第04章の実装でも、E2E テストでも、この教材は一貫して<strong>「超過させて殺されるか」で判定します</strong>。設定値の読み返しでは済ませません。</p>
+    </div>
+
+    <p>→ <strong>cgroup による資源制限は Must のまま進められます。ただし、この環境では v1 で。</strong></p>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span>overlayfs をマウントする</h2>
+
+    <p>次は第06章で使う OverlayFS です。読み取り専用の下層と書き込み用の上層を重ねて 1 つに見せる仕組みで、これがあると「イメージは共有したまま、コンテナごとの書き込みだけ分ける」ことができます。</p>
+
+    <p>必要なディレクトリは 4 つです。<code>lower</code>（下層・読み取り専用）、<code>upper</code>（上層・書き込み先）、<code>work</code>（overlayfs が内部で使う作業場所）、<code>merged</code>（重ねた結果が見えるところ）。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> mkdir -p /tmp/ovl/{lower,upper,work,merged}
+<span class="ps">$</span> mount -t overlay overlay -o lowerdir=/tmp/ovl/lower,upperdir=/tmp/ovl/upper,workdir=/tmp/ovl/work /tmp/ovl/merged
+<span class="ps">$</span> mount | grep overlay
+<span class="out">overlay on /tmp/ovl/merged type overlay (rw,relatime,lowerdir=/tmp/ovl/lower,upperdir=/tmp/ovl/upper,workdir=/tmp/ovl/work,uuid=on)</span></code></pre>
+    </div>
+
+    <p><strong>通りました。</strong> エラーが出ずに <code>mount</code> の一覧に現れれば成功です。第06章では、この <code>lowerdir</code> にレジストリから取ってきたレイヤを並べ、<code>merged</code> をコンテナの <code>/</code> にします。</p>
+
+    <p>参考までに、完成した <code>mydocker</code> が実際に作るマウント行はこうなります。形はまったく同じです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>（第06章の完成形。今は「同じ形だ」とだけ見てください）</p>
+      <pre class="term"><code><span class="out">overlay /var/lib/mydocker/containers/a10f2703bb37/merged overlay rw,relatime,lowerdir=/var/lib/mydocker/layers/sha256_55afa1ecc21d2bb5e5045f32dafee56272ffd89860bac26f6c32123439af26a4,upperdir=/var/lib/mydocker/containers/a10f2703bb37/upper,workdir=/var/lib/mydocker/containers/a10f2703bb37/work 0 0</span></code></pre>
+    </div>
+
+    <p>→ <strong>層の重ね合わせは Should のまま進められます。</strong> なお overlayfs が使えない環境でも、<code>mydocker run --rootfs &lt;パス&gt;</code> で手元のディレクトリを直接根にする道を残してあるので、教材が完全に止まることはありません。</p>
+
+    <h2 class="step" id="step-6"><span class="step-no">Step 6</span>レジストリのトークンを取る</h2>
+
+    <p>最後の確認は、イメージを配っているレジストリに届くかどうかです。Docker Registry API v2 では、いきなりイメージを取ることはできません。<strong>まずトークンを取ります。</strong></p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>認証サーバに「library/alpine を pull したい」と申告して、トークンをもらいます。長いので先頭 200 バイトだけ表示します。</p>
+      <pre class="term"><code><span class="ps">$</span> curl -s "https://auth.docker.io/token?service=registry.docker.io&amp;scope=repository:library/alpine:pull" | head -c 200
+<span class="out">{"token":"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsIng1YyI6WyJNSUlFRmpDQ0F2NmdBd0lCQWdJVU9yTFd5UVpxMmFuZXd6WnhYN1JLbHQ3bDVUTXdEUVlKS29aSWh2Y05BUUVMQlFBd2dZWXhDekFKQmdOVkJBWVRBbFZUTVJNd0VRWURWUVFJRXdwRFlXeH</span></code></pre>
+      <p>取れました。トークン全体は 2658 文字あります。</p>
+    </div>
+
+    <p>次に、このトークンを付けてマニフェスト（イメージの目次）を取りにいきます。<strong>ここでいきなり落とし穴を踏みます。</strong></p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>返ってきた JSON の冒頭です。</p>
+      <pre class="term"><code><span class="out">{"manifests":[{"annotations":{"com.docker.official-images.bashbrew.arch":"amd64","org.opencontainers.image.base.name":"scratch","org.opencontainers.image.created":"2026-06-16T00:01:04Z","org.opencontainers.image.revision":"398ff0c866d27e9f46f53e48184fe36c674b8897","org.opencontainers.image.source":"https://github.com/alpinelinux/docker-alpine.git#398ff0c866d27e9f46f53e48184fe36c674b8897:x86_64","org.opencontainers.image.url":"https://hub.docker.com/_/alpine","org.opencontainers.image.version":"3.24.1"},"digest":"sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f","mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"architecture":"amd64","os":"linux"},"size":1022},{"annotations":{"vnd.docker.reference.digest":"sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f","vnd.docker.reference.type":"attestation-manifest"},"digest":"sha256:f21951a6120df0f5f9329311202f7869e7b70120f4748632d58753cff662b126","mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"architecture":"unknown","os":"unknown"},"size":838}, ...</span></code></pre>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · マニフェストの取得は 1 回では終わらない</div>
+      <p>よく見てください。<strong><code>layers</code> がありません。</strong> 返ってきたのは <code>manifests</code> という配列を持つ別物 — <strong>OCI イメージインデックス（マニフェストリスト）</strong>です。「amd64 用はこの digest、arm64 用はこの digest」という案内板であって、目次そのものではありません。</p>
+      <p>正しくは、<code>platform.architecture == "amd64"</code> かつ <code>platform.os == "linux"</code> の項目を選び、その <code>digest</code> で<strong>もう一度取り直します</strong>。</p>
+      <p>さらに悪いことに、リストには <code>platform.architecture == "unknown"</code> で <code>vnd.docker.reference.type: attestation-manifest</code>（署名の付随物）が混ざっています。<strong>「最初の項目を取る」実装は、この attestation を掴んで確実に壊れます。</strong> アーキテクチャと OS で明示的に絞ってください。第05章で正面から扱います。</p>
+    </div>
+
+    <p>→ <strong>イメージの取得は Should のまま進められます。</strong></p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 出口が塞がれていることがある</div>
+      <p>この教材を書いた環境では、<strong>Docker Hub のレイヤ配信ドメイン <code>production.cloudfront.docker.com</code> に出られませんでした</strong>（組織の egress ポリシーで CONNECT が 403）。トークンもマニフェストも取れるのに、レイヤの取得だけが失敗します。</p>
+      <p>そこで実測は <code>mirror.gcr.io/library/alpine</code> を使って行いました。取得できる中身は同一で、同じ digest <code>sha256:79ff19e9084a…</code> を指します。あなたの環境で Docker Hub からレイヤが取れない場合は、同じように届くレジストリを指定してください。<code>mydocker</code> も E2E テストも、レジストリのホスト名を引数や環境変数で差し替えられるように作ってあります。</p>
+    </div>
+
+    <h2 class="step" id="step-7"><span class="step-no">Step 7</span>⚠ 後片付け（ここが本題）</h2>
+
+    <p>ここまでで、<code>/tmp/ovl</code> に overlay をマウントし、<code>/tmp/cg2</code> に cgroup2 をマウントし、<code>/sys/fs/cgroup</code> の下に <code>smoketest</code> というディレクトリを 3 つ作りました。<strong>全部片付けます。</strong></p>
+
+    <p>そして、これは「行儀の話」ではありません。<strong>この教材は「後片付けができているか」を検査する教材です。</strong> 第07章では、コンテナが終了したあとにマウントが残っていないか、cgroup ディレクトリが残っていないかを実数で数えて検査します。その入口である第00章が汚したままでは、筋が通りません。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · umount の成否を確かめずに rm -rf を続けてはいけない</div>
+      <p>これはこの教材で<strong>最も危険な操作</strong>です。順に説明します。</p>
+      <p><code>/tmp/ovl/merged</code> には overlay がマウントされています。もし <code>umount</code> が何らかの理由で失敗し（プロセスがそのディレクトリを開いたまま、など）、それに気づかずに <code>rm -rf /tmp/ovl</code> を実行すると、<strong>マウント越しに <code>lower</code> の実体まで削除されます</strong>。overlay の <code>merged</code> は下層の中身が「見えている」だけで、削除操作は下層の実ファイルに届くからです。</p>
+      <p>今回は <code>/tmp</code> の実験用ディレクトリなので笑い話で済みます。しかし第06章以降では、<code>lowerdir</code> に<strong>ダウンロードして展開したイメージのレイヤ</strong>が入ります。同じことをすれば、共有しているレイヤのキャッシュが消えます。他のコンテナも巻き添えになります。</p>
+      <p>ですから、<strong><code>umount</code> したら <code>mountpoint -q</code> で外れたことを確認し、外れていたときだけ削除に進みます。</strong> この「確認してから消す」という型は、第06章の <code>Unmount</code> と第07章の <code>rm</code> にそのまま実装されています。</p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>overlay の後片付け。<strong>アンマウントが成功したときだけ削除します。</strong></p>
+      <pre class="term"><code><span class="ps">$</span> umount /tmp/ovl/merged
+<span class="ps">$</span> if mountpoint -q /tmp/ovl/merged; then
+<span class="ps">&gt;</span>     echo "!! まだマウントされている。削除しない。"
+<span class="ps">&gt;</span> else
+<span class="ps">&gt;</span>     rm -rf /tmp/ovl
+<span class="ps">&gt;</span> fi</code></pre>
+      <p>自分でマウントした cgroup2 も外します。<code>&amp;&amp;</code> なので、<code>umount</code> が失敗したら <code>rmdir</code> は実行されません。</p>
+      <pre class="term"><code><span class="ps">$</span> umount /tmp/cg2 &amp;&amp; rmdir /tmp/cg2</code></pre>
+    </div>
+
+    <p>次が cgroup です。ここにもう 1 つ罠があります。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · cgroup のディレクトリは rm -rf では消えない</div>
+      <p><code>/sys/fs/cgroup</code> の下にあるものは、普通のディレクトリのように見えて、<strong>カーネルが管理している仮想的なファイルシステム</strong>です。中のファイル（<code>memory.limit_in_bytes</code> など）は個別に削除できません。だから <code>rm -rf</code> は「中のファイルが消せない」と言って失敗します。</p>
+      <p>正しくは <strong><code>rmdir</code></strong> です。ディレクトリを直接消すと、カーネルがその cgroup を解体します。中のファイルは自動的に消えます。</p>
+      <p>そして <code>rmdir</code> は、<strong>その cgroup にまだプロセスが residing していると <code>EBUSY</code> で失敗します</strong>。これは正しい挙動です。「まだ誰か使っている cgroup を壊すな」というカーネルの主張です。第07章の後片付け実装では、この <code>EBUSY</code> を正面から扱います。</p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> rmdir /sys/fs/cgroup/unified/smoketest
+<span class="ps">$</span> rmdir /sys/fs/cgroup/memory/smoketest
+<span class="ps">$</span> rmdir /sys/fs/cgroup/pids/smoketest</code></pre>
+    </div>
+
+    <p>今回、<code>memory.failcnt</code> が 37 まで上がっていた <code>smoketest</code> は、<strong>中のプロセスが既に OOM で死んでいた</strong>ので <code>rmdir</code> が素直に成功しました。もしプロセスが生きていれば <code>EBUSY</code> になります。</p>
+
+    <p>最後に、<strong>片付いたことを確認します</strong>。片付けたつもりで終わらせません。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>overlay のマウントは 0 件か。cgroup のディレクトリは消えているか。</p>
+      <pre class="term"><code><span class="ps">$</span> mount | grep -c /tmp/ovl
+<span class="ps">$</span> ls -d /sys/fs/cgroup/memory/smoketest
+<span class="ps">$</span> ls -d /sys/fs/cgroup/unified/smoketest
+<span class="out">unmounted and removed
+=== 確認 ===
+mount|grep -c /tmp/ovl : 0
+ls: cannot access '/sys/fs/cgroup/memory/smoketest': No such file or directory
+ls: cannot access '/sys/fs/cgroup/unified/smoketest': No such file or directory</span></code></pre>
+    </div>
+
+    <p><strong>残っていません。</strong> overlay のマウントは 0 件、cgroup ディレクトリは両方とも消えています。<code>No such file or directory</code> がここでは<em>成功</em>の合図であることに注意してください。</p>
+
+    <div class="ascii">後片付けの型（この教材で何度も出てくる）
+
+  1. umount する
+  2. ★mountpoint -q で「本当に外れたか」を確認する
+  3. 外れていたときだけ rm -rf に進む
+       └─ 外れていなければ、消さずに止まる（消すほうが危険）
+  4. cgroup は rm -rf ではなく rmdir
+       └─ EBUSY なら、まだ中にプロセスがいる。それは正しい失敗
+  5. ★片付いたことを数えて確認する（マウント数・ディレクトリの有無）
+
+  「やったつもり」で終わらせない。数えるまでが後片付け。</div>
+
+    <h2 id="compose">docker-compose.yml を逐行で読む</h2>
+
+    <p>ここまでの実験ができる環境を、誰でも再現できる形にしたものが案A の <code>docker-compose.yml</code> です。<strong>全文を載せます。</strong> 短いですが、1 行ずつに理由があります。</p>
+
+    <div class="file-tag">src/devcontainer/docker-compose.yml</div>
+<pre><code><span class="cm"># mydocker の開発環境 — 「Docker を作るために Docker を使う」
+#
+# コンテナランタイムは Linux カーネルの機能（namespace / cgroup / overlayfs / pivot_root）
+# そのものなので、Windows でも macOS でもネイティブには一行も動かない。
+# そこで特権付きの Linux コンテナを1つ立て、その中で開発・ビルド・実行・テストを行う。
+#
+#   docker compose -f src/devcontainer/docker-compose.yml run --rm dev
+#
+# で開発シェルに入る。以降の作業はすべてこのシェルの中で行うこと。</span>
+
+services:
+  dev:
+    image: <span class="st">golang:1.24-bookworm</span>
+
+    <span class="cm"># ★ここが要。これが無いと mount も pivot_root も cgroup の書き込みも EPERM で落ちる。
+    #   privileged は「ホストとほぼ同じ権限」を意味する。開発用途に限って使うこと。</span>
+    privileged: <span class="st">true</span>
+
+    <span class="cm"># cgroup の階層をホストと共有し、書き込み可能にする。
+    # 読み取り専用でマウントされると /sys/fs/cgroup 配下にディレクトリを作れない。</span>
+    cgroup: <span class="st">host</span>
+
+    <span class="cm"># pivot_root は「新しい root がマウントポイントであること」を要求する。
+    # コンテナの / が overlay のままでも動くが、実験中に何度もマウントするので
+    # /var/lib/mydocker は名前付きボリュームに逃がしておくと後片付けが楽になる。</span>
+    volumes:
+      - <span class="st">../..:/work</span>            <span class="cm"># リポジトリ全体をマウント（src/ も docs/ も見える）</span>
+      - <span class="st">mydocker-state:/var/lib/mydocker</span>
+
+    working_dir: <span class="st">/work/src</span>
+
+    <span class="cm"># マウントの伝播を private にしておく。
+    # 既定の shared のままだと、コンテナ内のマウントがホストへ漏れることがある。</span>
+    tmpfs:
+      - <span class="st">/run</span>
+
+    environment:
+      <span class="cm"># Go のビルドキャッシュをボリュームに置かないと、毎回フルビルドになる</span>
+      - <span class="st">GOCACHE=/var/lib/mydocker/.gocache</span>
+      - <span class="st">GOFLAGS=-buildvcs=false</span>
+
+    <span class="cm"># 何もしないで待つのではなく、シェルを開く</span>
+    command: <span class="st">/bin/bash</span>
+    stdin_open: <span class="st">true</span>
+    tty: <span class="st">true</span>
+
+volumes:
+  mydocker-state:</code></pre>
+
+    <p>順に見ます。</p>
+
+    <h3>image: golang:1.24-bookworm</h3>
+
+    <p>Go の公式イメージです。Debian bookworm ベースで、Go 1.24 が入っています。<strong>自分で Go を入れる手間が消え、全員のバージョンが揃います。</strong> 実測環境の <code>go version</code> は <code>go1.24.7 linux/amd64</code> でした。<code>go.mod</code> の <code>go 1.24</code> と合っています。</p>
+
+    <h3>privileged: true — 無いと全部 EPERM</h3>
+
+    <p><strong>ここが要です。</strong> これが無いと、この章の実験のほとんどが <code>EPERM</code>（Operation not permitted）で落ちます。具体的には <code>mount</code> も、<code>pivot_root</code> も、<code>/sys/fs/cgroup</code> への書き込みも、<code>unshare</code> の一部も通りません。</p>
+
+    <p>通常の Docker コンテナには capability の一部しか与えられていません。<code>privileged: true</code> は<strong>ほぼ全部を与えます</strong>。ホストとほぼ同じ権限です。裏を返すと<strong>コンテナとしての隔離はほとんど無くなります</strong>。開発用途に限って使ってください。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · EPERM に出会ったときの読み方</div>
+      <p>Go で <code>syscall.Mount(...)</code> が失敗すると、返ってくるエラーは <code>operation not permitted</code> という文字列になります。これが <code>EPERM</code> です。</p>
+      <p>この教材で <code>EPERM</code> が出たら、疑うべきはコードではなく<strong>権限</strong>です。順に確認してください — ①<code>id</code> で root か／②<code>privileged: true</code> が効いているか（<code>docker compose</code> の設定を変えたあとコンテナを作り直したか）／③そもそもホストが Linux か。この 3 つで大半は解決します。<code>EPERM</code> は「コードが間違っている」ではなく「そもそも許されていない」というサインです。</p>
+    </div>
+
+    <h3>cgroup: host — 書き込める cgroup 階層を得る</h3>
+
+    <p>cgroup の階層をホストと共有し、<strong>書き込み可能</strong>にする指定です。これが無いと、<code>/sys/fs/cgroup</code> が読み取り専用でマウントされ、その配下にディレクトリを作れません。Step 3.4 でやった <code>mkdir /sys/fs/cgroup/memory/smoketest</code> が通らなくなります。</p>
+
+    <p>ここは第04章に直結します。<code>mydocker</code> がコンテナごとに cgroup を作れなければ、資源の上限はかけられません。</p>
+
+    <h3>volumes — リポジトリ全体と、状態の置き場</h3>
+
+    <p>2 つマウントしています。</p>
+
+    <ul>
+      <li><code>../..:/work</code> — <strong>リポジトリ全体</strong>をコンテナの <code>/work</code> にマウントします。<code>src/</code> だけでなく <code>docs/</code> も見えます。ホスト側のエディタで編集した内容が、そのままコンテナの中に反映されます。</li>
+      <li><code>mydocker-state:/var/lib/mydocker</code> — <strong>名前付きボリューム</strong>です。<code>mydocker</code> が状態（展開済みレイヤ、マニフェストのキャッシュ、実行中コンテナの記録、overlay の作業ディレクトリ）を置く場所を、ホストのファイルシステムから切り離しています。</li>
+    </ul>
+
+    <p>2 つめが重要です。この教材では実験中に何度もマウントとアンマウントを繰り返します。その舞台をボリュームに逃がしておくと、<strong>おかしくなったときにボリュームごと捨てれば元通り</strong>になります。ホストのディレクトリを直接使っていると、そう簡単にはいきません。</p>
+
+    <h3>tmpfs: /run — マウントの伝播を private にする</h3>
+
+    <p>コンテナの中で行ったマウント操作が、ホスト側へ伝わってしまうことがあります。これがマウントの<strong>伝播（propagation）</strong>です。既定の <code>shared</code> のままだと、コンテナ内のマウントがホストへ漏れます。漏れると、コンテナを消してもホストにマウントが残ります。</p>
+
+    <p>この伝播という性質は、第03章で <code>pivot_root</code> をやるときに<strong>正面から扱います</strong>。<code>MS_PRIVATE|MS_REC</code> で伝播を切ることが、根を挿げ替える 5 手順の 1 番目になります。今は「マウントには伝わる性質があり、切らないとホストを汚す」とだけ覚えてください。</p>
+
+    <h3>environment: GOCACHE — 毎回フルビルドを避ける</h3>
+
+    <p><code>GOCACHE=/var/lib/mydocker/.gocache</code>。Go のビルドキャッシュの置き場を、<strong>名前付きボリュームの中</strong>に指定しています。</p>
+
+    <p><code>docker compose run --rm dev</code> は <code>--rm</code> なので、シェルを抜けるとコンテナが消えます。キャッシュがコンテナの中に置かれていると、毎回一緒に消えて、<strong>毎回フルビルドになります</strong>。ボリュームに置けば残ります。地味ですが、この教材のように何十回もビルドし直す作業では効きます。</p>
+
+    <p><code>GOFLAGS=-buildvcs=false</code> は、Go がビルド時に Git の情報を埋め込もうとして、リポジトリの所有者が違うと警告を出す問題を避けるためのものです。</p>
+
+    <h3>command / stdin_open / tty — 待つのではなく、シェルを開く</h3>
+
+    <p>この dev コンテナはサーバではありません。<strong>人間が入って作業する箱</strong>です。だから <code>command: /bin/bash</code> でシェルを開き、<code>stdin_open</code> と <code>tty</code> で対話的に使えるようにしています。起動コマンドはこうなります。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>この 1 行で開発シェルに入ります。以降の作業はすべてこのシェルの中です。</p>
+      <pre class="term"><code><span class="ps">$</span> docker compose -f src/devcontainer/docker-compose.yml run --rm dev</code></pre>
+      <p>入ったら、この章の Step 1 からもう一度なぞってください。<strong>あなたの環境での答えは、この教材の実測値と違って構いません。</strong> 大事なのは、あなたの環境の答えを<strong>あなたが知っている</strong>ことです。</p>
+    </div>
+
+    <h2 id="gomod">go.mod — require が空であること</h2>
+
+    <p>もう 1 つ、この章で読んでおくファイルがあります。<code>go.mod</code> です。全文です。</p>
+
+    <div class="file-tag">src/go.mod</div>
+<pre><code><span class="cm">// mydocker — 自作コンテナランタイム（学習用）
+//
+// ★依存ライブラリは1つも使わない。
+//   containerd / runc / libcontainer / moby のいずれにも依存しない。
+//   使うのは Go の標準ライブラリ（syscall / os/exec / net/http / archive/tar / compress/gzip）だけ。
+//   require ブロックが空のままであることが、この教材の前提そのものである。</span>
+module mydocker
+
+go 1.24</code></pre>
+
+    <p>コメントを除くと <strong>2 行</strong>です。モジュール名と Go のバージョン。それだけです。</p>
+
+    <p><strong><code>require</code> ブロックがありません。</strong> 依存ライブラリが 1 つも無いからです。そして、これは「まだ足していないだけ」ではありません。<strong>最後まで足しません。</strong> この空白が、この教材の前提そのものです。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · go.mod と require ブロック</div>
+      <p><code>go.mod</code> は Go のモジュール定義ファイルで、<code>module</code>（このモジュールの名前）、<code>go</code>（言語バージョン）、<code>require</code>（依存する外部モジュールとそのバージョン）を書きます。</p>
+      <p>外部パッケージを 1 つでも <code>import</code> して <code>go mod tidy</code> を打つと、<code>require</code> ブロックが自動的に生えます。逆に言えば、<strong><code>require</code> が空のままだということは、標準ライブラリ以外を 1 つも <code>import</code> していないことの機械的な証明</strong>になります。人間の宣言ではなく、ツールが保証してくれます。</p>
+      <p>おまけとして、<code>go.sum</code> も要りませんし、<code>go build</code> がネットワーク無しで通ります。第00章でビルドを試すとき、外部から何もダウンロードされないことを確かめてみてください。</p>
+    </div>
+
+    <p>なぜここまで縛るのか。序章でも触れましたが、もう一度書きます。<strong>ライブラリを使うと、いちばん学びたい部分がライブラリの中に隠れるから</strong>です。<code>libcontainer</code> を <code>import</code> すればコンテナは 20 行で起動しますが、その 20 行を書いても namespace のことは何も分かりません。分かるのは <code>libcontainer</code> の API だけです。</p>
+
+    <p>そして実際、標準ライブラリだけで足ります。使うのは <code>syscall</code>（名前空間とマウント）、<code>os/exec</code>（子プロセスの起動）、<code>net/http</code>（レジストリ通信）、<code>archive/tar</code> と <code>compress/gzip</code>（レイヤの展開）、<code>encoding/json</code>（マニフェストの解析）。この 6 つです。無理をして避けているのではなく、素直に書いたら要らなかった、というのが実態です。</p>
+
+    <h2 id="verdict">判定と縮退 — この教材のスコープを確定する</h2>
+
+    <p>7 つの実験が終わりました。結果をまとめて、この教材のスコープを確定させます。</p>
+
+    <table>
+      <tr><th>確認項目</th><th>結果</th><th>判定</th></tr>
+      <tr><td>namespace（Step 2）</td><td>✅ 通った</td><td><strong>Must のまま</strong></td></tr>
+      <tr><td>cgroup（Step 3・4）</td><td>⚠ <strong>v2 では不可 / v1 なら効く</strong></td><td><strong>Must のまま。ただし実装を v2/v1 両対応にする</strong></td></tr>
+      <tr><td>overlayfs（Step 5）</td><td>✅ 通った</td><td>Should のまま</td></tr>
+      <tr><td>Registry（Step 6）</td><td>✅ 通った（マニフェストリスト対応が必須）</td><td>Should のまま</td></tr>
+      <tr><td>後片付け（Step 7）</td><td>✅ 痕跡ゼロを確認</td><td>第07章で機械的に検査する</td></tr>
+    </table>
+
+    <p>そして、もし落ちていたらどうなっていたか。<strong>縮退の設計</strong>も書いておきます。これは「うまくいったから書かなくていい」ものではありません。あなたの環境で落ちるかもしれないからです。</p>
+
+    <table>
+      <tr><th>落ちたもの</th><th>教材への影響</th><th>縮退の仕方</th></tr>
+      <tr><td><strong>namespace</strong></td><td><strong>教材が成立しない。</strong> 第01章から積み上がらない</td><td>縮退できない。環境を替えるしかない（案A へ）</td></tr>
+      <tr><td><strong>cgroup v2</strong></td><td>影響なし</td><td>v1 で書く。実際そうした</td></tr>
+      <tr><td><strong>cgroup v1・v2 の両方</strong></td><td>第04章で上限が効かない</td><td>第04章を「なぜ効かない環境があるか」を扱う読む章にする</td></tr>
+      <tr><td><strong>overlayfs</strong></td><td>第06章の重ね合わせができない</td><td><code>mydocker run --rootfs &lt;パス&gt;</code> で手元のディレクトリを直接根にする</td></tr>
+      <tr><td><strong>レジストリ</strong></td><td>第05章のイメージ取得ができない</td><td>届く別のレジストリを指定する。それも無ければ手元の rootfs を <code>--rootfs</code> で使う</td></tr>
+      <tr><td><strong>ネットワーク</strong></td><td>もともと未実装</td><td>Could のまま落とす。第08章は地図の章</td></tr>
+    </table>
+
+    <h3>⚠ 縮退ではなく「拡張」した点 — cgroup を v1/v2 両対応にする</h3>
+
+    <p>ここは判断として書いておきます。<strong>当初の計画では、cgroup v2 が使えなかったら cgroup 機能を Should に降格し、第04章は「なぜ効かない環境があるか」を扱う読む章にする</strong>ことにしていました。Step 1 の <code>stat</code> が <code>tmpfs</code> を返した時点で、その分岐に倒れるはずでした。</p>
+
+    <p>しかし Step 4 で確かめたとおり、<strong>この環境でも v1 経由なら上限は実際に効きます</strong>（<code>Killed</code> / <code>exit=137</code> / <code>failcnt</code> が 37）。ここで降格すると、<strong>動かせるものを動かさずに終わる</strong>ことになります。そこで、次の判断をしました。</p>
+
+    <ul>
+      <li><strong>cgroup は Must のまま維持する</strong></li>
+      <li><code>internal/cgroup</code> を <strong>v2 優先・v1 フォールバック</strong>の 2 バックエンド構成にする
+        <ul>
+          <li>起動時に「v2 の統一階層に <code>memory</code> コントローラが見えるか」を判定する</li>
+          <li>見えれば v2（<code>memory.max</code> / <code>cpu.max</code> / <code>pids.max</code>）</li>
+          <li>見えなければ v1（<code>memory.limit_in_bytes</code> / <code>cpu.cfs_quota_us</code> / <code>pids.max</code>）</li>
+        </ul>
+      </li>
+      <li><strong>第04章では「なぜ効かない環境があるか」も併せて書く。</strong> 実際に踏んだ hybrid 構成の話は、机上の一般論よりずっと良い教材になる</li>
+    </ul>
+
+    <p><strong>この判断で落としたものは 1 つもありません。</strong> 実装コストは 1 ファイル分増えましたが、「設定できた」と「効いた」の差を読者に見せるという教材の核が守られます。そして副産物として、<strong>読者の環境が v1 でも v2 でも動く</strong>ようになりました。</p>
+
+    <p>完成した <code>mydocker</code> には、この判定結果を表示する <code>info</code> サブコマンドがあります。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>（第07章の完成形。今は「こういうものができる」と見てください）</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker info
+<span class="out">状態の置き場: /var/lib/mydocker
+資源制限:     cgroup v1 (/sys/fs/cgroup, 利用可能: memory cpu pids)
+overlayfs:    利用可能
+overlay 数:   0 件
+実行中:       0 件</span></code></pre>
+      <p><code>cgroup v1</code> と表示されています。この章で手作業で突き止めたことを、プログラムが起動時に自動で判定しているわけです。</p>
+    </div>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>Docker Desktop が入っていません。他に方法はありますか?</summary>
+      <div class="qa-body">
+        <p>あります。Linux マシン（クラウドの VM でも構いません）に root で入れるなら、<code>docker-compose.yml</code> の中身を読み替えて直接その Linux で作業できます。必要なのは「Linux + 特権」だけで、Docker は必須ではありません。</p>
+        <p>Windows なら WSL2（案B）も選べます。ただし比較表と落とし穴ボックスに書いたとおり、<strong>cgroup の構成が環境ごとに違う</strong>ので、Step 3 と Step 4 は必ず自分で走らせてください。答えが v1 でも v2 でも問題ありません。困るのは、確かめずに前提にすることだけです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>mkdir /sys/fs/cgroup/memory/smoketest が Permission denied になります。</summary>
+      <div class="qa-body">
+        <p>3 つ確認してください。</p>
+        <p><strong>①root ですか?</strong> <code>id</code> で <code>uid=0(root)</code> を確認します。<strong>②<code>privileged: true</code> は効いていますか?</strong> compose ファイルを編集したあとにコンテナを作り直していないと、古い設定のまま動いています。一度抜けて <code>run --rm dev</code> し直してください。<strong>③<code>cgroup: host</code> は付いていますか?</strong> これが無いと <code>/sys/fs/cgroup</code> が読み取り専用でマウントされます。<code>mount | grep cgroup</code> の出力に <code>ro,</code> が入っていたらこれです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>stat -fc %T /sys/fs/cgroup/ が cgroup2fs でした。この教材のとおりに進みませんが大丈夫ですか?</summary>
+      <div class="qa-body">
+        <p>まったく問題ありません。むしろ素直な環境です。<code>cgroup2fs</code> なら、<code>/sys/fs/cgroup/cgroup.controllers</code> が読めるはずなので、そこに <code>memory</code> <code>cpu</code> <code>pids</code> が並んでいるか確認してください。並んでいれば v2 でそのまま進めます。</p>
+        <p>その場合、Step 3.4 の代わりに <code>mkdir /sys/fs/cgroup/smoketest</code> して <code>memory.max</code> に <code>10485760</code> を書きます。<strong>Step 4（超過させて殺されるか）は必ずやってください。</strong> v2 でも「親の <code>cgroup.subtree_control</code> に <code>memory</code> を有効化していないと子で使えない」という別の落とし穴があるので、効くかどうかは確かめる必要があります。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>hybrid 構成って、そんなに珍しくないんですか? 自分の環境も気にしたほうがいい?</summary>
+      <div class="qa-body">
+        <p>珍しくありません。cgroup v2 は 2016 年に入りましたが、v1 を前提にした既存のソフトウェアが多かったので、長い移行期間がありました。その名残で、<strong>v1 と v2 が同時にマウントされている環境は今でも普通に見かけます</strong>。特にクラウドの実行基盤やコンテナの中のコンテナでは、よく起きます。</p>
+        <p>気にしたほうがいいかというと、<strong>「気にする」のではなく「確かめる」</strong>のが答えです。<code>mount | grep cgroup</code> を打てば 3 秒で分かります。この教材の実装が起動時に自動判定しているのも、同じ理由です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>memory.failcnt が 37 でした。この数字に意味はありますか?</summary>
+      <div class="qa-body">
+        <p>「上限に当たった回数」です。今回は 1 MB ずつ確保していったので、10 MB の壁に何度もぶつかりながら、カーネルがページを回収したり再試行したりして、37 回目あたりで諦めて SIGKILL を投げた、という経緯を表しています。</p>
+        <p>値そのものに深い意味はありません。<strong>大事なのは「0 ではない」ことです。</strong> 0 なら一度も上限に触れていない、つまり上限が効いていないか、そもそも超過していないということになります。プロセスが死んだ理由が本当に cgroup なのかを、プロセスの外側から裏取りできる数字です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>後片付けの節、そんなに大事ですか? /tmp なんだから残っても困りません。</summary>
+      <div class="qa-body">
+        <p>この章の <code>/tmp</code> は困りません。困るのは第06章以降です。</p>
+        <p>そこでは <code>lowerdir</code> にダウンロードして展開したレイヤが入ります。<code>umount</code> の成否を確かめずに <code>rm -rf</code> すると、<strong>マウント越しに共有レイヤの実体が消えます</strong>。他のコンテナも巻き添えです。そして厄介なことに、この事故は<strong>エラーを出しません</strong>。次に別のコンテナを起動したときに、原因不明の「ファイルが無い」で気づきます。</p>
+        <p>もう 1 つ。第07章の E2E テストは「10 回起動しても overlay のマウント数が増えないこと（前 0 件 → 後 0 件）」「テスト全体を通してホストのマウント数が元に戻ること（開始 22 → 終了 22）」を実数で検査します。<strong>後片付けは、この教材では検査対象の機能そのものです。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Step 6 でレイヤの取得だけが失敗します。ネットワークの問題ですか?</summary>
+      <div class="qa-body">
+        <p>おそらくそうです。この教材を書いた環境でも同じことが起きました。トークンもマニフェストも取れるのに、レイヤ配信ドメイン <code>production.cloudfront.docker.com</code> への CONNECT が 403 で弾かれました。組織の egress ポリシーです。</p>
+        <p>切り分け方は簡単で、<strong>トークンとマニフェストが取れているかどうか</strong>を見ます。そこまで取れていれば、認証もレジストリ API も理解できているということなので、あとは届くレジストリに替えるだけです。この教材の実測は <code>mirror.gcr.io/library/alpine</code> で取りました。中身は同一で、同じ digest <code>sha256:79ff19e9084a…</code> を指します。</p>
+      </div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。<strong>答えを見て「知っていた」と思うかではなく、見る前に言葉にできたか</strong>で判定してください。</p>
+
+    <details class="qa"><summary>Q1. stat -fc %T /sys/fs/cgroup/ が tmpfs を返したとき、「この環境に cgroup v2 は無い」と結論してよいですか?</summary>
+      <div class="qa-body">
+        <p><strong>いけません。</strong> それは <code>/sys/fs/cgroup</code> という 1 点が tmpfs だという事実にすぎません。hybrid 構成では、その tmpfs の下に v1 のコントローラが個別にマウントされ、さらに <code>unified/</code> に cgroup2 も同時にマウントされます。</p>
+        <p>結論を出すには <code>mount | grep cgroup</code> まで見る必要があります。実際、この教材の環境では <code>cgroup2 on /sys/fs/cgroup/unified type cgroup2</code> という行がちゃんとありました。<strong>1 つの指標で断定しない、というのがこの Step の教訓です。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q2. cgroup2 がマウントできているのに memory.max が使えませんでした。なぜですか?</summary>
+      <div class="qa-body">
+        <p><strong>1 つのコントローラは v1 か v2 のどちらか一方にしか結び付けられない</strong>からです。この環境では <code>memory</code> / <code>cpu</code> / <code>pids</code> が v1 に取られていたので、v2 側の <code>cgroup.controllers</code> には <code>cpuset hugetlb</code> しか出ませんでした。</p>
+        <p>確かめ方は <code>cat &lt;v2のマウント先&gt;/cgroup.controllers</code> です。自分で新しく <code>mount -t cgroup2 none /tmp/cg2</code> しても結果は同じでした。マウントの問題ではなく、コントローラの所属の問題だからです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q3. cat memory.limit_in_bytes が 10485760 を返しました。上限は効いていますか?</summary>
+      <div class="qa-body">
+        <p><strong>分かりません。</strong> それは「ファイルに値が書かれた」ことの証拠でしかありません。</p>
+        <p>効いていることを確かめるには、超過させて殺されるところを見ます。この章では 10 MB 制限の中で 200 MB 確保しにいって、<code>Killed</code> / <code>exit=137</code>（= 128 + SIGKILL）を得ました。<code>memory.failcnt</code> も 37 に増えていました。</p>
+        <p>加えて、<strong><code>cgroup.procs</code> に PID を書いていなければ、誰にも効いていません</strong>。ディレクトリを作って値を書くのは準備であって、適用ではありません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q4. umount のあと mountpoint -q で確認せずに rm -rf すると何が起きますか?</summary>
+      <div class="qa-body">
+        <p><code>umount</code> が失敗していた場合、<strong>マウント越しに <code>lower</code> の実体まで削除されます</strong>。overlay の <code>merged</code> は下層の中身が見えているだけなので、削除操作は下層の実ファイルに届きます。</p>
+        <p>第06章以降の <code>lowerdir</code> にはダウンロードして展開したレイヤが入るので、これは共有キャッシュの破壊を意味します。しかも即座にはエラーになりません。次に別のコンテナを起動したときに、原因不明の「ファイルが無い」として現れます。</p>
+        <p>だから型は「<code>umount</code> → <code>mountpoint -q</code> で確認 → 外れていたときだけ削除」です。外れていないなら、<strong>消さずに止まるほうが安全</strong>です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q5. cgroup のディレクトリを rm -rf で消してはいけないのはなぜですか? EBUSY が返ったらどうしますか?</summary>
+      <div class="qa-body">
+        <p>cgroup のディレクトリはカーネルが管理する仮想ファイルシステムで、中のファイル（<code>memory.limit_in_bytes</code> など）を個別に削除することはできません。だから <code>rm -rf</code> は失敗します。正しくは <strong><code>rmdir</code></strong> で、ディレクトリを消すとカーネルがその cgroup を解体します。</p>
+        <p><code>EBUSY</code> が返るのは、<strong>その cgroup にまだプロセスが入っているとき</strong>です。これは正しい挙動なので、力ずくで消そうとしてはいけません。中のプロセスを終了させる（あるいは終了を待つ）のが正解です。第07章の <code>rm</code> 実装では、実行中のコンテナを消そうとすると <code>mydocker: コンテナ … はまだ実行中です。先に終了させてください</code> と拒否する形になっています。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q6. docker-compose.yml から privileged: true を消すと、最初にどこで壊れますか?</summary>
+      <div class="qa-body">
+        <p>ほぼ全部で壊れますが、この章の順番でいうと <strong>Step 3.4 の <code>mkdir /sys/fs/cgroup/memory/smoketest</code></strong> か、<strong>Step 5 の <code>mount -t overlay</code></strong> が最初です。どちらも <code>EPERM</code>（Operation not permitted）になります。</p>
+        <p>実装を書き始めてからだと、第02章の名前空間生成、第03章の <code>mount</code> と <code>pivot_root</code>、第04章の cgroup 書き込みが軒並み落ちます。<code>EPERM</code> を見たら、まずコードではなく権限を疑ってください。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q7. go.mod の require が空であることは、何を保証していますか?</summary>
+      <div class="qa-body">
+        <p><strong>標準ライブラリ以外を 1 つも <code>import</code> していないこと</strong>を、機械的に保証しています。外部パッケージを 1 つでも使えば <code>go mod tidy</code> で <code>require</code> が生えるので、空のままだということは使っていないということです。人間の宣言ではなく、ツールによる証明です。</p>
+        <p>教材としての意味は、<strong>「この教材のコードは全部読める」</strong>ということです。<code>libcontainer</code> の中で何が起きているかを追う必要がありません。目の前の数百行が全部です。おまけに、<code>go build</code> がネットワーク無しで通ります。</p>
+      </div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>次の 2 つができていれば、この章は完了です。</p>
+      <ol>
+        <li>特権 Linux 環境の中で <code>unshare --pid --fork --mount-proc ps aux</code> を打ち、<strong>自分だけが PID 1 として 1 行</strong>並ぶこと</li>
+        <li>実験の痕跡が<strong>1 つも残っていない</strong>ことを、確認出力で見届けたこと</li>
+      </ol>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork --mount-proc ps aux
+<span class="out">USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.0   7900  3932 ?        R    22:14   0:00 ps aux</span>
+<span class="ps">$</span> mount | grep -c /tmp/ovl
+<span class="ps">$</span> ls -d /sys/fs/cgroup/memory/smoketest
+<span class="out">mount|grep -c /tmp/ovl : 0
+ls: cannot access '/sys/fs/cgroup/memory/smoketest': No such file or directory</span></code></pre>
+      <p>そして、あなたの環境の cgroup が v1 なのか v2 なのかを<strong>言えること</strong>。これが第04章への持ち物です。</p>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>この章で地面をならしました。特権付きの Linux 環境を用意し、そこで 7 つの疎通実験を走らせて、<strong>この環境で何ができて何ができないかを、前提ではなく実測として</strong>手に入れました。namespace は作れる（<code>ps aux</code> が 1 行）。cgroup は v2 では書けないが v1 なら書けて、しかも<strong>実際に効く</strong>（<code>exit=137</code>、<code>failcnt</code> が 37）。overlayfs はマウントできる。レジストリにも届く。そして実験の痕跡はゼロにできる。ついでに、<code>docker-compose.yml</code> の 1 行 1 行がなぜそこにあるのかと、<code>go.mod</code> の <code>require</code> が空である意味も読みました。</p>
+
+    <p>ただし、まだ 1 行も書いていません。<code>unshare</code> は既製のコマンドです。ここから先は、同じことを Go のプログラムとして自分で書く必要があります。そこで最初に立ちはだかるのが、Step 2 で見た<strong>「PID 名前空間は次の子から効く」</strong>という癖です。名前空間を作りたいプロセス自身は、その名前空間に入れません。ではどうやって「新しい名前空間の中で自分のコードを動かす」のか。<code>fork</code> して <code>exec</code> するにしても、<strong>exec した先で動かすプログラムはどこにあるのか</strong>。</p>
+
+    <p>次の第01章では、この問いに答えます。答えは意表を突いていて、しかも定石です — <strong>自分自身をもう一度起動します</strong>。<code>/proc/self/exe</code> という特別なパスを使って、いま動いているバイナリを「<code>init</code> という別の顔」で起動し直す。この re-exec と呼ばれる手法が、この教材のすべての土台になります。第02章の名前空間も、第03章の <code>pivot_root</code> も、第04章の cgroup も、全部この親子構造の上に建ちます。地面は整いました。基礎を打ちにいきましょう。</p>
+
+    <div class="chap-foot">
+      <a class="pager" href="index.html"><span class="dir">← 前へ</span>序章 · はじめに・準備</a>
+      <a class="pager next" href="01-reexec.html"><span class="dir">次へ →</span>第01章 · 自分をもう一度起動する</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

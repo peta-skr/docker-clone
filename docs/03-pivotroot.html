@@ -71,17 +71,15 @@
 
     <div class="ascii">02章を終えた時点のコンテナ
 
-  ホスト                        コンテナ (PID 1)
-  ------------------------      ------------------------
-   PID 名前空間          別々    PID 名前空間
-   UTS 名前空間          別々    UTS 名前空間
-   IPC 名前空間          別々    IPC 名前空間
-   マウント名前空間       別々    マウント名前空間
-        |                            |
-        +--------------+-------------+
-                       |
-                 同じ / を見ている        ← ここがまだ分かれていない
-                 (/etc /usr /root ...)</div>
+  ホストとコンテナで【分かれているもの】 ← 第02章で作った
+    PID 名前空間        $$ は 1 になった
+    UTS 名前空間        hostname は変えられた
+    IPC 名前空間
+    マウント名前空間     一覧の写しは作った
+
+  ホストとコンテナで【分かれていないもの】 ← この章の宿題
+    /                  同じディレクトリツリーを踏んでいる
+    /etc /usr /root    ホストのものがそのまま見えている</div>
 
     <p>「マウント名前空間は分けたのに、なぜ同じ <code>/</code> を見ているの?」という疑問はもっともです。マウント名前空間を分けると、<strong>マウントの一覧が複製されて、以後の変更が互いに伝わらなくなる</strong>だけで、複製された時点の中身は元と同じです。分身を作っただけで、まだ何も入れ替えていない。ここから先が本章の仕事になります。</p>
 
@@ -93,19 +91,28 @@
 
     <div class="ascii">やりたいこと
 
-  【今】                                【したい】
-  /                  ← ホストの root     /                ← rootfs が root になる
-  |- bin                                |- bin
-  |- etc                                |- etc
-  |- usr                                |- lib
-  |- root                               |- usr
-  +- var                                +- var
+  【今】ホストから見た姿
+  /                             ← ホストの root
+  |- bin
+  |- etc
+  |- root
+  |- usr
+  +- var
      +- lib
         +- mydocker
-           +- .../merged   ← rootfs      (ホストの / はどこにも見えない)
+           +- .../merged        ← rootfs（イメージを展開したもの）
               |- bin
               |- etc
-              +- usr</div>
+              +- usr
+
+  【したい】コンテナから見た姿
+  /                             ← さっきの rootfs が root になっている
+  |- bin
+  |- etc
+  |- lib
+  |- usr
+  +- var
+                                ← ホストの / はどこにも見えない</div>
 
     <p>この「差し替え」をやってくれるシステムコールが2つあります。<code>chroot</code> と <code>pivot_root</code> です。名前からすると <code>chroot</code>（change root）の方が素直に見えます。実際、まずはそちらを試すべきです。<strong>試して、破れることを自分の目で見てから</strong> <code>pivot_root</code> に進む。それがこの章の進み方です。</p>
 
@@ -221,16 +228,21 @@ os.chroot(<span class="st">"."</span>)                      <span class="cm"># �
 
     <div class="ascii">伝播を切る前と後
 
-  【切る前】shared                     【切った後】private
+  【切る前】shared（既定値）
+    ホストのマウント木
+        ^
+        |  双方向に伝わる
+        v
+    コンテナのマウント木
+        コンテナで mount すると、ホストのマウント一覧にも同じものが増える
 
-  ホストのマウント木                    ホストのマウント木
-        |                                    |
-        | 双方向に伝わる                       X  伝わらない
-        |                                    |
-  コンテナのマウント木                  コンテナのマウント木
-        |                                    |
-        +- ここで mount すると               +- ここで何をしても
-           ホストにも同じものが増える            ホストは 22 個のまま</div>
+  【切った後】private（MS_PRIVATE|MS_REC）
+    ホストのマウント木
+        X
+        X  どちらにも伝わらない
+        X
+    コンテナのマウント木
+        コンテナで何をしても、ホスト側は 22 個のまま</div>
 
     <p>「マウント名前空間を分けたのに、まだ伝わるのか?」と思うかもしれません。私も同じところで引っかかりました。<strong>名前空間を分けることと、伝播を切ることは別の操作です。</strong> 名前空間を分けるのは「マウント一覧の写しを作る」こと。伝播はその写しと元の間に張られたパイプで、写しを作っただけではパイプは残っています。<code>MS_PRIVATE</code> はそのパイプを外す操作です。</p>
 
@@ -281,18 +293,23 @@ os.chroot(<span class="st">"."</span>)                      <span class="cm"># �
 
     <p>そこで <code>MS_BIND</code> の出番です。bind mount は「あるディレクトリを、別の場所にもう一度生やす」マウントで、行き先を自分自身にすることもできます。自分の上に自分を重ねると、見え方は変わらないまま、<strong>そのパスは「マウントポイントである」という資格を得ます</strong>。カーネルのマウント一覧に1行増えるからです。まさに、規則を満たすためだけの操作です。</p>
 
-    <div class="ascii">bind mount 前と後（見え方は同じ、資格だけが変わる）
+    <div class="ascii">bind mount の前と後（見え方は同じ、資格だけが変わる）
 
-  【前】カーネルのマウント一覧              rootfs は…
-   / on /                    ext4         ただのディレクトリ
-   /proc on /proc            proc         → pivot_root は EINVAL
-   ... (全 22 行)
+  【前】カーネルのマウント一覧
+    / on /                ext4
+    /proc on /proc        proc
+    ... (全 22 行)
+                          ← rootfs はただのディレクトリ
+                          ← pivot_root は EINVAL で落ちる
 
-  【後】カーネルのマウント一覧              rootfs は…
-   / on /                    ext4         マウントポイント
-   /proc on /proc            proc         → pivot_root の条件を満たす
-   ... (全 22 行)
-   ROOTFS on ROOTFS          bind    ← この1行が増えただけ</div>
+  【後】カーネルのマウント一覧
+    / on /                ext4
+    /proc on /proc        proc
+    ... (全 22 行)
+    ROOTFS on ROOTFS      bind
+                          ← この1行が増えただけ
+                          ← rootfs はマウントポイントになった
+                          ← pivot_root の条件を満たす</div>
 
     <div class="gonote"><div class="box-k">LINUX メモ · pivot_root(2) の規則</div>
       <p><code>pivot_root(new_root, put_old)</code> には、満たさなければならない条件がいくつもあります。実装で効いてくるのは次の3つです。</p>
@@ -349,18 +366,31 @@ os.chroot(<span class="st">"."</span>)                      <span class="cm"># �
 
     <div class="ascii">pivot_root の前後
 
-  【前】                                【後】
-  /                  ← ホストの root     /                    ← 元 rootfs
-  |- bin                                |- bin                （イメージの中身）
-  |- etc                                |- etc
-  |- usr                                |- usr
-  +- var                                +- .old_root         ← 元の / （この後捨てる）
-     +- lib                                |- bin
-        +- mydocker                        |- etc
-           +- .../merged  ← rootfs         |- usr
-              |- bin                       +- var
-              |- etc                          +- lib
-              +- usr                             +- mydocker</div>
+  【前】
+  /                             ← ホストの root
+  |- bin
+  |- etc
+  |- usr
+  +- var
+     +- lib
+        +- mydocker
+           +- .../merged        ← rootfs（これから root にする）
+              |- bin
+              |- etc
+              +- usr
+
+  【後】
+  /                             ← 元 rootfs（イメージの中身）
+  |- bin
+  |- etc
+  |- usr
+  +- .old_root                  ← 元の / （この後捨てる）
+     |- bin
+     |- etc
+     |- home
+     +- var
+        +- lib
+           +- mydocker</div>
 
     <p>図をよく見てください。<strong>ホストの <code>/</code> は消えていません。</strong> <code>/.old_root</code> という場所に移動しただけです。この時点ではまだ、コンテナの中から <code>ls /.old_root</code> と打てばホストの中身が丸見えです。これを消すのが Step 6 の仕事になります。</p>
 
@@ -496,23 +526,29 @@ ls: /.old_root: No such file or directory</span></code></pre>
     <div class="ascii">/proc がどこを指しているか
 
   【貼り直す前】
-   コンテナのプロセス
+    コンテナのプロセス
         |
-        | ps が読む
+        |  ps はここを読む
         v
-   /proc  ────────→  ホストの PID 名前空間      ← 起動時にホストがマウントした鏡
-                        (85 個のプロセス)
+      /proc
+        |
+        v
+      ホストの PID 名前空間
+        85 個のプロセスが映る（起動時にホストがマウントした鏡だから）
 
-   ※ PID 名前空間そのものは分かれている。$$ はちゃんと 1 になる。
-      分かれていないのは「鏡」の方。
+    ※ PID 名前空間そのものは分かれている。$$ はちゃんと 1 になる。
+       分かれていないのは「鏡」の方。
 
   【貼り直した後】
-   コンテナのプロセス
+    コンテナのプロセス
         |
-        | ps が読む
+        |  ps はここを読む
         v
-   /proc  ────────→  コンテナの PID 名前空間    ← 自分でマウントし直した鏡
-                        (1 個のプロセス)</div>
+      /proc
+        |
+        v
+      コンテナの PID 名前空間
+        自分のプロセスだけが映る（自分でマウントし直した鏡だから）</div>
 
     <p>だから正しい言い方はこうなります。<strong>PID 名前空間は効いていた。見えていたのは <code>/proc</code> の中身であって、名前空間の中身ではなかった。</strong> 私たちは名前空間を疑っていたのに、実際には「古い鏡を見続けていた」だけだったのです。</p>
 
@@ -589,16 +625,24 @@ root           1  0.0  0.0   7900  3932 ?        R    22:14   0:00 ps aux</span>
 
     <div class="ascii">古い root が切り離される様子
 
-  【pivot_root 直後】                  【dropOldRoot の後】
-  /                                    /
-  |- bin                               |- bin
-  |- etc                               |- etc
-  |- proc      ← Step 5 で貼った        |- proc
-  +- .old_root ← ホストの root が        (.old_root は消滅)
-     |- bin       まるごと見えている
-     |- etc                             ホストへ戻る道は
-     |- home                            マウント木から消えた
-     +- var</div>
+  【pivot_root 直後】
+  /
+  |- bin
+  |- etc
+  |- proc                       ← Step 5 で貼り直した新しい鏡
+  +- .old_root                  ← ホストの root がまるごと見えている
+     |- bin
+     |- etc
+     |- home
+     +- var
+
+  【dropOldRoot（MNT_DETACH → os.Remove）の後】
+  /
+  |- bin
+  |- etc
+  +- proc
+                                ← .old_root は消滅した
+                                ← ホストへ戻る道がマウント木から消えた</div>
 
     <div class="gonote"><div class="box-k">LINUX メモ · MNT_DETACH（遅延アンマウント）</div>
       <p>普通の <code>umount</code> は、そのファイルシステムを誰かが使っていると <code>EBUSY</code>（デバイスが使用中）で失敗します。誰かが開いているファイル、誰かの作業ディレクトリ——1つでもあれば断られます。</p>
@@ -663,20 +707,31 @@ root           1  0.0  0.0   7900  3932 ?        R    22:14   0:00 ps aux</span>
 
     <div class="ascii">/dev の作り方の違い
 
-  【bind mount する案】                 【tmpfs + mknod の案（採用）】
-  /dev  ──→ ホストの /dev              /dev  = tmpfs (64k, mode=755)
-             |- null                            |- null      1:3
-             |- zero                            |- zero      1:5
-             |- sda      ★ホストのディスク       |- full      1:7
-             |- nvme0n1  ★ホストのディスク       |- random    1:8
-             |- kmsg                            |- urandom   1:9
-             +- ... (数百)                      |- tty       5:0
-                                                |- fd     -> /proc/self/fd
-                                                |- stdin  -> /proc/self/fd/0
-                                                |- stdout -> /proc/self/fd/1
-                                                +- stderr -> /proc/self/fd/2
+  【案A】ホストの /dev を bind mount する
+  /dev = ホストの /dev そのもの
+    |- null
+    |- zero
+    |- sda                      ← ★ホストのディスクへの生の入口
+    |- nvme0n1                  ← ★ホストのディスクへの生の入口
+    |- kmsg
+    +- ... (数百)
+                                1行で済む。そのかわり穴が空く
 
-  1行で済むが穴が空く                    書く量は増えるが、無いものは触れない</div>
+  【案B】tmpfs を敷いて必要なノードだけ作る（採用）
+  /dev = tmpfs (size=64k, mode=755, MS_NOSUID)
+    |- null       c 1:3
+    |- zero       c 1:5
+    |- full       c 1:7
+    |- random     c 1:8
+    |- urandom    c 1:9
+    |- tty        c 5:0
+    |- fd     -&gt; /proc/self/fd
+    |- stdin  -&gt; /proc/self/fd/0
+    |- stdout -&gt; /proc/self/fd/1
+    +- stderr -&gt; /proc/self/fd/2
+                                書く量は増える。そのかわり
+                                作らなかったものは存在しない
+                                （c = キャラクタデバイス。ブロックは0個）</div>
 
     <p>実装を全文見ます。まず、作りたいノードを表すための小さな型があります。</p>
 

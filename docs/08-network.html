@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第08章 外とつながる — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第08章 / 全10章 · 層: NETWORK · 読了目安 2〜3時間</div>
+    <div class="eyebrow"><span>Network</span><span class="depth">— 踏み込まなかった領域の地図</span></div>
+    <h1>外とつながる</h1>
+    <p class="lede">ここまでの 7 章は、書いたコードを動かし、動いたことを実測で確かめて進んできました。この章だけは違います。<strong>ネットワークは実装していません。</strong>だからこの章は、動くコードの解説ではなく、<strong>なぜ手を出さなかったのか・実装するなら何が必要になるのか・どこで転ぶのか</strong>を渡す地図です。地図は歩いた道の記録ではありませんが、これから歩く人にとっては、たぶん記録より役に立ちます。</p>
+
+    <div class="box"><div class="box-k">■ 先に正直に言っておくこと</div>
+      <p><strong>この章には実装がありません。</strong><code>src/internal/network/</code> というディレクトリは存在せず、ネットワークを設定する関数も型も 1 つも書いていません。したがって、この章に <strong>Go のコードは 1 行も出てきません</strong>。存在しないコードを載せることになるからです。</p>
+      <p>代わりに出てくるのは、<code>ip</code> / <code>iptables</code> / <code>sysctl</code> といった <strong>シェルコマンド</strong>と、<strong>図</strong>と、<strong>概念の説明</strong>です。そしてそのシェルコマンドも、「実装するとこういう操作になる」という<strong>設計の説明</strong>として書いてあります。私が打って出力を採ったものではありません。</p>
+      <p>この章で「実際に打って、出力を採った」ものはただ 1 つ、<strong>いまのコンテナが外をどう見ているかを確かめる 1 コマンド</strong>だけです。それは次の節にそのまま貼ります。</p>
+    </div>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p>いまの mydocker が<strong>ネットワークだけ隔離していない</strong>という事実を、自分の目で確かめる。そのうえで、コンテナに独立したネットワークを与えるために必要な <strong>4 つの部品（bridge・veth・ルーティング・NAT）</strong>がそれぞれ何をする部品なのかを、自分の言葉で説明できるようになる。さらに、<strong>なぜこれを MVP から外したのか</strong>という判断を、感情ではなく理由として説明できるようになる。</p>
+      <p>仕上げに、コンテナの中で <code>ip -o addr</code> を打ち、<strong>ホストのアドレスがそのまま見えている</strong>ことを確認する。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章の道順</div>
+      <ol>
+        <li><a href="#now">まず現状を見る — ここだけは実測</a></li>
+        <li><a href="#why">なぜ最後まで手を出さなかったのか</a></li>
+        <li><a href="#shape">目指す形と、登場人物の名前</a></li>
+        <li><a href="#step-1">Step 1 · bridge を作る</a></li>
+        <li><a href="#step-2">Step 2 · veth ペアで名前空間をまたぐ</a></li>
+        <li><a href="#step-3">Step 3 · コンテナ側の住所と道順</a></li>
+        <li><a href="#step-4">Step 4 · 転送と NAT — ここを忘れると必ず詰まる</a></li>
+        <li><a href="#step-5">Step 5 · 名前解決 — いちばん分かりにくい壊れ方</a></li>
+        <li><a href="#go">Go から実装するとどうなるか（設計の見取り図）</a></li>
+        <li><a href="#hazmap">難所の地図</a></li>
+      </ol>
+    </div>
+
+    <h2 id="now">まず現状を見る — ここだけは実測</h2>
+
+    <p>第 02 章で、私たちは名前空間を 4 つ作りました。<code>internal/container/run.go</code> の <code>Cloneflags</code> に並んでいるのは <code>CLONE_NEWUTS</code>（ホスト名）・<code>CLONE_NEWPID</code>（プロセス番号）・<code>CLONE_NEWNS</code>（マウント）・<code>CLONE_NEWIPC</code>（プロセス間通信）の 4 つです。第 02 章で名前空間を 6 種類並べたとき、私は「このうち NET はこの教材では作らない」と断りました。その断り書きが、ここで効いてきます。</p>
+
+    <p><code>CLONE_NEWNET</code> が無いということは、<strong>コンテナはホストのネットワーク名前空間をそのまま共有している</strong>ということです。理屈で言われても実感が湧かないので、まずコンテナの中から自分の住所を聞いてみます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>コンテナの中で <code>ip -o addr</code> を打ちます。<code>-o</code> は「1 つのインタフェースを 1 行にまとめて出す」という意味で、見比べるときに便利です。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'ip -o addr'
+<span class="out">1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+2: eth0    inet 192.0.2.2/24 brd 192.0.2.255 scope global eth0\       valid_lft forever preferred_lft forever</span></code></pre>
+    </div>
+
+    <p>2 行目の <code>eth0</code> の <code>192.0.2.2/24</code>。これは <strong>ホストのアドレスそのもの</strong>です。コンテナ用に新しく振られたアドレスではありません。<code>lo</code>（ループバック）も同じで、ホストの <code>lo</code> です。</p>
+
+    <p>第 03 章で <code>ls /</code> を打ったときは、ホストのファイルは 1 つも見えませんでした。第 02 章で <code>ps</code> を打ったときも、ホストのプロセスは 1 つも出ませんでした。ところが <code>ip -o addr</code> だけは、<strong>ホストのものが素通しで見えている</strong>。箱の壁に、ここだけ穴が空いているわけです。</p>
+
+    <div class="ascii">いまの mydocker — NET だけ隔離していない
+
+  host netns
+  +------------------------------------+
+  |  lo    127.0.0.1/8                 |
+  |  eth0  192.0.2.2/24  ---> outside  |
+  |                                    |
+  |  +----------------------------+    |
+  |  |  mydocker container        |    |   ← UTS / PID / MNT / IPC は別の箱
+  |  |  (uses the SAME lo/eth0)   |    |   ← NET だけホストと同じ部屋のまま
+  |  +----------------------------+    |
+  +------------------------------------+</div>
+
+    <p>この状態には、良いことと悪いことが両方あります。</p>
+
+    <h3>良いこと — 通信は「できる」</h3>
+
+    <p>コンテナの中から外へ出る通信は<strong>普通にできます</strong>。ホストとまったく同じ経路・同じ住所を使うので、ホストで通るものはコンテナでも通ります。第 05 章でイメージを取ってくるとき、通信の設定を何もしなかったのに動いていたのは、そもそも隔離していなかったからです。</p>
+
+    <p>つまり「外とつながる」という機能要件だけを見れば、<strong>すでに満たされている</strong>ように見えます。ここが厄介なところで、動いているように見えるので問題に気づきにくい。</p>
+
+    <h3>悪いこと — 「隔離されていない」</h3>
+
+    <p>問題は、通信が<strong>ホストと区別できない</strong>ことです。具体的には次のことが起きます。</p>
+
+    <ul>
+      <li><strong>ポートがホストのポートである。</strong>コンテナの中で 8080 番を開くと、それはホストの 8080 番です。ブラウザから <code>localhost:8080</code> で直接届きます。「ポートを公開する」という概念がそもそも存在しません（すでに全部公開されているので）。</li>
+      <li><strong>ポートが衝突する。</strong>同じイメージのコンテナを 2 つ動かして、両方が 8080 番を開こうとすると、後から起動したほうが「アドレスが使用中です」で失敗します。ホストで何かが 8080 番を使っていても同じです。</li>
+      <li><strong>コンテナ同士を区切れない。</strong>コンテナ A とコンテナ B は同じネットワークにいるので、互いに <code>127.0.0.1</code> で通じてしまいます。「この 2 つは通信させたくない」を表現する手段がありません。</li>
+      <li><strong>ホストのネットワーク設定に手を出せてしまう。</strong>コンテナの中は root です。ホストの netns を共有しているということは、そこで <code>ip</code> コマンドを打てば<strong>ホストの経路表を書き換えられる</strong>ということでもあります。</li>
+    </ul>
+
+    <p>要件定義の §3.2 には「コンテナ間およびコンテナ・外部間のネットワーク通信」がはっきりとスコープ外として書いてあります。つまりこれは事故ではなく、<strong>最初から外すと決めていたもの</strong>です。ただ、決めていたからといって「無かったこと」にはできません。今の mydocker は<strong>ネットワークについては隔離されていない道具</strong>であり、それを知って使うのと知らずに使うのとでは、まったく話が違います。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · ネットワーク名前空間（network namespace）</div>
+      <p>ネットワーク名前空間は、<strong>ネットワークに関する持ち物一式をまるごと 1 セット複製する</strong>仕組みです。ここでいう「持ち物一式」には次のものが含まれます。</p>
+      <p>ネットワークインタフェース（<code>lo</code> や <code>eth0</code>）、IP アドレス、経路表（どの宛先をどこへ流すか）、ARP テーブル、<strong>ポート番号の空間</strong>、そしてファイアウォール（<code>iptables</code>）のルール。これらが名前空間ごとにまるごと別になります。</p>
+      <p>ここで大事なのは、<strong>新しく作った netns はほとんど空っぽ</strong>だという点です。作った直後にあるのは、電源の入っていない <code>lo</code> ただ 1 つ。外へ出る線は 1 本もありません。第 03 章で新しい <code>/</code> を用意したときと同じで、<strong>箱を作ることと、箱に中身を入れることは別の作業</strong>です。そして後者のほうがずっと大変だ、というのがこの章の主題です。</p>
+      <p>ちなみに「ポート番号の空間が別になる」というのが、Docker で <code>-p 8080:80</code> と書ける理由です。コンテナの 80 番とホストの 8080 番は<strong>別の名簿に載った別の 80 番・8080 番</strong>なので、対応づけという概念が成り立ちます。名簿が 1 冊しかない今の mydocker では、対応づけようがありません。</p>
+    </div>
+
+    <h2 id="why">なぜ最後まで手を出さなかったのか</h2>
+
+    <p>ここは言い訳の節ではなく、<strong>判断の記録</strong>の節です。「時間が足りなかった」で済ませると何も学べないので、何をどう秤にかけたのかを書きます。</p>
+
+    <h3>1. Must と Should を、検証込みで仕上げることを優先した</h3>
+
+    <p>要件を優先度で並べたとき、絶対に落とせない <strong>Must</strong> は 3 つでした — 隔離（名前空間）、根の挿げ替え（<code>pivot_root</code>）、資源制限（cgroup）。この 3 つが揃って初めて「コンテナ」と呼べるものになります。次の <strong>Should</strong> が、イメージの取得・層の重ね合わせ・<code>ps</code>・<code>exec</code>。ここまでで「使える道具」になります。ネットワークは <strong>Could</strong>、つまり「あればなお良い」の段でした。</p>
+
+    <p>そしてこの教材の方針として、<strong>「実装した」と書けるのは検証まで通したものだけ</strong>と決めていました。第 04 章でメモリ上限を確かめるとき、設定ファイルに数値が書き込めたことでは満足せず、実際に上限を超える確保をさせて <code>exit=137</code> で殺されるところまで見ましたね。あれを全機能でやると、実装そのものと同じくらいの時間がかかります。</p>
+
+    <p>限られた時間の使い道は 2 つありました。</p>
+
+    <ul>
+      <li><strong>A.</strong> Must と Should を、検証込みで完全に仕上げる</li>
+      <li><strong>B.</strong> Must と Should の検証を薄くして、ネットワークにも着手する</li>
+    </ul>
+
+    <p>選んだのは A です。理由は次の 2 つ目に続きます。</p>
+
+    <h3>2. ネットワークは「単体で数時間」かつ「失敗が分かりにくい」</h3>
+
+    <p>これが決定的でした。この章のあとで見る 4 つの部品——bridge を作る、veth を渡す、経路を引く、NAT をかける——は、<strong>どれか 1 つでも欠けると通信できません</strong>。しかもそのとき出るエラーが、ほぼ全部同じ顔をしています。</p>
+
+    <div class="ascii">4 つの部品と、欠けたときの見え方
+
+  bridge が無い        → そもそも線がつながらない
+  veth を渡していない  → コンテナ内に eth0 が無い
+  経路を引いていない   → 「Network is unreachable」
+  NAT をかけていない   → 何も言わずに、ただ黙る（応答が返ってこない）
+
+  最後のやつが、いちばん時間を溶かす。
+  「送れている」のに「返ってこない」ので、送信側だけ見ても何も分からない。</div>
+
+    <p>プログラムのバグなら、スタックトレースが出るか、少なくとも例外が飛びます。ネットワークの設定漏れは<strong>沈黙</strong>で表れます。パケットは正しく出ていって、正しく相手に届いて、相手も正しく返事をして、その返事だけがどこかへ消える。この状態を切り分けるには、少なくとも「どこまで届いているか」を見る道具（<code>tcpdump</code> のような）と、それを読む力が要ります。それは<strong>この教材が扱う範囲を明らかに超えていました</strong>。</p>
+
+    <h3>3. 動かない実装は資産にならない</h3>
+
+    <p>いちばん避けたかったのは、次の結末です。</p>
+
+    <blockquote>
+      ネットワークに手を出したせいで時間が溶け、その結果ネットワークは中途半端に動くだけで終わり、しかも他の章の検証まで薄くなった。
+      <cite>— 最悪のシナリオ</cite>
+    </blockquote>
+
+    <p>コードは書いた量ではなく、<strong>信頼できる量</strong>で測るべきです。「たぶん動くはずのネットワーク実装」は、後から誰か（未来の自分を含む）が触るときに、資産ではなく負債になります。「これは動くと確認した」「これは着手していない」がはっきり分かれているほうが、どちらの立場から見ても扱いやすい。</p>
+
+    <p>だから mydocker のネットワーク機能は、<strong>中途半端に存在するのではなく、はっきり存在しません</strong>。そして代わりに、この地図の章があります。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ ここで身につけてほしい態度</div>
+      <p>「やらなかった」と「できなかった」と「やらないと決めた」は、まったく別のことです。3 つ目だけが、判断として記録に値します。</p>
+      <p>そして記録するときに書くべきなのは、<strong>やらなかった理由</strong>ではなく<strong>何を優先したか</strong>です。「時間が無かった」は理由に見えて何も言っていません。「Must の検証を優先し、Could を落とした」なら、次に時間ができたときに何から手をつけるかまで決まります。</p>
+    </div>
+
+    <h2 id="shape">目指す形と、登場人物の名前</h2>
+
+    <p>ここからは「実装するなら」の話です。まず完成形を 1 枚の図にします。この図が頭に入っていれば、あとの Step 1〜5 は「この図のどこを作っているか」で読めます。</p>
+
+    <div class="ascii">目指す形 — bridge にぶら下げて、NAT で外へ出す
+
+   container A netns          container B netns
+   +-------------------+      +-------------------+
+   |  eth0             |      |  eth0             |
+   |  172.30.0.2/16    |      |  172.30.0.3/16    |
+   +---------+---------+      +---------+---------+
+             |                          |
+             | veth ペア                | veth ペア
+   ==========|==========================|===============  netns の境界
+             |                          |
+   +---------+--------------------------+-------------+
+   |              mydocker0  (bridge)                 |  ← 仮想的なスイッチ
+   |              172.30.0.1/16                       |     コンテナのゲートウェイ
+   +------------------------+-------------------------+
+                            |
+                            |  ip_forward = 1          ← 転送を許可する
+                            |  MASQUERADE              ← 送信元アドレスを書き換える
+                      +-----+------+
+                      |  eth0      |                   ← ホストの本物のインタフェース
+                      |  192.0.2.2 |
+                      +-----+------+
+                            |
+                         outside</div>
+
+    <p>コンテナが増えても、この図は縦に伸びません。<strong>bridge に横へぶら下がっていくだけ</strong>です。ここが設計としてきれいなところで、「コンテナごとにホストの物理インタフェースを用意する」ような話にはなりません。</p>
+
+    <p>登場人物が急に増えたので、名前を先に整理します。この表は覚えるためではなく、後で戻ってくるためのものです。</p>
+
+    <table>
+      <tr><th>名前</th><th>正体</th><th>身近なたとえ</th></tr>
+      <tr><td>netns</td><td>ネットワーク名前空間。インタフェース・IP・経路表・ポート・iptables を 1 セットにしたもの</td><td>部屋。壁で仕切られていて、外へ出るには線を通す必要がある</td></tr>
+      <tr><td>veth ペア</td><td>両端が必ず対になった仮想的なケーブル。片端に入れたものは必ずもう片端から出る</td><td>2 つの部屋をつなぐ 1 本の線。片方を壁の穴に通す</td></tr>
+      <tr><td>bridge</td><td>複数のインタフェースを束ねる仮想的なスイッチ</td><td>ハブ。何本も線を挿せる箱</td></tr>
+      <tr><td>経路表（ルーティング）</td><td>「この宛先はどのインタフェースへ出す」の一覧</td><td>分岐点の道案内板</td></tr>
+      <tr><td>デフォルトルート</td><td>案内板に載っていない宛先を、とりあえず全部そこへ流す先</td><td>「その他はすべてこちら」の矢印</td></tr>
+      <tr><td>ip_forward</td><td>「自分宛でないパケットを転送してよい」というカーネルの設定</td><td>通行許可。既定では止められている</td></tr>
+      <tr><td>NAT / MASQUERADE</td><td>出ていくパケットの送信元アドレスをホストのものに書き換え、返事を元に戻す仕組み</td><td>転送サービス付きの私書箱</td></tr>
+    </table>
+
+    <p>この 7 つのうち、<strong>bridge・veth・経路・NAT の 4 つが「部品」</strong>です。次からそれを 1 つずつ作っていきます——といっても、繰り返しますが、実際に作ったわけではありません。「作るならこうなる」という設計です。</p>
+
+    <div class="box"><div class="box-k">■ これ以降のコマンドの読み方</div>
+      <p>Step 1 以降に出てくるコマンドには、<strong>プロンプト記号（<code>$</code>）も出力も付けていません</strong>。私が実行して結果を採ったものではないからです。付けてしまうと「動かした記録」に見えてしまいます。</p>
+      <p>これらは <strong>「実装したら、mydocker はこの操作に相当することをすることになる」</strong> という設計の記述です。実際に自分の環境で試すときは、必ず<strong>壊してよい環境</strong>（第 00 章で用意した使い捨ての Linux）で試してください。ホストの経路表を触るコマンドが混ざっているので、作業マシンで打つと SSH が切れることがあります。</p>
+    </div>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>bridge を作る</h2>
+
+    <p>最初に作るのは <strong>bridge</strong>、日本語なら仮想的なスイッチです。これはコンテナがまだ 1 つも無くても作れます。というより、<strong>コンテナより先に無いと困る</strong>ものです。コンテナは起動のたびに現れて消えますが、ぶら下がる先のスイッチは居続けてもらわないといけません。</p>
+
+    <p>名前は <code>mydocker0</code> にします。末尾の <code>0</code> は「1 本目」という慣習で、Docker の <code>docker0</code> も同じ流儀です。</p>
+
+<pre><code><span class="cm"># 1. スイッチの本体を作る（この時点では何も挿さっていない）</span>
+ip link add mydocker0 type bridge
+
+<span class="cm"># 2. スイッチ自身に住所を与える</span>
+<span class="cm">#    この住所が、コンテナから見た「ゲートウェイ」になる</span>
+ip addr add 172.30.0.1/16 dev mydocker0
+
+<span class="cm"># 3. 電源を入れる（これを忘れると、線を挿しても何も流れない）</span>
+ip link set mydocker0 up</code></pre>
+
+    <p>3 行それぞれに役割があります。</p>
+
+    <ul>
+      <li><strong>1 行目</strong>で箱そのものを作ります。<code>type bridge</code> がスイッチであることの宣言です。この時点では、ポートが全部空いているハブが机の上に置かれただけの状態です。</li>
+      <li><strong>2 行目</strong>でスイッチ自身に IP を振ります。ここが少し不思議に感じるところで、「スイッチに住所が要るのか?」と思うかもしれません。要ります。というのも、この bridge は<strong>ただのスイッチであると同時に、ホスト側のインタフェースでもある</strong>からです。コンテナから見ると、この <code>172.30.0.1</code> が「外へ出るときにまず渡す相手」——つまりゲートウェイになります。</li>
+      <li><strong>3 行目</strong>で電源を入れます。Linux のインタフェースは作った直後は <code>DOWN</code> で、明示的に <code>up</code> にするまで一切のパケットを通しません。これは「作ったのに動かない」の定番の原因です。</li>
+    </ul>
+
+    <p><code>172.30.0.0/16</code> という範囲を選んだのは、これがプライベートアドレス（インターネットには出ていかない、組織内で自由に使ってよい範囲）だからです。<code>/16</code> は「上位 16 ビットが同じものは同じネットワーク」という意味で、<code>172.30.0.1</code> から <code>172.30.255.254</code> までの約 6 万 5 千個を使えます。コンテナを 6 万個立てる予定は無いので十分です。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · bridge（仮想スイッチ）</div>
+      <p><code>bridge</code> は、複数のネットワークインタフェースを束ねて<strong>1 つのスイッチのように振る舞わせる</strong>カーネルの機能です。物理的なスイッチングハブがやっていることを、そのままソフトウェアでやります。</p>
+      <p>スイッチの仕事は単純です。ある口からフレームが入ってきたら、宛先の MAC アドレスを見て、その相手がぶら下がっている口だけへ流す。相手がどの口にいるか知らなければ、とりあえず全部の口へ流して、返事が来た口を覚える。これだけです。<strong>IP アドレスのことは何も知りません</strong>——スイッチは 1 つ下の階層（データリンク層）の道具だからです。</p>
+      <p>ではなぜ Step 1 の 2 行目で IP を振ったのか。それは <code>mydocker0</code> が<strong>スイッチであると同時に、ホスト自身がそのスイッチにつないだ 1 本の線でもある</strong>からです。ホストは「スイッチに参加している 1 台」として住所を持ち、その住所がコンテナ側のゲートウェイになります。この二重の役割が、bridge がいちばん理解しにくい点だと思います。</p>
+    </div>
+
+    <div class="box"><div class="box-k">◇ 自分で確かめるなら</div>
+      <p>この Step の内容は、コンテナが 1 つも無くても確かめられます。壊してよい Linux で <code>ip link add ... type bridge</code> を打ってから <code>ip link</code> の一覧を見ると、作ったばかりの <code>mydocker0</code> が <code>DOWN</code> で並んでいるはずです。<code>up</code> にする前後で状態表示がどう変わるかを見ておくと、Step 2 以降で「なぜか流れない」に当たったときに、まずここを疑えるようになります。</p>
+      <p>後片付けは <code>ip link del mydocker0</code> です。<strong>作ったら消す</strong>——第 07 章でさんざんやったことが、ここでもそのまま必要になります。</p>
+    </div>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>veth ペアで名前空間をまたぐ</h2>
+
+    <p>スイッチができました。次はコンテナをそこへつなぐ線が要ります。ここで使うのが <strong>veth ペア</strong>です。</p>
+
+    <p>veth の性質でいちばん大事なのは、<strong>必ず 2 本 1 組で生まれる</strong>ことです。単体では作れません。そして片方に入れたパケットは、必ずもう片方から出てきます。ケーブルとまったく同じ振る舞いです。</p>
+
+<pre><code><span class="cm"># 1. ケーブルを 1 本作る（両端に veth0 / veth1 という名前が付く）</span>
+ip link add veth0 type veth peer name veth1
+
+<span class="cm"># 2. 片端をスイッチに挿す</span>
+ip link set veth0 master mydocker0
+
+<span class="cm"># 3. ホスト側の端に電源を入れる</span>
+ip link set veth0 up
+
+<span class="cm"># 4. もう片端を、コンテナのネットワーク名前空間へ引っ越させる</span>
+<span class="cm">#    &lt;pid&gt; はコンテナの中の PID 1 の、ホストから見た PID</span>
+ip link set veth1 netns &lt;pid&gt;</code></pre>
+
+    <p>4 行目が、この章でいちばん面白いところです。<strong>インタフェースを名前空間ごと引っ越させる</strong>という操作が存在します。ファイルを移動するのと同じ感覚で、ネットワークインタフェースを別の部屋へ移せる。</p>
+
+    <div class="ascii">veth ペア — 1 本のケーブルの両端
+
+  作った直後（両端ともホストの netns にいる）
+
+    host netns
+    +-------------------------------------+
+    |   veth0 ==================== veth1  |
+    +-------------------------------------+
+
+  片端だけ引っ越した後
+
+    host netns                    container netns
+    +--------------------+        +--------------------+
+    |  veth0 ============|========|=== veth1           |
+    +--------------------+        +--------------------+
+        ↑                              ↑
+        bridge に挿す                  eth0 に改名して IP を振る
+                                       ホスト側からはもう見えない</div>
+
+    <p>ここで <code>&lt;pid&gt;</code> と書いたのは、コンテナの<strong>ホストから見た PID</strong> です。第 01 章でやったことを思い出してください——コンテナの中では PID 1 でも、ホストから見れば普通の番号を持ったプロセスです。<code>ip link set ... netns &lt;pid&gt;</code> は「この PID のプロセスが属している netns へ移せ」という指定なので、ホスト側の番号を渡します。<code>internal/container/run.go</code> の <code>Run</code> は、子プロセスを起動した直後にこの PID を掴んでいます（<code>st.PID = pid</code> の行です）。実装するなら、その直後がこの操作を差し込む場所になります。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 引っ越した veth は、元の部屋から「消えたように見える」</div>
+      <p><code>ip link set veth1 netns &lt;pid&gt;</code> を打った直後にホストで <code>ip link</code> を見ると、<strong><code>veth1</code> がどこにもありません</strong>。消えたのではなく、別の部屋に移っただけです。しかし初めて見ると「コマンドが失敗してインタフェースが壊れた」ようにしか見えません。</p>
+      <p>この「消えたように見える」性質は、順序を間違えたときにも牙を剥きます。たとえば <code>veth1</code> に IP を振ってから引っ越させようとすると、その後の操作をホスト側から続けられません。<strong>引っ越しは、その端に対する最後のホスト側操作</strong>だと考えてください。それ以降は、コンテナの netns の中から触ることになります。</p>
+      <p>もっと厄介なのは、<strong>引っ越し先の netns が消滅したとき</strong>です。netns はその中にプロセスが 1 つもいなくなると消えます。コンテナが終了すると netns も消え、その中にいた <code>veth1</code> も一緒に消えます。ここは救いで、<strong>ペアの片方が消えるともう片方も自動的に消えます</strong>。つまり通常終了ならホスト側の <code>veth0</code> の後始末は要りません。ただし「通常終了なら」です。</p>
+    </div>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · veth ペア</div>
+      <p><code>veth</code> は virtual Ethernet の略で、<strong>常に 2 本 1 組で作られる仮想インタフェース</strong>です。単体では存在できません。<code>ip link add veth0 type veth peer name veth1</code> の <code>peer</code> が「相方」の意味で、この 1 コマンドで 2 本同時に生まれます。</p>
+      <p>動作はきわめて素直です。<code>veth0</code> へ送信されたフレームは、そのまま <code>veth1</code> の受信として現れます。逆も同じ。中身を見ることも、書き換えることもしません。ただの直結ケーブルです。</p>
+      <p>「ただの直結ケーブル」が価値を持つのは、<strong>両端を別々の名前空間に置けるから</strong>です。名前空間は壁ですが、veth はその壁を貫通して置ける唯一の線になります。第 03 章で <code>pivot_root</code> をやったとき、コンテナの中からホストのファイルへ手が届かないことを確かめました。ネットワークの世界における「その壁に開ける穴」が veth です。<strong>穴の開け方が明示的である</strong>ことがポイントで、意図せず穴が空くことはありません。</p>
+      <p>なお、コンテナ側の端を <code>eth0</code> と名付けるのは単なる慣習です。カーネルは名前を気にしません。ただ、中で動くアプリケーションが「<code>eth0</code> があるのが普通」と思っていることが多いので、慣習に従っておくと余計な問題を踏みません。</p>
+    </div>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>コンテナ側の住所と道順</h2>
+
+    <p>線はつながりました。しかし、コンテナ側の端はまだ<strong>名前も住所も無い、電源も入っていないケーブル</strong>です。ここに 3 つのことをします——名前を付ける、住所を振る、道順を教える。</p>
+
+    <p>操作の場所が変わることに注意してください。ここからは<strong>コンテナの netns の中で</strong>打つコマンドです。ホストからそれをやる方法として <code>ip netns exec</code> という仕組みがありますが、mydocker のようにコンテナを自前で起動している場合は、対象の netns を <code>/proc/&lt;pid&gt;/ns/net</code> として指定して同じことをします。第 07 章の <code>Exec</code> で <code>/proc/&lt;pid&gt;/ns/uts</code> のようなパスを開いて <code>setns</code> したのと、まったく同じ考え方です。</p>
+
+<pre><code><span class="cm"># --- ここからはコンテナの netns の中での操作 ---</span>
+
+<span class="cm"># 1. ループバックを起こす（意外と忘れる。中のアプリが localhost を使うと詰む）</span>
+ip link set lo up
+
+<span class="cm"># 2. 引っ越してきた端を eth0 に改名する（慣習に合わせるだけ）</span>
+ip link set veth1 name eth0
+
+<span class="cm"># 3. 住所を振る</span>
+ip addr add 172.30.0.2/16 dev eth0
+
+<span class="cm"># 4. 電源を入れる</span>
+ip link set eth0 up
+
+<span class="cm"># 5. 道順を教える — 「知らない宛先はすべて bridge へ渡せ」</span>
+ip route add default via 172.30.0.1</code></pre>
+
+    <p>5 行目の <strong>デフォルトルート</strong>が肝です。これが無いと、コンテナは <code>172.30.x.x</code> 宛（つまり同じ bridge にぶら下がった相手）としか話せません。それ以外の宛先について、パケットをどこへ出せばいいか分からないからです。「知らない宛先は全部 <code>172.30.0.1</code> に渡す」と教えることで、初めて外の世界へ向かう道ができます。</p>
+
+    <p>ここまでやると、<strong>コンテナ ↔ ホスト</strong>は通じるようになります。コンテナから <code>172.30.0.1</code> へ、ホストから <code>172.30.0.2</code> へ、どちらも届きます。コンテナ A ↔ コンテナ B も、同じ bridge にぶら下がっているので通じます。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ ここで「できた」と思うと、必ず転ぶ</div>
+      <p>Step 3 まで終わった時点で、コンテナからホストへ ping が通ります。ここで「よし、ネットワークができた」と思うのが、この一連の作業でいちばんよくある勘違いです。</p>
+      <p><strong>まだ外の世界へは 1 バイトも出られません。</strong>通じているのは「同じ bridge にぶら下がっている者同士」と「ホスト自身」だけです。外へ出るには、あと 2 つ——転送の許可と、送信元アドレスの書き換え——が要ります。それが Step 4 です。</p>
+    </div>
+
+    <div class="box"><div class="box-k">◇ 考えてみる</div>
+      <p>Step 4 を読む前に、少しだけ考えてみてください。<strong>いまコンテナが <code>172.30.0.2</code> という送信元アドレスでパケットを外へ出したら、返事はどこへ返ってくるでしょうか?</strong></p>
+      <p>ヒント: <code>172.30.0.0/16</code> はプライベートアドレスです。つまり、インターネットのどこにも「そこへの行き方」を知っている機械はありません。この 1 点から、Step 4 で何をしなければならないかが導けます。</p>
+    </div>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>転送と NAT — ここを忘れると必ず詰まる</h2>
+
+    <p>さっきの問いの答えです。<strong>返事はどこへも返ってきません。</strong></p>
+
+    <p>コンテナが送信元 <code>172.30.0.2</code> でパケットを出す。それはホストを通って外の相手に届く（ここまでは行けます）。相手は律儀に返事を作り、宛先に <code>172.30.0.2</code> と書く。ところが <code>172.30.0.2</code> はこの家の中でしか通用しない住所なので、<strong>世界中のどのルータもそこへの行き方を知りません</strong>。返事は途中で捨てられます。</p>
+
+    <div class="ascii">NAT を忘れると起きること
+
+  コンテナ                ホスト                外の相手
+  172.30.0.2  ─────→  そのまま通す  ─────→  受け取る
+                                              「172.30.0.2 へ返信」
+                                                    │
+                          ？  ←───────────────────  │
+                    どのルータも 172.30.0.2 を知らない
+                    → 返事は途中で消える
+
+  送信側から見ると「送れているのに黙っている」ようにしか見えない。
+  これが「ping は出るのに応答が返らない」の正体。</div>
+
+    <p>だから、外へ出るときに<strong>送信元アドレスをホストのものに書き換える</strong>必要があります。これが NAT（Network Address Translation）です。そして帰ってきた返事を、書き換える前のコンテナのアドレスへ<strong>戻す</strong>必要もあります。この 2 つは同じ仕組みの表と裏です。</p>
+
+<pre><code><span class="cm"># 1. カーネルに「自分宛でないパケットを転送してよい」と許可する</span>
+<span class="cm">#    既定では 0（転送しない）。ここが 0 のままだと bridge 止まりになる</span>
+sysctl -w net.ipv4.ip_forward=1
+
+<span class="cm"># 2. 172.30.0.0/16 から出ていくパケットの送信元を、出口のアドレスに書き換える</span>
+<span class="cm">#    「! -o mydocker0」= bridge の内側へ戻る通信は書き換えない、の意味</span>
+iptables -t nat -A POSTROUTING -s 172.30.0.0/16 ! -o mydocker0 -j MASQUERADE</code></pre>
+
+    <p>1 行目は<strong>通行許可</strong>です。Linux は既定では「自分宛でないパケットは黙って捨てる」設定になっています。これは安全側に倒した既定値で、うっかりルータとして振る舞ってしまわないための配慮です。コンテナのパケットを外へ流すというのは、まさにルータとして振る舞うことなので、明示的に許可が要ります。</p>
+
+    <p>2 行目が NAT の設定です。読み解くと次のようになります。</p>
+
+    <table>
+      <tr><th>断片</th><th>意味</th></tr>
+      <tr><td><code>-t nat</code></td><td>アドレス書き換え用の表を触る（フィルタ用の表とは別）</td></tr>
+      <tr><td><code>-A POSTROUTING</code></td><td>「行き先を決めた後、実際に送り出す直前」の段に規則を足す</td></tr>
+      <tr><td><code>-s 172.30.0.0/16</code></td><td>送信元がコンテナの範囲のものだけを対象にする</td></tr>
+      <tr><td><code>! -o mydocker0</code></td><td>ただし出口が bridge 自身のものは除く（＝コンテナ同士の通信は書き換えない）</td></tr>
+      <tr><td><code>-j MASQUERADE</code></td><td>送信元アドレスを「出ていくインタフェースのアドレス」に書き換える</td></tr>
+    </table>
+
+    <p><code>! -o mydocker0</code> の <code>!</code> は否定です。これが無いと、コンテナ A からコンテナ B への通信まで書き換えてしまい、B から見た送信元が全部ホストになってしまいます。<strong>外へ出るときだけ書き換える</strong>のが要点です。</p>
+
+    <div class="ascii">NAT がヘッダを書き換える様子
+
+  行き（コンテナ → 外）
+
+    コンテナが作った時点          ホストを出る時点
+    +----------------------+      +----------------------+
+    | src 172.30.0.2:50001 |  →   | src 192.0.2.2:41000  |   ← 書き換わる
+    | dst OUTSIDE:443      |      | dst OUTSIDE:443      |
+    +----------------------+      +----------------------+
+                                  （この対応を表に控えておく）
+
+  帰り（外 → コンテナ）
+
+    ホストに届いた時点            コンテナへ渡す時点
+    +----------------------+      +----------------------+
+    | dst 192.0.2.2:41000  |  →   | dst 172.30.0.2:50001 |   ← 元に戻す
+    +----------------------+      +----------------------+
+                                  （控えた表を引いて宛先を復元する）</div>
+
+    <p>図の右下の「控えた表」が、NAT がステートフル（状態を持つ）である理由です。書き換えっぱなしでは帰り道が分からないので、<strong>誰の通信をどう書き換えたかを覚えている必要があります</strong>。この表はカーネルが持っていて、通信が終われば消えます。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · NAT / MASQUERADE</div>
+      <p>NAT はパケットのヘッダに書かれたアドレスを書き換える技術の総称です。家庭用のルータが当たり前にやっていることと同じで、家の中の複数の機械が 1 つのグローバルアドレスを共有できるのはこの仕組みのおかげです。</p>
+      <p><code>MASQUERADE</code> は NAT の一種で、<strong>「書き換え先を固定で指定せず、出ていくインタフェースのアドレスを自動で使う」</strong>という意味です。似たものに <code>SNAT</code> があり、こちらは書き換え先のアドレスを明示します。ホストのアドレスが DHCP で変わりうる環境では <code>MASQUERADE</code> のほうが安全で、代わりに毎回アドレスを引く分だけわずかに遅い、というのが両者の違いです。</p>
+      <p>ポート番号も一緒に書き換わることに注目してください。図では <code>50001</code> が <code>41000</code> になっています。なぜかというと、複数のコンテナが同時に外と通信したとき、<strong>送信元アドレスを全部ホストのものにしてしまうと、返事が誰宛か分からなくなる</strong>からです。ポート番号を振り分けることで区別しています。だから正確には NAPT（アドレスとポートの変換）と呼ぶべきものですが、実務では区別せず NAT と呼ぶことがほとんどです。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · NAT を忘れると「ping は出るのに応答が返らない」</div>
+      <p>これがこの章で最大の落とし穴です。症状はこうです——コンテナから外へ <code>ping</code> を打つ。エラーは出ない。パケットは確かに出ていく。<strong>ただ、いつまでも応答が返ってこない</strong>。タイムアウトするだけで、何が悪いのかを示す情報が一切出ません。</p>
+      <p>原因は上で見たとおり、送信元アドレスが外から見て到達不能だからです。返事の宛先が世界のどこにも存在しないので、返事そのものが作られても捨てられる。<strong>送信側だけをいくら調べても分かりません</strong>。</p>
+      <p>切り分けの手掛かりは「どこまでは届くか」を段階的に確かめることです。bridge のアドレス（<code>172.30.0.1</code>）へは届くか。ホストの物理インタフェースのアドレスへは届くか。外の相手へは届くか。届かなくなった境目が、設定が欠けている場所です。この地道な切り分けが必要になることこそ、私がネットワークを MVP から外した理由そのものです。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>ip_forward</code> が 0 のままだと bridge 止まりになる</div>
+      <p>NAT を正しく書いても、<code>net.ipv4.ip_forward</code> が <code>0</code> のままなら外へは出られません。カーネルが「自分宛でないパケット」を転送する前に捨てるからです。</p>
+      <p>症状は NAT 忘れとよく似ていて、やはり<strong>沈黙</strong>します。違いは「bridge のアドレスまでは届くが、その先へ 1 ホップも進まない」こと。ここでも切り分けは「どこまで届くか」を刻んで確かめるしかありません。</p>
+      <p>もう 1 つ厄介なのが、<code>sysctl -w</code> での設定は<strong>再起動すると消える</strong>ことです。「昨日は動いたのに今日動かない」の典型的な原因になります。恒久化するには設定ファイルに書く必要があり、つまり <strong>mydocker がホストの永続設定に手を出すかどうか</strong>という設計判断が発生します。これも見えにくいコストです。</p>
+    </div>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span>名前解決 — いちばん分かりにくい壊れ方</h2>
+
+    <p>ここまでで、コンテナは IP アドレスを指定すれば外と通信できるようになりました。しかし、まだ 1 つ足りません。</p>
+
+    <p><strong><code>/etc/resolv.conf</code></strong> です。これはコンテナの中のファイルで、「ホスト名を IP アドレスに翻訳してくれるサーバはどこか」を書いておく場所です。第 06 章でやった overlay の上に、このファイルを置いてやる必要があります。</p>
+
+<pre><code><span class="cm"># コンテナの rootfs の中に、名前解決の宛先を書いておく</span>
+<span class="cm"># （実際にはホストの /etc/resolv.conf をそのまま写すことが多い）</span>
+echo "nameserver 8.8.8.8" &gt; /path/to/merged/etc/resolv.conf</code></pre>
+
+    <p>これを忘れたときの壊れ方が、この章でいちばん意地悪です。</p>
+
+    <div class="ascii">resolv.conf を忘れたときの症状
+
+  ping 1.1.1.1        → 通る    ← IP を直に指定すれば動く
+  curl 93.x.x.x       → 通る    ← これも動く
+  curl example.com    → 失敗    ← 名前を使った瞬間だけ落ちる
+
+  「ネットワークは繋がっている」ことが確認できてしまうので、
+  ネットワークの問題だと思わない。アプリのバグを疑い始める。</div>
+
+    <p>IP 直打ちは通るのです。だから「ネットワークは動いている」という確信が持ててしまう。その状態で <code>curl example.com</code> だけが失敗するので、<strong>疑う先がアプリケーション側へ逸れます</strong>。実際には、名前解決だけが別の経路——DNS サーバへの問い合わせ——を通っていて、その宛先が書かれていないだけです。</p>
+
+    <p>名前解決は、他のネットワーク機能とは<strong>層が違う</strong>ということを覚えておいてください。Step 1〜4 はカーネルの機能でした。名前解決は<strong>ユーザ空間のライブラリがファイルを読んで行う</strong>ことなので、カーネルの設定がどれだけ完璧でも、ファイルが無ければ動きません。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>resolv.conf</code> を忘れると、名前解決だけが失敗する</div>
+      <p>症状: <code>ping 1.1.1.1</code> は通るのに <code>curl example.com</code> が失敗する。あるいは「一部のアプリだけ動かない」という報告になる。</p>
+      <p>原因: 名前解決だけが DNS という別の仕組みを通っており、その宛先を書いた <code>/etc/resolv.conf</code> がコンテナの rootfs に無い。</p>
+      <p>気づきにくさ: <strong>他のすべてが正常に見える</strong>ため。ネットワーク疎通の確認を IP アドレスで行っていると、100% 成功します。確認は必ず<strong>名前でも</strong>行ってください。</p>
+      <p>さらに厄介なこと: ホストの <code>/etc/resolv.conf</code> をそのまま写すと、そこに <code>127.0.0.53</code> のようなループバックのアドレスが書いてあることがあります（ホスト上でローカルの DNS キャッシュが動いている場合）。コンテナの netns の中の <code>127.0.0.1</code> は<strong>ホストのループバックではない</strong>ので、写しただけでは動きません。「写せばいい」で済まないのが、この部品の面倒なところです。</p>
+    </div>
+
+    <h2 id="go">Go から実装するとどうなるか — 設計の見取り図</h2>
+
+    <p>ここまでのコマンドを、mydocker の中からどうやって実行するか。これは実装の話に見えて、実は<strong>方針の話</strong>です。そして<strong>着手する前に決めておくべきだった</strong>のが、まさにこの部分でした。</p>
+
+    <p>この教材は「コンテナ関連のライブラリを使わず、カーネルの機能を直接扱う」という縛りで書いています。第 04 章では cgroup のファイルに直接数値を書き、第 05 章ではレジストリの HTTP API を自分で叩き、第 06 章では <code>mount(2)</code> を直接呼びました。同じ方針をネットワークに当てはめると、道は 2 つに分かれます。</p>
+
+    <h3>道 A · netlink のソケットを自分で組み立てる</h3>
+
+    <p><code>ip</code> コマンドがやっていることは、突き詰めると <strong>netlink</strong> という専用のソケットを開いて、決められた形式のバイト列をカーネルへ送ることです。カーネルとユーザ空間がネットワーク設定をやりとりするための、専用の通信路だと思ってください。</p>
+
+    <p>これを Go の標準ライブラリだけでやるのは、<strong>できます</strong>。<code>syscall</code> パッケージには netlink 用のソケットを開く機能があります。ただし、その先が長い。「bridge を 1 つ作る」というたった 1 つの操作のために、メッセージのヘッダを組み、属性を入れ子で詰め、長さフィールドを計算し、境界を 4 バイトに揃え、返ってきたバイト列を解釈してエラーかどうかを判定する——という作業が続きます。しかも失敗したときに返ってくるのは数値のエラーコードだけです。</p>
+
+    <p>これは第 05 章でレジストリの API を自分で叩いたときとは、難しさの質が違います。あちらは HTTP と JSON という、読める形式でした。netlink は<strong>読めないバイト列</strong>です。デバッグの体験がまるで別物になります。</p>
+
+    <h3>道 B · <code>ip</code> コマンドを外部プロセスとして呼ぶ</h3>
+
+    <p>もう 1 つの道は、<code>os/exec</code> で <code>ip</code> コマンドをそのまま呼ぶことです。Step 1〜4 のコマンドを文字列で組み立てて実行する。これなら実装は圧倒的に短く、エラーメッセージも人間が読める形で返ってきます。</p>
+
+    <p>問題は建前です。<strong>「ライブラリを使わずにカーネルの機能を直接扱う」と言いながら、外部コマンドに頼るのは一貫しているのか?</strong> ——ここに線を引かないといけません。</p>
+
+    <p>ちなみに mydocker は、この線を完全には引ききっていません。第 06 章で見たとおり overlay のマウントは <code>syscall.Mount</code> を直接呼んでいますが、教材の中では <code>mount</code> コマンドを使った説明もしています。「学習のために手で確かめるのは外部コマンド、実装は直接呼び出し」という使い分けです。ネットワークにも同じ線が引けるなら、道 A が筋ということになります。</p>
+
+    <h3>そして、この判断こそ先に決めるべきだった</h3>
+
+    <p>私がネットワークに着手しなかった理由を、もう 1 段掘り下げるとここに行き着きます。<strong>方針が決まっていなかった</strong>のです。</p>
+
+    <ul>
+      <li>道 A を選べば、実装コストは Step 1〜5 の設定そのものより、netlink のバイト列を組む作業のほうが大きくなる</li>
+      <li>道 B を選べば実装は数時間で終わるが、教材の一貫性に穴が空く。そして読者は「なぜここだけ外部コマンドなのか」と正当に疑問を持つ</li>
+      <li>どちらを選んでも、Step 1〜5 の <strong>4 つの部品の切り分けコスト</strong>は変わらない</li>
+    </ul>
+
+    <p>着手してから悩み始めていたら、悩んでいる時間そのものが Must の検証時間を食っていたはずです。<strong>「作るか作らないか」を決める前に、「作るならどう作るか」の見通しを立てる。</strong>見通しが立たないなら、それは着手すべきタイミングではない——これがこの章から持ち帰ってほしい、いちばん実務的な教訓かもしれません。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · netlink</div>
+      <p><code>netlink</code> は、ユーザ空間のプログラムとカーネルがやりとりするための、ソケット型の通信路です。<code>AF_NETLINK</code> という種別のソケットを開いて使います。</p>
+      <p>ネットワーク設定に netlink が使われているのは歴史的な理由があります。昔は <code>ioctl</code> という仕組みで設定していたのですが、こちらは 1 回の呼び出しで渡せる情報の形が固定で、IPv6 のように後から増えた概念を表現しきれませんでした。netlink は<strong>可変長の属性を入れ子で詰められる</strong>設計なので、拡張に強い。その柔軟さの代償が、組み立ての面倒さです。</p>
+      <p>ちなみに <code>ip</code> コマンドと、それより古い <code>ifconfig</code> の違いもここにあります。<code>ifconfig</code> は <code>ioctl</code> の時代の道具なので、新しい機能——複数アドレスの割り当てや、名前空間の操作——を表現できません。<strong>ネットワークの操作は <code>ip</code> コマンドを使う</strong>、というのが現在の標準的な作法です。</p>
+    </div>
+
+    <h2 id="hazmap">難所の地図</h2>
+
+    <p>この章で出てきた落とし穴を、1 つの表にまとめます。実装するときは、この表を横に置いておくと切り分けの時間がだいぶ減るはずです。</p>
+
+    <table>
+      <tr><th>難所</th><th>症状</th><th>原因</th></tr>
+      <tr><td>NAT 忘れ</td><td>ping は出るのに応答が返らない</td><td>送信元アドレスが外から到達不能</td></tr>
+      <tr><td>IP フォワード無効</td><td>bridge までは届くが外へ出ない</td><td>カーネルが転送しない</td></tr>
+      <tr><td><code>resolv.conf</code> 忘れ</td><td>IP 直打ちは通るのに名前で失敗</td><td>名前解決だけが別経路</td></tr>
+      <tr><td>netns へ veth を入れる順序</td><td>インタフェースが消えたように見える</td><td>移動後は元の netns から見えない</td></tr>
+      <tr><td>コンテナ終了後の掃除</td><td>veth と iptables ルールが溜まり続ける</td><td>後片付けの対象が増える</td></tr>
+    </table>
+
+    <p>最後の行が、第 07 章の話とそのままつながります。第 07 章で私たちは「終わったら何も残さない」ことに強くこだわりました。overlay をアンマウントし、cgroup のディレクトリを消し、状態ファイルを片付ける。E2E テストでは <strong>10 回起動しても overlay のマウント数が増えないこと</strong>と、<strong>テスト全体でホストのマウント数が元に戻ること</strong>まで確かめました。</p>
+
+    <p>ネットワークを実装すると、この「片付けるべきものリスト」に 2 種類が加わります。</p>
+
+    <ul>
+      <li><strong>veth インタフェース。</strong>通常終了ならペアの相方が消えると自動的に消えます。しかし mydocker 自身が <code>SIGKILL</code> で殺されたら? 第 07 章で見たとおり、そのときは overlay のマウントが残りました。同じことが veth でも起きえます。</li>
+      <li><strong>iptables のルール。</strong>これは自動では消えません。コンテナごとにルールを足す設計にすると、<strong>起動のたびにルールが 1 行ずつ増えていく</strong>ことになります。10 回起動して 10 行残っていたら、それは第 07 章の基準では明確な失敗です。</li>
+    </ul>
+
+    <p>つまりネットワークは、実装コストだけでなく<strong>後片付けの設計コスト</strong>も持ち込みます。第 07 章で <code>Cleanup</code> に組み込んだ「アンマウントが失敗したら削除に進まない」のような慎重な設計を、ネットワークの片付けにも設計し直す必要がある。これも、着手前には見えていなかったコストです。</p>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>実装しなかったのに章を作る意味はあるんですか?</summary>
+      <div class="qa-body">
+        <p>率直な問いなので、率直に答えます。<strong>意味はある、と私は思っています。</strong>ただし理由は「章数を揃えたいから」ではありません。</p>
+        <p>1 つ目の理由。<strong>読者が今の mydocker を誤解しないため</strong>です。この章が無ければ、読者は「7 章まで読んだから、コンテナの隔離は全部分かった」と思って終わります。実際にはネットワークだけ穴が空いている。それを知らずに「自作コンテナで隔離できた」と考えるのは、この教材が生み出せる<strong>最悪の誤解</strong>です。</p>
+        <p>2 つ目の理由。<strong>やらないと決める判断も技術の一部だから</strong>です。実務で書くコードのうち、何を書かないかを決めることは、何を書くかを決めることと同じくらい重要です。にもかかわらず、教材でそれを扱うものはほとんどありません。全部作った話しか載らないからです。この章は「作らなかったものの話」を残す場所です。</p>
+        <p>3 つ目の理由。<strong>実際、これから作る人には地図が要る</strong>から。Step 1〜5 と難所の表は、私が読んで調べて整理したものです。これから実装する人が同じ調査を最初からやる必要はありません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>ネットワークが隔離されていないのに「コンテナ」と呼んでいいんですか?</summary>
+      <div class="qa-body">
+        <p>呼んでいいと思いますが、注釈が要ります。</p>
+        <p>実は Docker にも <code>--network host</code> というオプションがあって、まさに今の mydocker と同じ状態——ホストの netns をそのまま使う——でコンテナを起動できます。性能が要る場面や、ホストのネットワークをそのまま見たい場面で実際に使われます。つまり<strong>「ネットワークを隔離しないコンテナ」という形態は、実運用にも存在します</strong>。</p>
+        <p>違いは、Docker では<strong>それが選択肢である</strong>のに対し、mydocker では<strong>それしかない</strong>ことです。選べるのと選べないのとでは、道具としての性質が違います。</p>
+        <p>正確に書くならこうなります——mydocker は、UTS・PID・マウント・IPC を隔離し、資源を制限し、イメージの層を重ねられるコンテナランタイムであり、<strong>ネットワークの隔離だけを持たない</strong>。この一行が書ければ、呼び方の問題は解決します。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>Cloneflags</code> に <code>CLONE_NEWNET</code> を足すだけではだめなんですか?</summary>
+      <div class="qa-body">
+        <p>足すだけなら 1 行です。そして<strong>足した瞬間、コンテナは外とまったく通信できなくなります</strong>。</p>
+        <p>理由は「LINUX メモ · ネットワーク名前空間」で書いたとおりで、新しく作った netns は空っぽだからです。中にあるのは電源の入っていない <code>lo</code> だけ。外へ出る線が 1 本もありません。</p>
+        <p>つまり <code>CLONE_NEWNET</code> を足すというのは、<strong>Step 1〜5 を全部やることとセット</strong>です。片方だけやると、今より確実に悪くなります（今は少なくとも通信できるので）。「隔離されていないが通信はできる」状態と「隔離されているが通信できない」状態のどちらがマシかと言えば、道具としては前者です。</p>
+        <p>これも、私が中途半端に着手しなかった理由の 1 つです。<strong>途中まで実装した状態は、実装しない状態より悪い</strong>という、珍しい性質を持った機能なのです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>第 05 章でイメージを取ってこられたのは、ネットワークがあったからですよね?</summary>
+      <div class="qa-body">
+        <p>鋭い質問です。答えは「ネットワークがあったから」ではなく、<strong>「ネットワークを隔離していないから」</strong>です。</p>
+        <p>もう少し丁寧に言うと、第 05 章のレジストリからの取得は、<strong>コンテナの中ではなくホスト側で走っています</strong>。<code>mydocker pull</code> はコンテナを起動しません。ホスト上のただのプロセスとして HTTPS を喋り、取ってきたレイヤを <code>/var/lib/mydocker/layers/</code> に置くだけです。だから、そもそもコンテナのネットワークとは無関係でした。</p>
+        <p>では <code>mydocker run</code> がイメージを取ってくる場合は? これも同じで、コンテナを起動する<strong>前に</strong>ホスト側で取得を済ませ、そのあとで overlay を組んで起動します。順序としてはネットワークが要る場面が先に終わっています。</p>
+        <p>ただし、<strong>コンテナの中で <code>apk add</code> のようなコマンドを打った場合</strong>は話が別で、それはコンテナのネットワーク（＝今はホストのもの）を使います。ここが動いているのは、まさに隔離していないおかげです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>4 つの部品のうち、どれか 1 つだけ先に作って試すことはできますか?</summary>
+      <div class="qa-body">
+        <p>できますし、実装するならその順序を強くおすすめします。ただし「試す」の意味を段階ごとに変える必要があります。</p>
+        <p><strong>Step 1（bridge）まで</strong>: コンテナが無くても、ホストで <code>ip link</code> を見て存在を確認できます。ここは独立して検証できる、いちばん安全な一歩です。</p>
+        <p><strong>Step 2（veth）まで</strong>: コンテナの中に <code>eth0</code> が現れることを確認できます。まだ IP は無いので通信はできません。</p>
+        <p><strong>Step 3（IP と経路）まで</strong>: コンテナ ↔ ホストの疎通が確認できます。ここが最初の「通った!」の瞬間です。ただし<strong>ここで満足してはいけない</strong>ことは Step 3 の hazard で書いたとおりです。</p>
+        <p><strong>Step 4（転送と NAT）まで</strong>: ようやく外と通信できます。ここまで来て初めて「ネットワークができた」と言えます。</p>
+        <p><strong>Step 5（resolv.conf）まで</strong>: 名前で通信できます。実用上、ここまでやらないと使い物になりません。</p>
+        <p>段階ごとに「何が確認できるようになるか」を先に決めておくのが、この手の作業を切り分ける唯一の方法です。逆に言うと、これを決めずに 5 つ全部書いてから動かすと、どこが悪いか分からない状態から始まることになります。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>コンテナ同士を通信させないようにしたい場合は、どこをいじるんですか?</summary>
+      <div class="qa-body">
+        <p>今の mydocker では<strong>不可能</strong>です。全コンテナがホストの netns を共有しているので、区切る単位が存在しません。</p>
+        <p>Step 1〜5 を実装したとしても、あの構成では全コンテナが同じ bridge にぶら下がるので、やはり互いに通信できます。区切りたいなら、次のどちらかが要ります。</p>
+        <p>1 つは <strong>bridge を複数用意する</strong>方法。<code>mydocker0</code> / <code>mydocker1</code> のように分け、通信させたくないコンテナは別の bridge にぶら下げます。Docker の「ユーザ定義ネットワーク」がおおむねこの発想です。</p>
+        <p>もう 1 つは <strong><code>iptables</code> のフィルタ規則で止める</strong>方法。同じ bridge のままで、特定の組み合わせだけを落とすルールを書きます。柔軟ですが、ルールの管理が一気に難しくなります。</p>
+        <p>どちらにせよ、この章の Step 1〜5 が<strong>できてからの話</strong>です。地図の外側、と思ってください。</p>
+      </div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。この章はコードが無いぶん、言葉で説明できるかどうかがそのまま理解度になります。</p>
+
+    <details class="qa"><summary>Q1. いまのコンテナで <code>ip -o addr</code> を打つと、なぜホストと同じアドレスが出るのですか?</summary>
+      <div class="qa-body">
+        <p><code>internal/container/run.go</code> の <code>Cloneflags</code> に <code>CLONE_NEWNET</code> が含まれていないからです。名前空間は<strong>明示的に指定したものだけ</strong>が新しく作られ、指定しなかったものは親（＝ホスト）のものをそのまま共有します。</p>
+        <p>指定しているのは UTS・PID・マウント・IPC の 4 つ。ネットワークは指定していないので、コンテナはホストのネットワーク名前空間の中にいます。したがって、そこから見えるインタフェースもアドレスも経路表も、すべてホストのものです。</p>
+        <p>ここで大事なのは、<strong>これはバグではない</strong>ということです。指定しなかったものが共有されるのは名前空間の設計どおりの振る舞いで、要件定義でもネットワークはスコープ外と明記してあります。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q2. veth ペアが「必ず 2 本 1 組」であることは、なぜ重要なのですか?</summary>
+      <div class="qa-body">
+        <p>名前空間という壁を<strong>貫通させるため</strong>です。</p>
+        <p>名前空間は、中と外を完全に分けます。分けたままでは通信できないので、どこかに穴が必要です。veth は 2 本 1 組で、片方に入れたものが必ずもう片方から出るという性質を持っているので、<strong>両端を別々の名前空間に置くと、そのまま壁を貫通する 1 本の線になります</strong>。</p>
+        <p>もし veth が単体で作れる（相方のいない）インタフェースだったら、パケットの行き先が定義できません。「片端に入れたら必ずもう片端から出る」という保証があるからこそ、線として使えます。</p>
+        <p>さらに言えば、この設計は<strong>穴が明示的である</strong>ことも保証しています。veth を作って引っ越させるという操作をしない限り、名前空間の壁に穴は空きません。うっかり漏れるということが起きない設計です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q3. Step 3 まで終わった時点で「ネットワークができた」と言えないのはなぜですか?</summary>
+      <div class="qa-body">
+        <p>通じているのが<strong>同じ bridge の内側だけ</strong>だからです。</p>
+        <p>Step 3 までで確立するのは、コンテナ ↔ ホスト（bridge のアドレス）と、コンテナ ↔ コンテナの疎通です。これは <code>172.30.0.0/16</code> という閉じた範囲の中の話で、その外へは 1 バイトも出ていません。</p>
+        <p>外へ出るには 2 つ足りません。1 つはカーネルの転送許可（<code>net.ipv4.ip_forward=1</code>）で、これが無いと自分宛でないパケットは捨てられます。もう 1 つが NAT で、これが無いと出ていけても<strong>返事が返ってきません</strong>。</p>
+        <p>そして厄介なのは、Step 3 の時点で ping が通ってしまうので、<strong>できた気になれてしまう</strong>ことです。この「部分的な成功が誤解を生む」構造こそが、この作業の難しさの本体です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q4. 「ping は出るのに応答が返らない」とき、まず何を疑いますか? そしてなぜその症状になるのですか?</summary>
+      <div class="qa-body">
+        <p>まず疑うのは <strong>NAT（MASQUERADE）の設定漏れ</strong>です。</p>
+        <p>症状の理屈はこうです。コンテナが送信元 <code>172.30.0.2</code> でパケットを出す。ホストがそれを転送する。相手に届く。相手は返事を作り、宛先に <code>172.30.0.2</code> と書く。ところが <code>172.30.0.2</code> はプライベートアドレスなので、<strong>インターネット上のどのルータもそこへの経路を知りません</strong>。返事は途中で捨てられます。</p>
+        <p>だから送信側から見ると「送れているのに黙っている」状態になります。エラーは出ません——エラーを出す相手がいないからです。</p>
+        <p>NAT はこの問題を、出ていくパケットの送信元をホストのアドレスに書き換えることで解決します。書き換えた対応を表に控えておき、返事が来たら元のアドレスに戻す。この表を持っているからこそ、返事を正しいコンテナへ配れます。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q5. <code>resolv.conf</code> の忘れが「いちばん分かりにくい壊れ方」と言われるのはなぜですか?</summary>
+      <div class="qa-body">
+        <p><strong>他のすべてが正常に動いて見えるから</strong>です。</p>
+        <p><code>ping 1.1.1.1</code> は通ります。IP アドレスを直に指定した通信は全部通ります。つまり、ネットワークの疎通確認を IP で行うかぎり <strong>100% 成功します</strong>。この状態で「ネットワークは正常」と結論づけるのは、極めて自然な判断です。</p>
+        <p>ところが <code>curl example.com</code> だけが失敗する。ここで疑いの矛先はアプリケーション側や、相手のサーバへ向かいます。実際の原因はネットワーク設定なのに、ネットワークは無罪だと確認してしまっている。この「無罪の証明を先に取ってしまう」構造が、切り分けを狂わせます。</p>
+        <p>層が違うことも理由です。Step 1〜4 はカーネルの機能でしたが、名前解決は<strong>ユーザ空間のライブラリが <code>/etc/resolv.conf</code> というファイルを読んで行う</strong>処理です。カーネル側の設定をいくら見直しても出てきません。</p>
+        <p>予防策は単純で、疎通確認を<strong>必ず名前でも行う</strong>ことです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q6. ネットワークを MVP から外した判断を、一言で説明してください。</summary>
+      <div class="qa-body">
+        <p>模範解答の一例: <strong>「4 つの部品のどれか 1 つ欠けても通信できず、しかも失敗が沈黙として現れるため切り分けコストが読めない。その不確実な作業に時間を割くより、Must と Should を検証込みで仕上げることを優先した」</strong>。</p>
+        <p>ここで避けたい答えが「時間が無かったから」です。これは理由の形をしていますが、何も説明していません。時間はいつでも足りないので、本当に言うべきなのは<strong>何を優先したか</strong>です。</p>
+        <p>もう 1 段付け足せると、さらに良い答えになります。<strong>「途中まで実装した状態が、実装しない状態より悪くなる機能だった」</strong>——<code>CLONE_NEWNET</code> だけ足すと、隔離はされるが通信ができなくなる。今は隔離されていないが通信はできる。道具としては後者のほうが使えます。だから「少しだけ着手する」という選択肢が存在しませんでした。</p>
+      </div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>この章には実装がないので、確認するのは「作ったものが動くこと」ではありません。<strong>いまの状態を自分の目で確かめること</strong>が、この章の完了の合図です。</p>
+      <p>コンテナの中で <code>ip -o addr</code> を打ってください。そこに<strong>ホストと同じアドレスがそのまま見えていれば</strong>、この章は完了です。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'ip -o addr'
+<span class="out">1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+2: eth0    inet 192.0.2.2/24 brd 192.0.2.255 scope global eth0\       valid_lft forever preferred_lft forever</span></code></pre>
+      <p>この 2 行を見て「あ、これはホストのアドレスだ。ネットワーク名前空間を作っていないからだ」と即座に言えれば、この章の目的は達成されています。7 章かけて積み上げた隔離の壁に、ここだけ穴が空いている——その事実を、誤解なく持って次へ進んでください。</p>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>この章で分かったのは、コンテナのネットワークが <strong>4 つの部品でできている</strong>ということでした。仮想的なスイッチ（bridge）を立て、壁を貫通する 1 本のケーブル（veth ペア）を渡し、コンテナ側に住所と道順（IP とデフォルトルート）を与え、外へ出るときに送信元を書き換える（転送許可と NAT）。そこに名前解決のファイルを 1 つ置いて、ようやく「使えるネットワーク」になります。そして、この 4 つはどれか 1 つ欠けても通信できず、しかも欠けたときの症状がほとんど<strong>沈黙</strong>で表れる。だから切り分けの時間が読めない。それが、この機能を Must の後ろに置いた理由でした。「時間が無かった」ではなく「何を優先したか」で説明できる判断として、記録しておく価値のあるものだと思っています。</p>
+
+    <p>そして、いまの mydocker は<strong>ネットワークだけ隔離されていません</strong>。コンテナの <code>eth0</code> はホストの <code>eth0</code> そのもので、開いたポートはホストのポート、コンテナ同士は素通しでつながります。この状態でも通信は普通にできてしまうので、放っておけば気づかないまま使い続けることになります。だからこの章を置きました。<strong>それを知っていて使うのと、知らずに使うのとは、まったく別のこと</strong>です。知っていれば「このコンテナでサーバを立てるならポートの衝突に気をつける」と判断できます。知らなければ、衝突したときに原因にたどり着けません。第 00 章から一貫して言ってきた「壊れたときに原因にたどり着けること」は、実装した機能だけでなく、<strong>実装しなかった機能についても</strong>成り立たなければいけません。</p>
+
+    <p>次の第 09 章は、この教材の最後の章です。ここまでで作ったものを一度全部並べ、そのうえで<strong>何が足りないかを正直に並べます</strong>。ネットワークだけではありません——rootless 実行、権限の絞り込み、イメージのビルド、ボリューム、複数コンテナの取りまとめ。どれも「本物のコンテナランタイム」には当たり前にあって、mydocker には無いものです。それらを 1 つずつ、なぜ無いのか・作るなら何が要るのかという形で並べ、最後に <code>docker run</code> の一行の中で何が起きているかを、もう一度最初から通しで見ます。<strong>作ったものの総括と、作らなかったものの一覧</strong>——その両方を持って、この本を閉じます。</p>
+
+    <div class="chap-foot">
+      <a class="pager" href="07-cli.html"><span class="dir">← 前へ</span>第07章 · 道具にする</a>
+      <a class="pager next" href="09-beyond.html"><span class="dir">次へ →</span>第09章 · さらに先へ</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

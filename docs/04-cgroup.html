@@ -1,0 +1,1289 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第04章 資源に上限をかける — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第04章 / 全10章 · 層: CGROUP · 読了目安 3〜4時間</div>
+    <div class="eyebrow"><span>Cgroup</span><span class="depth">— 世界に底を入れる</span></div>
+    <h1>資源に上限をかける</h1>
+    <p class="lede">ここまでで、コンテナは自分だけの世界を持ちました。プロセス番号も、ホスト名も、ファイルシステムの根も、ホストとは別物です。けれど、その世界には<strong>底がありません</strong>。中で走るプロセスは、ホストのメモリを好きなだけ食えるし、CPU を独占できます。この章では、その底を入れます。やることは驚くほど単純です。<strong>ディレクトリを作り、ファイルに数字を書き、もう1つのファイルに PID を書く。</strong>それだけです。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p><code>internal/cgroup/cgroup.go</code> を頭から終わりまで読み切り、「cgroup とは要するにファイル操作である」ことを自分の手で確かめる。そのうえで <strong>v2 と v1 の2つのバックエンドがなぜ両方必要になったのか</strong>を、この環境の実測から説明できるようになる。仕上げに、<strong>上限なしなら成功し、上限 10m なら <code>exit 137</code> で殺される</strong>という対照実験を自分で走らせる。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#step-1">手で触ってみる — ディレクトリを作って数字を書く</a></li>
+        <li><a href="#step-2">「書けた」は「効いた」ではない</a></li>
+        <li><a href="#step-3">cgroup v2 の作法 — subtree_control と内部プロセス禁止</a></li>
+        <li><a href="#step-4">★この環境では v2 が使えなかった</a></li>
+        <li><a href="#step-5">だから2バックエンドにした — findV2Root</a></li>
+        <li><a href="#step-6">cgroup v1 の作法 — コントローラごとに別の階層</a></li>
+        <li><a href="#step-7">Apply — 作っただけでは効かない</a></li>
+        <li><a href="#step-8">後片付け — rm -rf では消えない</a></li>
+        <li><a href="#step-9">終了コードの翻訳 — 255 では伝わらない</a></li>
+      </ol>
+    </div>
+
+    <h2>底の無い世界は、隣を殺す</h2>
+
+    <p>前章までに作ったコンテナを思い出してください。中で <code>ps</code> を打つと自分のプロセスしか見えず、<code>hostname</code> は <code>mydocker</code> を返し、<code>ls /</code> は alpine の中身を返しました。見事に隔離されています。</p>
+
+    <p>ところが、この隔離は<strong>「見え方」の隔離でしかありません</strong>。名前空間は、プロセスに見せる名札の集合を分けているだけです。分けていないものがあります。<strong>実際の物、つまりメモリと CPU と、プロセス表の枠</strong>です。コンテナの中で 8GB のメモリを確保するプログラムを走らせれば、ホストのメモリが 8GB 減ります。無限ループで <code>fork</code> し続ければ、ホストのプロセス表が埋まって、ホスト側で新しいコマンドが打てなくなります。</p>
+
+    <div class="ascii">名前空間だけを付けた状態 — 「見え方」は分かれたが、物は共有のまま
+
+  ┌──────────── ホストの物理資源（メモリ / CPU / プロセス表）────────────┐
+  │                                                                     │
+  │   ┌── コンテナ A ──┐   ┌── コンテナ B ──┐   ┌── ホストの仕事 ──┐  │
+  │   │ PID 1,7 だけ   │   │ PID 1,5 だけ   │   │ sshd, systemd … │  │
+  │   │ hostname=…     │   │ hostname=…     │   │                  │  │
+  │   └────────────────┘   └────────────────┘   └──────────────────┘  │
+  │        ↑                                                            │
+  │        └─ ここが 8GB 確保すると、B もホストも巻き添えで死ぬ         │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  名前空間 = 名札を分ける仕組み
+  cgroup   = 物の取り分に上限をかける仕組み  ← この章で足すもの</div>
+
+    <p>つまり、名前空間と cgroup は<strong>別の道具</strong>です。名前空間は「見えるもの」を仕切り、cgroup は「使えるもの」を仕切ります。この2つが揃って初めて、コンテナは「他人に迷惑をかけない実行単位」になります。<code>docker run --memory 512m</code> の <code>--memory</code> が担っているのが、まさにこの後者です。</p>
+
+    <h2>cgroup とは何か — ディレクトリと数字だけ</h2>
+
+    <p>「control groups」という名前と、カーネル機能という響きから、身構えてしまうかもしれません。私も最初はそうでした。<code>ioctl</code> のような専用のシステムコールを呼ぶのだろう、と。</p>
+
+    <p>違いました。<strong>cgroup の操作は、ほぼ全部がふつうのファイル操作です。</strong>専用のファイルシステム（cgroupfs）が <code>/sys/fs/cgroup</code> にマウントされていて、そこに<strong>ディレクトリを作ると新しいグループができ</strong>、その中に自動的に現れる<strong>ファイルに数字を書くと上限が決まり</strong>、<code>cgroup.procs</code> というファイルに <strong>PID を書くとそのプロセスがグループに入ります</strong>。</p>
+
+    <div class="ascii">cgroup v2 の階層 — mydocker が作るもの
+
+  /sys/fs/cgroup/                     ← cgroupfs のルート（v2 なら単一の木）
+  ├ cgroup.controllers                  「この階層で使えるコントローラ」の一覧（読み取り専用）
+  ├ cgroup.subtree_control              「子に配るコントローラ」を指定する（書き込む）
+  ├ cgroup.procs                        このグループに属する PID の一覧
+  │
+  └ mydocker/                         ← ① 親（mydocker が作る。groupName）
+    ├ cgroup.subtree_control            ← ② ここでも子に配る指定が要る
+    └ a10f2703bb37/                   ← ③ 葉（コンテナ ID ごと。ここに入れる）
+      ├ memory.max                      "10485760"     … メモリ上限（バイト）
+      ├ memory.swap.max                 "0"            … スワップまで使わせない
+      ├ cpu.max                         "50000 100000" … 100ms 中 50ms ＝ 0.5 コア
+      ├ pids.max                        "64"           … プロセス数の上限
+      └ cgroup.procs                    "23900"        ← ★ここに PID を書いて初めて効く</div>
+
+    <p>この図の右側にある文字列は、全部ただのテキストです。<code>echo 10485760 &gt; memory.max</code> と打てば上限がかかります。Go から書くなら <code>os.WriteFile</code> の1行です。<strong>魔法はどこにもありません。</strong></p>
+
+    <p>この章の8割は、この事実に慣れるための時間です。そして残りの2割が、実際にやってみると出てくる「作法」の話 —— <code>subtree_control</code>、内部プロセス禁止、v1 と v2 の違い、そして<strong>この環境では v2 が使えなかったという実測</strong> —— です。</p>
+
+    <h2>用語をここで揃えておく</h2>
+
+    <p>読み進める前に、この章で繰り返し出る言葉を並べておきます。今すぐ覚える必要はありません。詰まったらここに戻ってください。</p>
+
+    <table>
+      <tr><th>言葉</th><th>意味</th></tr>
+      <tr><td>cgroup</td><td>control group。プロセスの集合に資源の上限をかけるカーネルの仕組み。実体はファイルシステム</td></tr>
+      <tr><td>cgroupfs</td><td>cgroup を操作するための特殊なファイルシステム。<code>/sys/fs/cgroup</code> にマウントされているのが普通</td></tr>
+      <tr><td>コントローラ</td><td>資源の種類ごとの担当（<code>memory</code> / <code>cpu</code> / <code>pids</code> / <code>blkio</code> …）。有効になっていない種類の上限はかけられない</td></tr>
+      <tr><td>v1 / v2</td><td>cgroup の2つの世代。v1 は<strong>コントローラごとに別々の木</strong>、v2 は<strong>1本の木にまとめる</strong></td></tr>
+      <tr><td>hybrid 構成</td><td>v1 と v2 が同じマシンに同居している状態。<strong>この環境がまさにこれ</strong></td></tr>
+      <tr><td><code>cgroup.procs</code></td><td>そのグループに属するプロセスの一覧。PID を書き込むと、そのプロセスが移動する</td></tr>
+      <tr><td><code>cgroup.subtree_control</code></td><td>v2 だけにあるファイル。<strong>子ディレクトリに配るコントローラ</strong>を <code>+memory</code> のように書いて指定する</td></tr>
+      <tr><td>内部プロセス禁止</td><td>v2 の規則。コントローラを子に配っているディレクトリには、プロセスを直接入れられない</td></tr>
+      <tr><td>OOM killer</td><td>メモリが足りなくなったときにプロセスを強制終了するカーネルの機能。上限超過はこれで殺される</td></tr>
+      <tr><td>exit 137</td><td>SIGKILL(9) で殺されたことを表す終了コード（128 + 9）。この章の合格判定に使う</td></tr>
+    </table>
+
+    <h2>この章で書くファイルの全体像</h2>
+
+    <p>担当する src ファイルは1つ、<code>internal/cgroup/cgroup.go</code> です。まず入口だけ見ておきます。パッケージのコメントに、この章で言いたいことがそのまま書いてあります。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — 冒頭</div>
+<pre><code><span class="cm">// Package cgroup は cgroup による資源制限を扱う。</span>
+<span class="cm">//</span>
+<span class="cm">// cgroup は「ファイルシステム操作そのもの」である。ディレクトリを作り、ファイルに数値を書き、</span>
+<span class="cm">// cgroup.procs に PID を書く。それだけで上限が効く。魔法は無い。</span>
+<span class="cm">//</span>
+<span class="cm">// ただし作法が cgroup v2 と v1 で違う。しかも「v2 がマウントされている」ことと</span>
+<span class="cm">// 「v2 で memory が使える」ことは別である（疎通実験 00_smoke_test.md §3.3 で実際に踏んだ）。</span>
+<span class="cm">// そこでこのパッケージは v2 を優先し、memory コントローラが v2 側に見えなければ v1 に落ちる。</span>
+<span class="kw">package</span> cgroup
+
+<span class="kw">import</span> (
+	<span class="st">"errors"</span>
+	<span class="st">"fmt"</span>
+	<span class="st">"os"</span>
+	<span class="st">"path/filepath"</span>
+	<span class="st">"strconv"</span>
+	<span class="st">"strings"</span>
+	<span class="st">"syscall"</span>
+)</code></pre>
+
+    <p>import を見てください。<code>errors</code> <code>fmt</code> <code>os</code> <code>path/filepath</code> <code>strconv</code> <code>strings</code> <code>syscall</code>。<strong>外部ライブラリは1つも使っていません</strong>し、<code>syscall</code> ですら使うのは1か所（<code>Statfs</code>）だけです。あとは全部 <code>os.WriteFile</code> と <code>os.MkdirAll</code> と <code>os.Remove</code>、つまりファイル操作です。これがこの章の主張の証拠になっています。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — 定数と型</div>
+<pre><code><span class="cm">// cgroup2 のスーパーブロックマジック。statfs の f_type がこの値なら cgroup v2 である。</span>
+<span class="cm">// /sys/fs/cgroup が tmpfs のこともある（v1 と v2 が同居する hybrid 構成）ので、</span>
+<span class="cm">// パスの存在ではなくファイルシステムの種類で判定する。</span>
+<span class="kw">const</span> cgroup2Magic = <span class="st">0x63677270</span>
+
+<span class="cm">// groupName は mydocker が作る親ディレクトリの名前。</span>
+<span class="cm">// 実際のコンテナはこの下の &lt;コンテナID&gt; に作られる。</span>
+<span class="kw">const</span> groupName = <span class="st">"mydocker"</span>
+
+<span class="cm">// Limits は利用者が指定した上限。ゼロ値は「上限なし」を意味する。</span>
+<span class="kw">type</span> <span class="ty">Limits</span> <span class="kw">struct</span> {
+	<span class="ty">MemoryBytes</span> <span class="kw">int64</span>   <span class="cm">// 例: 10485760（10MiB）</span>
+	<span class="ty">CPUs</span>        <span class="kw">float64</span> <span class="cm">// 例: 0.5（0.5 コア分）</span>
+	<span class="ty">PidsMax</span>     <span class="kw">int64</span>   <span class="cm">// 例: 64</span>
+}
+
+<span class="cm">// IsZero は上限が1つも指定されていないことを返す。</span>
+<span class="kw">func</span> (l <span class="ty">Limits</span>) <span class="ty">IsZero</span>() <span class="kw">bool</span> {
+	<span class="kw">return</span> l.<span class="ty">MemoryBytes</span> == <span class="st">0</span> &amp;&amp; l.<span class="ty">CPUs</span> == <span class="st">0</span> &amp;&amp; l.<span class="ty">PidsMax</span> == <span class="st">0</span>
+}
+
+<span class="cm">// Cgroup は作成済みの cgroup 1つを表す。</span>
+<span class="kw">type</span> <span class="ty">Cgroup</span> <span class="kw">struct</span> {
+	version <span class="kw">string</span>   <span class="cm">// "v2" または "v1"</span>
+	dirs    []<span class="kw">string</span> <span class="cm">// 実際に作ったディレクトリ（後片付けの対象）</span>
+	id      <span class="kw">string</span>
+}
+
+<span class="cm">// Version は使ったバックエンドを返す（"v2" / "v1"）。</span>
+<span class="kw">func</span> (c *<span class="ty">Cgroup</span>) <span class="ty">Version</span>() <span class="kw">string</span> { <span class="kw">return</span> c.version }
+
+<span class="cm">// Dirs は作成した cgroup ディレクトリの一覧を返す。後片付けの検査に使う。</span>
+<span class="kw">func</span> (c *<span class="ty">Cgroup</span>) <span class="ty">Dirs</span>() []<span class="kw">string</span> { <span class="kw">return</span> <span class="kw">append</span>([]<span class="kw">string</span>(<span class="kw">nil</span>), c.dirs...) }</code></pre>
+
+    <p><code>Cgroup</code> 構造体が持っているのは、<strong>バージョン名と「作ったディレクトリの一覧」と ID だけ</strong>です。ファイルディスクリプタも、カーネルへのハンドルも持ちません。持つ必要がないのです。cgroup の実体はディレクトリなので、パスさえ覚えておけば後から何でもできます。</p>
+
+    <p><code>Dirs()</code> が <code>append([]string(nil), c.dirs...)</code> でコピーを返しているのは、呼び出し側にスライスの中身を書き換えられないようにするためです。ここは Go の定番の作法です。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — 入口</div>
+<pre><code><span class="cm">// ErrUnsupported はこの環境で cgroup による制限がかけられないことを表す。</span>
+<span class="cm">// ⚠ 黙って無視してはいけない。上限を指定したのに効かないまま動くのが最悪の結果である。</span>
+<span class="kw">var</span> <span class="ty">ErrUnsupported</span> = errors.<span class="ty">New</span>(<span class="st">"この環境では cgroup による資源制限が使えない（v2 に memory が無く、v1 の階層も見つからない）"</span>)
+
+<span class="cm">// New は id に対応する cgroup を作り、limits を書き込む。</span>
+<span class="cm">// この時点ではまだプロセスは所属していない。Apply で入れる。</span>
+<span class="kw">func</span> <span class="ty">New</span>(id <span class="kw">string</span>, limits <span class="ty">Limits</span>) (*<span class="ty">Cgroup</span>, <span class="kw">error</span>) {
+	<span class="kw">if</span> root, ok := findV2Root(); ok {
+		<span class="kw">return</span> newV2(root, id, limits)
+	}
+	<span class="kw">if</span> roots, ok := findV1Roots(); ok {
+		<span class="kw">return</span> newV1(roots, id, limits)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>, <span class="ty">ErrUnsupported</span>
+}</code></pre>
+
+    <p>この章のこれからの道のりが、この <code>New</code> 9行に全部畳み込まれています。<strong>v2 を探して、あれば v2 の作法で作る。無ければ v1 を探して、v1 の作法で作る。どちらも無ければ、黙って進まずにエラーを返す。</strong></p>
+
+    <p>最後の1行が大事です。<code>return nil, ErrUnsupported</code> —— 上限をかけられないなら、<strong>コンテナを起動しません</strong>。「上限を指定したのに、実は効いていないまま動いていた」が、この章でいちばん避けたい結末だからです。呼び出し側（<code>internal/container/run.go</code>）でも同じ姿勢が貫かれています。</p>
+
+    <div class="file-tag">internal/container/run.go — 抜粋</div>
+<pre><code>	<span class="cm">// --- 2. 資源の上限を用意する（プロセスはまだ入れない）---</span>
+	<span class="kw">var</span> cg *cgroup.<span class="ty">Cgroup</span>
+	<span class="kw">if</span> !cfg.<span class="ty">Limits</span>.<span class="ty">IsZero</span>() {
+		cg, err = cgroup.<span class="ty">New</span>(id, cfg.<span class="ty">Limits</span>)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="cm">// ⚠ 上限を指定したのに黙って無視して走らせるのが最悪の結果。必ず止める。</span>
+			_ = cleanup(<span class="kw">nil</span>)
+			<span class="kw">return</span> <span class="st">1</span>, err
+		}
+		st.<span class="ty">CgroupDirs</span> = cg.<span class="ty">Dirs</span>()
+		st.<span class="ty">CgroupVersion</span> = cg.<span class="ty">Version</span>()
+	}</code></pre>
+
+    <p>では、ここから1段ずつ登っていきます。最初は Go を書かずに、シェルだけで cgroup を触ります。</p>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>手で触ってみる — ディレクトリを作って数字を書く</h2>
+
+    <p>コードを読む前に、手を動かします。cgroup が「ただのファイル操作」だと納得するには、実際にファイルを操作するのが一番早いからです。</p>
+
+    <p>この環境の <code>/sys/fs/cgroup/memory/</code> の下にディレクトリを1つ作ってみます。名前は何でもよいので <code>smoketest</code> にします。作った瞬間、そのディレクトリの中に<strong>カーネルがファイルを勝手に生やします</strong>。私たちは <code>touch</code> も <code>mkdir</code> も何もしていないのに、です。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>ディレクトリを1つ作り、<code>memory.limit_in_bytes</code> に 10485760（＝10MiB）と書いて、読み返します。</p>
+      <pre class="term"><code><span class="ps">$</span> mkdir -p /sys/fs/cgroup/memory/smoketest
+<span class="ps">$</span> echo 10485760 &gt; /sys/fs/cgroup/memory/smoketest/memory.limit_in_bytes
+<span class="ps">$</span> cat /sys/fs/cgroup/memory/smoketest/memory.limit_in_bytes
+<span class="out">10485760</span></code></pre>
+      <p>ついでに <code>pids</code> でも同じことをしてみます。こちらは「同時に存在できるプロセス数」の上限です。</p>
+      <pre class="term"><code><span class="ps">$</span> mkdir -p /sys/fs/cgroup/pids/smoketest
+<span class="ps">$</span> echo 64 &gt; /sys/fs/cgroup/pids/smoketest/pids.max
+<span class="ps">$</span> cat /sys/fs/cgroup/pids/smoketest/pids.max
+<span class="out">64</span></code></pre>
+    </div>
+
+    <p>これで終わりです。<strong>API も、ライブラリも、特別なシステムコールも出てきませんでした。</strong><code>mkdir</code> と <code>echo</code> と <code>cat</code> だけです。</p>
+
+    <p>ここで少し中を覗いてみましょう。作ったディレクトリではなく、その親（<code>/sys/fs/cgroup/memory/</code> 自体）にどんなファイルがあるかを見ると、cgroup が用意している「つまみ」の種類が分かります。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>memory コントローラのディレクトリに並ぶファイル（抜粋）。</p>
+      <pre class="term"><code><span class="ps">$</span> ls /sys/fs/cgroup/memory/
+<span class="out">cgroup.clone_children  memory.limit_in_bytes      memory.stat
+cgroup.event_control   memory.max_usage_in_bytes  memory.swappiness
+cgroup.procs           memory.memsw.limit_in_bytes memory.usage_in_bytes
+memory.failcnt         memory.oom_control         memory.use_hierarchy
+...</span></code></pre>
+    </div>
+
+    <p>名前を眺めるだけで、だいたい何ができるか想像がつきます。<code>memory.usage_in_bytes</code> は現在の使用量、<code>memory.max_usage_in_bytes</code> はこれまでの最大値、<code>memory.failcnt</code> は<strong>上限に当たった回数</strong>。<code>cgroup.procs</code> は所属プロセスの一覧です。全部テキストファイルとして読み書きできます。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · cgroup.procs と tasks の違い</div>
+      <p>cgroup v1 のディレクトリには <code>cgroup.procs</code> と <code>tasks</code> の2つがあります。紛らわしいのですが、意味がはっきり違います。</p>
+      <p><strong><code>tasks</code> は「スレッド」単位</strong>です。ここに書いた番号のスレッド1本だけが移動します。マルチスレッドのプロセスなら、他のスレッドは元のグループに残ります。</p>
+      <p><strong><code>cgroup.procs</code> は「プロセス」単位</strong>です。PID を書くと、そのプロセスに属する<strong>全スレッドがまとめて移動</strong>します。私たちが欲しいのは当然こちらです。コンテナの中の <code>/bin/sh</code> のスレッドが1本だけ制限されても意味がありません。</p>
+      <p>cgroup v2 では、この混乱を減らすためにスレッド単位の扱いが別枠（threaded mode）に切り出され、通常の <code>cgroup.procs</code> はプロセス単位に統一されました。mydocker は v1 でも v2 でも <code>cgroup.procs</code> だけを使います。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>cat</code> で確認しただけで満足する</div>
+      <p>今やったことを整理すると、「<code>echo</code> で書いて、<code>cat</code> で読んだら同じ値が返ってきた」だけです。これは<strong>「ファイルに値が入った」ことの証明でしかありません</strong>。</p>
+      <p>「上限が効いている」ことの証明には<strong>まったくなっていない</strong>のです。値が入っていても、そのグループにプロセスが1つも入っていなければ、誰も制限されません。実際この後の Step 7 で見るとおり、<code>cgroup.procs</code> に PID を書き忘れると、<code>memory.max</code> に値が入っているのに1バイトも制限されない cgroup ができあがります。</p>
+      <p>次の Step 2 は、まるごとこの話に使います。</p>
+    </div>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>「書けた」は「効いた」ではない</h2>
+
+    <p>10MB の上限を書いた <code>smoketest</code> グループが手元にあります。ここに実際にプロセスを入れて、<strong>200MB を確保しにいかせます</strong>。効いていれば、途中で殺されるはずです。効いていなければ、200MB 確保して平然と終わるはずです。どちらになるかを見ます。</p>
+
+    <p>使ったのは Python 3 で書いた 4 行のプログラムです。1行目で<strong>自分自身の PID を <code>cgroup.procs</code> に書き込んで</strong>、グループに入っています。あとは 1MiB ずつ 200 回、バイト列を足していくだけです。</p>
+
+    <div class="file-tag">/tmp/hog.py（疎通実験で使ったスクリプト）</div>
+<pre><code>import os
+open("/sys/fs/cgroup/memory/smoketest/cgroup.procs","w").write(str(os.getpid()))
+b = bytearray()
+for i in range(200):
+    b += bytearray(1024*1024)
+print("allocated", len(b))</code></pre>
+
+    <p>注目してほしいのは <code>print("allocated", len(b))</code> の行です。<strong>最後まで走り切れば、この行が印字されます。</strong>逆に言えば、この行が出なければ、途中で殺されたということです。合否の判定がはっきりします。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>10MB の上限がかかったグループの中で、200MB を確保しにいきます。</p>
+      <pre class="term"><code><span class="ps">$</span> python3 /tmp/hog.py; echo "exit=$?"
+<span class="out">/bin/bash: line 32:  5187 Killed                  python3 /tmp/hog.py
+exit=137</span>
+<span class="ps">$</span> cat /sys/fs/cgroup/memory/smoketest/memory.failcnt
+<span class="out">37</span></code></pre>
+    </div>
+
+    <p>効きました。読み取れることが3つあります。</p>
+
+    <p><strong>① <code>allocated ...</code> が印字されていない。</strong>プログラムは最後まで到達しませんでした。上限の中で 200MB は確保できなかったということです。</p>
+
+    <p><strong>② シェルが <code>Killed</code> と報告し、終了コードが 137 になっている。</strong>137 は 128 + 9 です。9 は SIGKILL の番号なので、「SIGKILL で殺された」を意味します。誰が殺したかというと、カーネルの OOM killer です。</p>
+
+    <p><strong>③ <code>memory.failcnt</code> が 37 に増えている。</strong>これはカーネル側の帳簿です。「このグループが上限に当たった回数」が 37 回記録されています。私たちの実験が偶然クラッシュしたのではなく、<strong>カーネルが上限として認識して、何度もブロックした結果</strong>だと分かります。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · OOM killer</div>
+      <p>OOM は Out Of Memory の略です。Linux は、メモリが足りなくなったときに<strong>プロセスを選んで強制終了する</strong>という荒っぽい解決策を持っています。それが OOM killer です。</p>
+      <p>普通は「マシン全体のメモリが枯渇したとき」に発動しますが、cgroup の memory コントローラを使うと<strong>そのグループの中だけで発動させる</strong>ことができます。グループの使用量が <code>memory.max</code>（v1 なら <code>memory.limit_in_bytes</code>）を超えそうになると、カーネルはまずページを回収しようとし、それでも足りなければ<strong>そのグループの中から犠牲者を選んで SIGKILL を送ります</strong>。</p>
+      <p>ここで重要なのは、<strong>殺されるプロセスは自分が殺されることを知らない</strong>という点です。SIGKILL は捕捉も無視もできません。「メモリ確保に失敗した」というエラーが返ってくるのではなく、いきなり消えます。だからこそ、上限超過を検出する手段は「エラーメッセージ」ではなく<strong>「終了コード 137」</strong>になります。Step 9 で、この 137 をきちんと利用者まで届ける話をします。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · テストのほうが間違っていることがある</div>
+      <p>実は、mydocker の実装中に一度ここで転びました。最初に書いた確認コマンドはこうでした。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --memory 10m alpine sh -c 'head -c 100000000 /dev/zero | wc -c'</code></pre>
+      <p>「10MB 制限の中で 100MB 読ませれば死ぬだろう」という発想です。ところが結果は <code>100000000</code> が表示されて <code>exit=0</code>。私は「上限が効いていない」と思いかけました。</p>
+      <p><strong>間違っていたのはテストのほうでした。</strong><code>head | wc</code> は<strong>ストリームを流すだけで、メモリに溜めません</strong>。パイプのバッファ（せいぜい 64KB）を通り抜けていくだけなので、10MB の上限には永遠に当たりません。100GB 流しても死にません。</p>
+      <p>そこで確認の方法を変えました。<code>dd</code> に大きな <code>bs</code>（ブロックサイズ）を与えて、<strong>1回で 100MB のバッファを確保させる</strong>のです。<code>dd if=/dev/zero of=/dev/null bs=100M count=1</code> なら、読み込みバッファとして 100MB を一度に取ろうとするので、確実に上限に当たります。</p>
+      <p>教訓は2つあります。<strong>(1) メモリ上限のテストは「溜める」操作でないと意味がない。</strong><strong>(2) 上限あり・上限なしの両方を走らせて差を見る。</strong>片方だけを見ていると、失敗しているのが上限なのかテストなのか永久に分かりません。この章の関所（後述）は、必ず対照とペアで行います。</p>
+    </div>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>cgroup v2 の作法 — subtree_control と内部プロセス禁止</h2>
+
+    <p>手で触った感触は掴めました。ここからは Go で同じことをします。ただし今度は cgroup <strong>v2</strong> の作法で書きます。v2 は新しい世代で、これから作る環境ではこちらが標準になるからです（Step 4 で、この環境では使えないと分かるのですが、それは後の話です）。</p>
+
+    <p>v2 でやることは、v1 とほとんど同じに見えます。<code>/sys/fs/cgroup/mydocker/&lt;コンテナID&gt;/</code> というディレクトリを作り、その中のファイルに書きます。ファイル名だけが違います。</p>
+
+    <table>
+      <tr><th>上限の種類</th><th>v2 のファイル</th><th>書く値の例</th></tr>
+      <tr><td>メモリ</td><td><code>memory.max</code></td><td><code>10485760</code>（バイト数をそのまま）</td></tr>
+      <tr><td>スワップ</td><td><code>memory.swap.max</code></td><td><code>0</code>（スワップは一切使わせない）</td></tr>
+      <tr><td>CPU</td><td><code>cpu.max</code></td><td><code>50000 100000</code>（後述）</td></tr>
+      <tr><td>プロセス数</td><td><code>pids.max</code></td><td><code>64</code></td></tr>
+      <tr><td>所属プロセス</td><td><code>cgroup.procs</code></td><td><code>23900</code>（PID）</td></tr>
+    </table>
+
+    <p><code>cpu.max</code> の <code>"50000 100000"</code> だけ説明が要ります。これは<strong>「quota period」の2値</strong>で、単位はマイクロ秒です。「100000μs（＝100ミリ秒）の期間ごとに、最大 50000μs（＝50ミリ秒）だけ CPU を使ってよい」という意味になります。割り算すると 0.5 —— つまり <strong>0.5 コア分</strong>です。<code>--cpus 0.5</code> という指定が、この2つの数字に翻訳されるわけです。</p>
+
+    <p>そして、v2 に特有の作法が2つあります。ここが引っかかりどころです。</p>
+
+    <h3>作法① 親の subtree_control でコントローラを配る</h3>
+
+    <p>v1 では、<code>/sys/fs/cgroup/memory/</code> の下にディレクトリを作れば、その中に <code>memory.*</code> のファイルが自動的に生えました。木そのものが memory 専用だったからです。</p>
+
+    <p>v2 は<strong>1本の木に全コントローラが同居</strong>します。そのため、「この子ディレクトリでは memory を使う」ということを<strong>親が明示的に宣言</strong>しなければなりません。その宣言をするファイルが <code>cgroup.subtree_control</code> です。<code>+memory</code> と書き込むと、<strong>その時点から子ディレクトリに <code>memory.max</code> などが生えるようになります</strong>。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · subtree_control を忘れると memory.max が「作られない」</div>
+      <p>この失敗は、非常に分かりにくい形で現れます。<code>mkdir</code> は成功します。エラーは何も出ません。ところが <code>ls</code> してみると、<strong>そこに <code>memory.max</code> というファイルが存在しない</strong>のです。</p>
+      <p>そこへ <code>os.WriteFile</code> で書き込もうとすると <code>no such file or directory</code> で落ちます。この時点でエラーを握りつぶす実装（<code>_ = write(...)</code> のような書き方）をしていると、<strong>「上限を設定したつもりのコンテナが、何の制限も受けずに走り出す」</strong>という最悪の状態になります。</p>
+      <p>だから mydocker は、<code>subtree_control</code> への書き込みで <strong><code>memory</code> だけは失敗をエラーにします</strong>（<code>cpu</code> と <code>pids</code> の失敗は許します）。メモリ上限がこの教材の Must だからです。</p>
+    </div>
+
+    <h3>作法② 内部プロセス禁止（no internal processes）</h3>
+
+    <p>もう1つの規則が、初見だと理不尽に見えるものです。<strong>コントローラを子に配っているディレクトリには、プロセスを直接入れられません。</strong>プロセスを入れられるのは<strong>木の葉（子を持たないディレクトリ）だけ</strong>です。</p>
+
+    <div class="ascii">v2 の「内部プロセス禁止」規則
+
+  ✗ できない配置                      ○ できる配置
+
+  mydocker/                           mydocker/
+  ├ cgroup.subtree_control            ├ cgroup.subtree_control  ← +memory を書いた
+  │   ← +memory を書いてある          │
+  ├ cgroup.procs  ← ここに PID を     ├ a10f2703bb37/   （葉）
+  │                  書くと EBUSY     │ ├ memory.max     ← 上限を書く
+  └ a10f2703bb37/                     │ └ cgroup.procs   ← ★PID はここに書く
+                                      └ 0c1be9ad663a/   （葉）
+                                        ├ memory.max
+                                        └ cgroup.procs
+
+  規則: コントローラを「子に配っている」ディレクトリは、
+        自分ではプロセスを持てない（中間ノードは空でなければならない）</div>
+
+    <p>なぜこんな規則があるのか。理由は<strong>資源配分の計算を素直にするため</strong>です。もし親ディレクトリが直接プロセスを持ちながら、同時に子グループにも資源を配っていたら、「親の直属プロセスと子グループを、どういう比率で競わせるのか」という厄介な問いが生まれます。v1 はこれを許していて、実際に配分の意味が曖昧になっていました。v2 は「中間ノードは空にする」と決めることで、この曖昧さを消しました。</p>
+
+    <p>実務上の帰結はシンプルです。<strong>親（<code>mydocker/</code>）は箱として作るだけ。実際のコンテナは必ずその下に葉として作り、PID は葉の <code>cgroup.procs</code> に書く。</strong>mydocker の実装はまさにそうなっています。</p>
+
+    <p>階層の設計を誤ると、書き込みが <code>EBUSY</code>（デバイスまたはリソースがビジー）や <code>ENOTSUP</code>（サポートされていない操作）で弾かれます。エラーメッセージからは原因が読み取りにくいので、この2つの規則を先に知っておくと時間を大幅に節約できます。</p>
+
+    <h3>実装 — newV2</h3>
+
+    <p>以上を踏まえて、v2 のグループを作る関数です。コメントに落とし穴がそのまま書いてあります。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — newV2</div>
+<pre><code><span class="kw">func</span> newV2(root, id <span class="kw">string</span>, limits <span class="ty">Limits</span>) (*<span class="ty">Cgroup</span>, <span class="kw">error</span>) {
+	parent := filepath.<span class="ty">Join</span>(root, groupName)
+	leaf := filepath.<span class="ty">Join</span>(parent, id)
+
+	<span class="cm">// ⚠ 親の cgroup.subtree_control でコントローラを有効にしないと、</span>
+	<span class="cm">//    子ディレクトリに memory.max などのファイルがそもそも作られない。</span>
+	<span class="kw">if</span> err := enableSubtree(root); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(parent, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"cgroup の親ディレクトリを作れませんでした: %w"</span>, err)
+	}
+	<span class="kw">if</span> err := enableSubtree(parent); err != <span class="kw">nil</span> {
+		_ = os.<span class="ty">Remove</span>(parent)
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+	<span class="cm">// ⚠ cgroup v2 の「内部プロセス禁止」規則により、プロセスを入れられるのは葉だけである。</span>
+	<span class="cm">//    parent には入れず、必ず leaf を作ってそこに入れる。</span>
+	<span class="kw">if</span> err := os.<span class="ty">Mkdir</span>(leaf, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"cgroup ディレクトリを作れませんでした: %w"</span>, err)
+	}
+
+	c := &amp;<span class="ty">Cgroup</span>{version: <span class="st">"v2"</span>, dirs: []<span class="kw">string</span>{leaf}, id: id}
+
+	<span class="kw">if</span> limits.<span class="ty">MemoryBytes</span> &gt; <span class="st">0</span> {
+		<span class="kw">if</span> err := write(leaf, <span class="st">"memory.max"</span>, strconv.<span class="ty">FormatInt</span>(limits.<span class="ty">MemoryBytes</span>, <span class="st">10</span>)); err != <span class="kw">nil</span> {
+			c.<span class="ty">Destroy</span>()
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+		<span class="cm">// スワップまで許すと「上限を超えても死なない」ので、スワップ側も同じ値で締める。</span>
+		<span class="cm">// swap accounting が無い環境では失敗するが、それは致命ではない。</span>
+		_ = write(leaf, <span class="st">"memory.swap.max"</span>, <span class="st">"0"</span>)
+	}
+	<span class="kw">if</span> limits.<span class="ty">CPUs</span> &gt; <span class="st">0</span> {
+		<span class="cm">// cpu.max は "&lt;quota&gt; &lt;period&gt;"。period 100000us(=100ms) のうち何us使えるか。</span>
+		<span class="kw">const</span> period = <span class="st">100000</span>
+		quota := <span class="kw">int64</span>(limits.<span class="ty">CPUs</span> * period)
+		<span class="kw">if</span> err := write(leaf, <span class="st">"cpu.max"</span>, fmt.<span class="ty">Sprintf</span>(<span class="st">"%d %d"</span>, quota, period)); err != <span class="kw">nil</span> {
+			c.<span class="ty">Destroy</span>()
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+	}
+	<span class="kw">if</span> limits.<span class="ty">PidsMax</span> &gt; <span class="st">0</span> {
+		<span class="kw">if</span> err := write(leaf, <span class="st">"pids.max"</span>, strconv.<span class="ty">FormatInt</span>(limits.<span class="ty">PidsMax</span>, <span class="st">10</span>)); err != <span class="kw">nil</span> {
+			c.<span class="ty">Destroy</span>()
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+	}
+	<span class="kw">return</span> c, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>逐行で追います。</p>
+
+    <p><strong>1〜2行目</strong>で <code>parent</code>（<code>&lt;root&gt;/mydocker</code>）と <code>leaf</code>（<code>&lt;root&gt;/mydocker/&lt;ID&gt;</code>）のパスを組み立てます。ここではまだディレクトリは作っていません。</p>
+
+    <p><strong>次に <code>enableSubtree(root)</code></strong>。ルート（<code>/sys/fs/cgroup</code>）で「子に memory / cpu / pids を配る」と宣言します。これをしないと、次に作る <code>mydocker/</code> の中にコントローラのファイルが生えません。</p>
+
+    <p><strong><code>os.MkdirAll(parent, 0o755)</code></strong> で親を作り、<strong>もう一度 <code>enableSubtree(parent)</code></strong>。ここがポイントです。<code>subtree_control</code> は<strong>1段ぶんしか効きません</strong>。ルートで宣言したから孫にも効く、ということはないのです。「親から子へ配る」という宣言なので、<strong>階層を1段下るたびに、その段でもう一度配り直す</strong>必要があります。ここを忘れると、葉に <code>memory.max</code> が生えません。</p>
+
+    <p><strong><code>os.Mkdir(leaf, 0o755)</code></strong> で葉を作ります。ここは <code>MkdirAll</code> ではなく <code>Mkdir</code> です。親は既に作ってあるので中間ディレクトリの作成は不要ですし、<strong>もし同名の葉が既にあれば失敗してほしい</strong>（コンテナ ID の衝突は異常事態）ので、あえて厳しいほうを使っています。</p>
+
+    <p>そのあとは、指定された上限を順に書くだけです。<code>limits.MemoryBytes &gt; 0</code> のように<strong>ゼロ値を「指定なし」として扱う</strong>ので、<code>--memory</code> を付けなければメモリ関係のファイルには一切触りません。</p>
+
+    <p>失敗したときに <code>c.Destroy()</code> を呼んでから返しているのにも注目してください。<strong>途中まで作ったディレクトリを残して立ち去らない</strong>ためです。この姿勢は Step 8 でもう一度出てきます。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · <code>_ = write(...)</code> という書き方</div>
+      <p><code>memory.swap.max</code> への書き込みだけ <code>_ = write(...)</code> と、戻り値を捨てています。Go では戻り値を無視するとき、明示的に <code>_</code> に代入する習慣があります（<code>go vet</code> や linter に「無視し忘れ」と区別させるため）。</p>
+      <p>ここで失敗を許している理由はコメントのとおりです。スワップの会計（swap accounting）はカーネルの設定で無効になっていることがあり、そういう環境では <code>memory.swap.max</code> が存在しません。<strong>存在しないなら、そもそもスワップに逃がされる心配も薄い</strong>ので、致命的ではないと判断しています。</p>
+      <p>逆に <code>memory.max</code> の失敗は絶対に許しません。<strong>「無視してよい失敗」と「無視してはいけない失敗」を区別して書くこと自体が設計判断です。</strong>全部無視するのも、全部エラーにするのも、どちらも間違いです。</p>
+    </div>
+
+    <h3>subtree_control に書く関数</h3>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — enableSubtree</div>
+<pre><code><span class="cm">// enableSubtree は dir の subtree_control に必要なコントローラを足す。</span>
+<span class="cm">// 既に有効なものを足しても害はない。権限や構成の都合で一部が拒否されることがあるので、</span>
+<span class="cm">// 1つずつ書いて「memory すら通らない」ときだけエラーにする。</span>
+<span class="kw">func</span> enableSubtree(dir <span class="kw">string</span>) <span class="kw">error</span> {
+	path := filepath.<span class="ty">Join</span>(dir, <span class="st">"cgroup.subtree_control"</span>)
+	cur, _ := os.<span class="ty">ReadFile</span>(path)
+	<span class="kw">var</span> memErr <span class="kw">error</span>
+	<span class="kw">for</span> _, ctrl := <span class="kw">range</span> []<span class="kw">string</span>{<span class="st">"memory"</span>, <span class="st">"cpu"</span>, <span class="st">"pids"</span>} {
+		<span class="kw">if</span> hasField(<span class="kw">string</span>(cur), ctrl) {
+			<span class="kw">continue</span>
+		}
+		err := os.<span class="ty">WriteFile</span>(path, []<span class="kw">byte</span>(<span class="st">"+"</span>+ctrl), <span class="st">0o644</span>)
+		<span class="kw">if</span> err != <span class="kw">nil</span> &amp;&amp; ctrl == <span class="st">"memory"</span> {
+			memErr = fmt.<span class="ty">Errorf</span>(<span class="st">"cgroup v2 で memory を有効にできませんでした (%s): %w"</span>, path, err)
+		}
+	}
+	<span class="kw">return</span> memErr
+}</code></pre>
+
+    <p>3つのコントローラを<strong>1つずつ別々に書いています</strong>。<code>"+memory +cpu +pids"</code> とまとめて書くこともできますが、そうすると<strong>1つでも拒否されると全部が失敗</strong>します。この環境のように「cpu だけ使えない」ようなケースで、memory の上限まで諦めることになってしまいます。1つずつ書けば、通るものは通ります。</p>
+
+    <p>そして <code>memory</code> の失敗だけを <code>memErr</code> に記録して返します。<strong>メモリ上限は Must、CPU と PID 数は Should</strong> という優先順位が、そのままコードの形になっています。</p>
+
+    <h3>ついでに — <code>--memory 10m</code> はどう解釈されるか</h3>
+
+    <p>ここまで一貫して「バイト数」で話してきましたが、利用者が打つのは <code>--memory 10m</code> です。この翻訳をしているのが <code>ParseMemory</code> です。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — ParseMemory</div>
+<pre><code><span class="cm">// ParseMemory は "10m" / "512k" / "1g" / "1048576" を解釈してバイト数を返す。</span>
+<span class="kw">func</span> <span class="ty">ParseMemory</span>(s <span class="kw">string</span>) (<span class="kw">int64</span>, <span class="kw">error</span>) {
+	s = strings.<span class="ty">TrimSpace</span>(strings.<span class="ty">ToLower</span>(s))
+	<span class="kw">if</span> s == <span class="st">""</span> {
+		<span class="kw">return</span> <span class="st">0</span>, <span class="kw">nil</span>
+	}
+	mult := <span class="kw">int64</span>(<span class="st">1</span>)
+	<span class="kw">switch</span> {
+	<span class="kw">case</span> strings.<span class="ty">HasSuffix</span>(s, <span class="st">"k"</span>), strings.<span class="ty">HasSuffix</span>(s, <span class="st">"kb"</span>):
+		mult, s = <span class="st">1</span>&lt;&lt;<span class="st">10</span>, strings.<span class="ty">TrimSuffix</span>(strings.<span class="ty">TrimSuffix</span>(s, <span class="st">"b"</span>), <span class="st">"k"</span>)
+	<span class="kw">case</span> strings.<span class="ty">HasSuffix</span>(s, <span class="st">"m"</span>), strings.<span class="ty">HasSuffix</span>(s, <span class="st">"mb"</span>):
+		mult, s = <span class="st">1</span>&lt;&lt;<span class="st">20</span>, strings.<span class="ty">TrimSuffix</span>(strings.<span class="ty">TrimSuffix</span>(s, <span class="st">"b"</span>), <span class="st">"m"</span>)
+	<span class="kw">case</span> strings.<span class="ty">HasSuffix</span>(s, <span class="st">"g"</span>), strings.<span class="ty">HasSuffix</span>(s, <span class="st">"gb"</span>):
+		mult, s = <span class="st">1</span>&lt;&lt;<span class="st">30</span>, strings.<span class="ty">TrimSuffix</span>(strings.<span class="ty">TrimSuffix</span>(s, <span class="st">"b"</span>), <span class="st">"g"</span>)
+	}
+	n, err := strconv.<span class="ty">ParseInt</span>(strings.<span class="ty">TrimSpace</span>(s), <span class="st">10</span>, <span class="st">64</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"メモリ量として解釈できません: %q（例: 10m, 512k, 1g）"</span>, s)
+	}
+	<span class="kw">if</span> n &lt;= <span class="st">0</span> {
+		<span class="kw">return</span> <span class="st">0</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"メモリ量は正の数で指定してください: %q"</span>, s)
+	}
+	<span class="kw">return</span> n * mult, <span class="kw">nil</span>
+}</code></pre>
+
+    <p><code>1&lt;&lt;20</code> は 2 の 20 乗、つまり 1048576 です。<code>10m</code> なら <code>10 * 1048576 = 10485760</code> —— Step 1 で手で書いたのと同じ数字になります。</p>
+
+    <p>細かいところですが、<strong>単位なしの数字（<code>1048576</code>）もそのまま通る</strong>ようにしてあります。<code>switch</code> のどのケースにも当たらなければ <code>mult</code> は 1 のままだからです。そして <code>0</code> や負数は明示的にエラーにします。<strong><code>--memory 0</code> を「上限なし」と黙って解釈されると事故になる</strong>ので、意図を確認させるためです。</p>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>★この環境では v2 が使えなかった</h2>
+
+    <p>ここがこの章の転回点です。</p>
+
+    <p>ここまで v2 の作法を丁寧に書いてきました。教科書どおりなら、この <code>newV2</code> だけで話は終わりです。実際、多くの入門記事は v2 だけを書いて終わっています。</p>
+
+    <p>ところが、<strong>実装を1行も書く前に行った疎通実験で、この環境では v2 が使えないことが分かりました。</strong>その過程を、実測のまま全部お見せします。「なぜ2バックエンドが必要になったのか」は、この節を読まないと絶対に納得できないからです。</p>
+
+    <h3>① まず素直に v2 を見る → ファイルが無い</h3>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>v2 のルートにあるはずの2ファイルを読んでみます。</p>
+      <pre class="term"><code><span class="ps">$</span> cat /sys/fs/cgroup/cgroup.controllers
+<span class="out">cat: /sys/fs/cgroup/cgroup.controllers: No such file or directory</span>
+<span class="ps">$</span> cat /sys/fs/cgroup/cgroup.subtree_control
+<span class="out">cat: /sys/fs/cgroup/cgroup.subtree_control: No such file or directory</span></code></pre>
+    </div>
+
+    <p>そもそもファイルが存在しません。なぜかというと、<code>/sys/fs/cgroup</code> が cgroup2fs ではないからです。確かめます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>stat -fc %T</code> でファイルシステムの種類を見ます。</p>
+      <pre class="term"><code><span class="ps">$</span> uname -r
+<span class="out">6.18.5</span>
+<span class="ps">$</span> stat -fc %T /sys/fs/cgroup/
+<span class="out">tmpfs</span></code></pre>
+    </div>
+
+    <p><strong><code>tmpfs</code></strong>。cgroupfs ではなく、ただのメモリ上のファイルシステムです。カーネルは 6.18.5 —— v2 が使えないほど古いわけがありません。何が起きているのでしょう。</p>
+
+    <h3>② 何がマウントされているのか調べる</h3>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>/sys/fs/cgroup</code> の中身と、cgroup 関連のマウントを全部並べます。</p>
+      <pre class="term"><code><span class="ps">$</span> ls -la /sys/fs/cgroup/
+<span class="out">total 0
+drwxrwxrwt 10 root root 200 Aug  2 07:26 .
+drwxr-xr-x 11 root root   0 Aug  2 07:26 ..
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 blkio
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 cpu
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 cpuacct
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 devices
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 freezer
+dr-xr-xr-x  3 root root   0 Aug  2 07:26 memory
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 pids
+dr-xr-xr-x  2 root root   0 Aug  2 07:26 unified</span>
+<span class="ps">$</span> mount | grep cgroup
+<span class="out">tmpfs on /sys/fs/cgroup type tmpfs (rw,relatime)
+cgroup on /sys/fs/cgroup/cpu type cgroup (rw,relatime,cpu)
+cgroup on /sys/fs/cgroup/cpuacct type cgroup (rw,relatime,cpuacct)
+cgroup on /sys/fs/cgroup/memory type cgroup (rw,relatime,memory)
+cgroup on /sys/fs/cgroup/devices type cgroup (rw,relatime,devices)
+cgroup on /sys/fs/cgroup/freezer type cgroup (rw,relatime,freezer)
+cgroup on /sys/fs/cgroup/blkio type cgroup (rw,relatime,blkio)
+cgroup on /sys/fs/cgroup/pids type cgroup (rw,relatime,pids)
+cgroup2 on /sys/fs/cgroup/unified type cgroup2 (rw,relatime)</span></code></pre>
+    </div>
+
+    <p>謎が解けました。<code>/sys/fs/cgroup</code> は<strong>ただの置き場（tmpfs）</strong>で、その下に<strong>v1 のコントローラが1つずつ別マウント</strong>されています。<code>type cgroup</code> と書かれている行が v1 です。そして最後の行、<code>unified/</code> には <strong><code>type cgroup2</code></strong> —— つまり v2 も同時にマウントされています。</p>
+
+    <div class="ascii">hybrid 構成 — v1 と v2 が同居している
+
+  /sys/fs/cgroup/                    ← tmpfs（ただの置き場。cgroup ではない！）
+  │                                     stat -fc %T が tmpfs を返す理由がこれ
+  ├ blkio/     ← cgroup  (v1)  ┐
+  ├ cpu/       ← cgroup  (v1)  │
+  ├ cpuacct/   ← cgroup  (v1)  │  それぞれが独立した「別のマウント・別の木」。
+  ├ devices/   ← cgroup  (v1)  ├─ 同じコントローラは1か所にしか結び付けない。
+  ├ freezer/   ← cgroup  (v1)  │
+  ├ memory/    ← cgroup  (v1)  │  ★memory はここ（v1）に取られている
+  ├ pids/      ← cgroup  (v1)  ┘
+  │
+  └ unified/   ← cgroup2 (v2)     v2 も同時にマウントされている。
+      └ cgroup.controllers = "cpuset hugetlb"
+                                   ★memory も cpu も pids も、ここには居ない
+
+  結論: 「v2 がマウントされている」ことと
+        「v2 で memory が使える」ことは、まったく別の話</div>
+
+    <p><code>/proc/self/cgroup</code> を見ると、この二重生活がもっとはっきりします。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>自分自身のプロセスが、どの cgroup に属しているかを見ます。</p>
+      <pre class="term"><code><span class="ps">$</span> cat /proc/self/cgroup
+<span class="out">7:pids:/
+6:blkio:/
+5:freezer:/
+4:devices:/
+3:memory:/process_api/019fc9b0-aeea-7122-9c35-01e1302d5859
+2:cpuacct:/
+1:cpu:/
+0::/</span></code></pre>
+    </div>
+
+    <p>読み方は「<code>階層ID:コントローラ名:パス</code>」です。<strong>数字付きの行が v1</strong>、<strong>先頭が <code>0::</code> の行が v2</strong> です。1つのプロセスが v1 の7つの木と v2 の木に<strong>同時に</strong>属しているのが分かります。これが hybrid 構成の姿です。</p>
+
+    <p>ちなみに <code>3:memory:/process_api/019fc9b0-…</code> の行は、この開発環境そのものが誰か（ホスト側の管理システム）によって既にメモリ制限された cgroup の中に置かれていることを示しています。<strong>私たちは既に誰かの cgroup の中にいて、その中でさらに子の cgroup を作ろうとしている</strong>わけです。入れ子は cgroup でも普通に起きます。</p>
+
+    <h3>③ v2 側で memory は使えるのか → 使えない</h3>
+
+    <p>ここが決定打です。<code>unified/</code> に v2 があるなら、そこで <code>memory</code> が使えるかもしれません。<code>cgroup.controllers</code> を読めば分かります。このファイルは「この階層で使えるコントローラの一覧」だからです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>v2 側で何が使えるかを読みます。</p>
+      <pre class="term"><code><span class="ps">$</span> cat /sys/fs/cgroup/unified/cgroup.controllers
+<span class="out">cpuset hugetlb</span></code></pre>
+      <p>念のため、自分で新しく cgroup2 をマウントしても同じか確かめました。</p>
+      <pre class="term"><code><span class="ps">$</span> mkdir -p /tmp/cg2 &amp;&amp; mount -t cgroup2 none /tmp/cg2
+<span class="ps">$</span> cat /tmp/cg2/cgroup.controllers
+<span class="out">cpuset hugetlb</span></code></pre>
+    </div>
+
+    <p><strong><code>cpuset hugetlb</code> の2つだけ。</strong><code>memory</code> も <code>cpu</code> も <code>pids</code> も居ません。しかも、自分で新しく cgroup2 をマウントし直しても結果は同じでした。</p>
+
+    <p>理由はこうです。<strong>1つのコントローラは、v1 と v2 のどちらか一方にしか結び付けられません。</strong>カーネルの制約です。この環境では <code>memory</code> / <code>cpu</code> / <code>pids</code> が<strong>先に v1 側に取られている</strong>ので、v2 からは永久に見えません。マウントし直そうが、新しい場所にマウントしようが、取り合いの結果は変わらないのです。</p>
+
+    <p>この事実が意味するのは、決定的なことです。</p>
+
+    <blockquote>
+      <p><strong>v2 だけで書いた実装は、この環境では「<code>memory.max</code> が作られない」という形で静かに失敗する。</strong></p>
+      <cite>00_smoke_test.md §3.3</cite>
+    </blockquote>
+
+    <p>「静かに」というのが厄介です。<code>mkdir</code> は成功します。<code>cgroup2</code> のマウントも見つかります。「v2 が使える環境だ」と判定して先に進むと、葉に <code>memory.max</code> が存在せず、書き込みだけが失敗します。そこでエラーを丁寧に扱っていなければ、<strong>上限が効かないコンテナが平然と起動</strong>します。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>stat</code> が <code>tmpfs</code> でも「v2 が無い」とは限らない</div>
+      <p>この節でいちばん誤解しやすいのがここです。<code>stat -fc %T /sys/fs/cgroup/</code> が <code>tmpfs</code> を返したからといって、<strong>「このマシンに cgroup v2 は無い」と結論してはいけません</strong>。実際、この環境には <code>/sys/fs/cgroup/unified</code> にちゃんと v2 が居ました。</p>
+      <p>逆も成り立ちます。<code>/sys/fs/cgroup</code> が cgroup2fs だったとしても、<strong>そこで <code>memory</code> が使えるとは限りません</strong>。コントローラの取り合いに負けていれば <code>cgroup.controllers</code> に <code>memory</code> は現れません。</p>
+      <p>つまり、<strong>ファイルシステムの種類だけを見ても、パスの存在だけを見ても、判定としては不十分</strong>です。「memory が使えるか」を知りたいなら、<strong>「memory が使えるか」を直接聞く</strong>しかありません。それが次の Step でやることです。</p>
+    </div>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · cgroup v1 と v2 の違い</div>
+      <p><strong>v1 は「コントローラごとに別の木」</strong>です。<code>memory</code> の木、<code>cpu</code> の木、<code>pids</code> の木 …… とマウント点が分かれています。だから、あるプロセスを「memory の木では A グループ、cpu の木では B グループ」に置くことができました。柔軟ですが、階層が互いに食い違うと配分の意味が説明できなくなります。後片付けの対象も、コントローラの数だけ増えます。</p>
+      <p><strong>v2 は「1本の木にまとめる」</strong>設計です（だから unified hierarchy と呼ばれます）。プロセスの居場所は1つに決まり、その場所に対して各コントローラが上限をかけます。代わりに、どのコントローラを子に配るかを <code>cgroup.subtree_control</code> で明示する必要が生まれ、「内部プロセス禁止」の規則も入りました。<strong>柔軟さを捨てて、意味の一貫性を取った</strong>のが v2 です。</p>
+      <p>ファイル名の対応もだいたい規則的です。<code>memory.limit_in_bytes</code> → <code>memory.max</code>、<code>cpu.cfs_quota_us</code> + <code>cpu.cfs_period_us</code> → <code>cpu.max</code>（2値を1ファイルに統合）。v2 のほうが名前が短く、単位の一貫性もあります。</p>
+    </div>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span>だから2バックエンドにした — findV2Root</h2>
+
+    <p>Step 4 の実測を受けて、設計を決めました。選択肢は3つありました。</p>
+
+    <table>
+      <tr><th>案</th><th>内容</th><th>判定</th></tr>
+      <tr><td>A</td><td>v2 だけ実装し、この環境では cgroup を諦める（Should に降格）</td><td>却下。<strong>v1 経由なら実際に効くのに、動かさずに終わる</strong>ことになる</td></tr>
+      <tr><td>B</td><td>v1 だけ実装する</td><td>却下。新しい環境（v2 単独）で動かなくなる。教材としても古い作法だけを教えることになる</td></tr>
+      <tr><td>C</td><td><strong>v2 優先・v1 フォールバック</strong></td><td><strong>採用</strong></td></tr>
+    </table>
+
+    <p>C を選んだ結果、実装コストは1ファイル分増えました。しかし、<strong>「設定できた」と「効いた」の差を読者に見せる</strong>というこの教材の核が守られました。上限が効かない環境で「効かないので省略します」と書くのと、実際に効かせて <code>exit 137</code> を見せるのとでは、伝わるものがまったく違います。</p>
+
+    <p>さて、C を実装するには「v2 が使えるか」を判定する関数が要ります。Step 4 で分かったことを、そのままコードにします。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — findV2Root</div>
+<pre><code><span class="cm">// findV2Root は「memory コントローラが実際に使える」cgroup v2 のルートを探す。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ ここが疎通実験でいちばん効いた分岐である。</span>
+<span class="cm">// cgroup2 がマウントされていても cgroup.controllers に memory が無いことがある。</span>
+<span class="cm">// hybrid 構成では memory が v1 側に取られており、v2 からは決して使えない。</span>
+<span class="cm">// 「マウントされているか」ではなく「コントローラが見えるか」で判定する。</span>
+<span class="kw">func</span> findV2Root() (<span class="kw">string</span>, <span class="kw">bool</span>) {
+	candidates := []<span class="kw">string</span>{
+		<span class="st">"/sys/fs/cgroup"</span>,
+		<span class="st">"/sys/fs/cgroup/unified"</span>, <span class="cm">// hybrid 構成ではここに v2 がぶら下がる</span>
+	}
+	<span class="kw">for</span> _, root := <span class="kw">range</span> candidates {
+		<span class="kw">var</span> st syscall.<span class="ty">Statfs_t</span>
+		<span class="kw">if</span> err := syscall.<span class="ty">Statfs</span>(root, &amp;st); err != <span class="kw">nil</span> {
+			<span class="kw">continue</span>
+		}
+		<span class="kw">if</span> <span class="kw">uint32</span>(st.<span class="ty">Type</span>) != cgroup2Magic {
+			<span class="kw">continue</span>
+		}
+		ctrls, err := os.<span class="ty">ReadFile</span>(filepath.<span class="ty">Join</span>(root, <span class="st">"cgroup.controllers"</span>))
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">continue</span>
+		}
+		<span class="kw">if</span> !hasField(<span class="kw">string</span>(ctrls), <span class="st">"memory"</span>) {
+			<span class="cm">// v2 ではあるが memory が使えない。ここを掴むと memory.max が作られず静かに壊れる。</span>
+			<span class="kw">continue</span>
+		}
+		<span class="kw">return</span> root, <span class="kw">true</span>
+	}
+	<span class="kw">return</span> <span class="st">""</span>, <span class="kw">false</span>
+}</code></pre>
+
+    <p>この関数は<strong>3段階の関門</strong>になっています。1つでも落ちたら <code>continue</code> で次の候補へ、全部落ちたら「v2 は使えない」と答えます。</p>
+
+    <p><strong>関門1: <code>syscall.Statfs</code> で <code>f_type</code> を見る。</strong>そのパスが本当に cgroup2fs かを、ファイルシステムのレベルで確認します。<code>cgroup2Magic</code>（<code>0x63677270</code>）と一致しなければ、そこは v2 ではありません。<code>/sys/fs/cgroup</code> が tmpfs だったこの環境では、1つ目の候補はここで落ちます。</p>
+
+    <p><strong>関門2: <code>cgroup.controllers</code> が読めるか。</strong>v2 なら必ずあるファイルです。読めなければ何かがおかしいので次へ。</p>
+
+    <p><strong>関門3: そこに <code>memory</code> が<strong>語として</strong>含まれるか。</strong>ここが Step 4 で得た教訓そのものです。この環境の <code>unified/</code> は関門1と2を通過しますが、<code>cgroup.controllers</code> が <code>cpuset hugetlb</code> なので<strong>ここで落ちます</strong>。結果として <code>findV2Root</code> は <code>("", false)</code> を返し、<code>New</code> は v1 へ落ちていきます。</p>
+
+    <p>候補リストに <code>/sys/fs/cgroup/unified</code> を入れているのは、まさに hybrid 構成のためです。ただし、この環境ではその候補も関門3で落ちる —— <strong>「探しにはいくが、使えないと分かったら掴まない」</strong>という作りになっています。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · <code>syscall.Statfs</code> で <code>f_type</code> を見る</div>
+      <p><code>statfs(2)</code> は「そのパスが乗っているファイルシステムの情報」を取るシステムコールです。Go では <code>syscall.Statfs(path, &amp;st)</code> の形で呼び、結果が <code>syscall.Statfs_t</code> 構造体に入ります。</p>
+      <p>使うのは <code>st.Type</code> フィールドです。ここにはファイルシステムごとに決められた<strong>マジックナンバー</strong>が入っています。<code>tmpfs</code> なら <code>0x01021994</code>、<code>cgroup2fs</code> なら <code>0x63677270</code>。この定数は Linux のヘッダ（<code>linux/magic.h</code>）に載っているもので、<code>stat -fc %T</code> が種類名を表示するときに引いているのも同じ値です。</p>
+      <p>ちなみに <code>0x63677270</code> をバイトごとに ASCII として読むと <code>c g r p</code> になります。マジックナンバーには、こうした遊びがよくあります。</p>
+      <p>コード中の <code>uint32(st.Type)</code> というキャストは必要です。<code>st.Type</code> の型はアーキテクチャによって <code>int64</code> だったり <code>int32</code> だったりするので、比較の前に幅を揃えないと環境によってコンパイルが通らなくなります。</p>
+    </div>
+
+    <h3>なぜ <code>strings.Contains</code> ではだめなのか</h3>
+
+    <p>関門3の <code>hasField</code> について、もう少しだけ。素朴に書くならこうなります。</p>
+
+<pre><code><span class="cm">// ✗ こう書きたくなるが、危ない</span>
+<span class="kw">if</span> !strings.<span class="ty">Contains</span>(<span class="kw">string</span>(ctrls), <span class="st">"memory"</span>) {</code></pre>
+
+    <p>これは<strong>部分一致</strong>です。<code>cgroup.controllers</code> の中身が仮に <code>memory_foo bar</code> だったとすると、<code>strings.Contains</code> は <code>true</code> を返します。<code>memory_foo</code> の中に <code>memory</code> という並びが含まれているからです。しかし <code>memory</code> というコントローラは実在しません。<strong>誤検出</strong>です。</p>
+
+    <p>逆方向の事故もありえます。将来 <code>memoryless</code> のようなコントローラが増えたら、それだけがある環境を「memory が使える」と誤判定してしまいます。判定を間違えると、<strong>上限が効かないまま起動する</strong>という、この章でいちばん避けたい結末に直結します。</p>
+
+    <p>だから語単位で見ます。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — 小道具</div>
+<pre><code><span class="kw">func</span> write(dir, name, value <span class="kw">string</span>) <span class="kw">error</span> {
+	path := filepath.<span class="ty">Join</span>(dir, name)
+	<span class="kw">if</span> err := os.<span class="ty">WriteFile</span>(path, []<span class="kw">byte</span>(value), <span class="st">0o644</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"%s に %q を書けませんでした: %w"</span>, path, value, err)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}
+
+<span class="cm">// hasField は空白区切りの一覧に word が含まれるかを返す。</span>
+<span class="cm">// strings.Contains では "memory" が "memory_foo" に誤ヒットするので、必ず語単位で見る。</span>
+<span class="kw">func</span> hasField(list, word <span class="kw">string</span>) <span class="kw">bool</span> {
+	<span class="kw">for</span> _, f := <span class="kw">range</span> strings.<span class="ty">Fields</span>(list) {
+		<span class="kw">if</span> f == word {
+			<span class="kw">return</span> <span class="kw">true</span>
+		}
+	}
+	<span class="kw">return</span> <span class="kw">false</span>
+}</code></pre>
+
+    <p><code>strings.Fields</code> は文字列を空白（スペース・タブ・改行）で分割して、空要素を捨てたスライスを返します。<code>"cpuset hugetlb\n"</code> なら <code>["cpuset", "hugetlb"]</code> です。あとは完全一致で比べるだけ。10行足らずですが、この関数が判定の正しさを支えています。</p>
+
+    <p>ついでに <code>write</code> も見ておいてください。この章で「ファイルに数字を書く」と繰り返してきた操作は、実装ではこの5行に集約されています。<strong>cgroup の設定は、本当にこれだけです。</strong>エラー時に<strong>どのパスに何を書こうとして失敗したか</strong>をメッセージに含めているのが唯一の工夫です。<code>%q</code> を使っているので、値が空文字だったときも <code>""</code> と見えて分かります。</p>
+
+    <h3>どちらが選ばれたかを人間に見せる</h3>
+
+    <p>判定が自動で行われる以上、<strong>「結局どっちが使われたのか」を利用者が確認できないと不安</strong>です。そのための関数が <code>Describe</code> です。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — Describe</div>
+<pre><code><span class="cm">// Describe は現在の環境で使えるバックエンドを人間向けに説明する。</span>
+<span class="cm">// 「なぜ効かないのか」を利用者に伝えるために使う。</span>
+<span class="kw">func</span> <span class="ty">Describe</span>() <span class="kw">string</span> {
+	<span class="kw">if</span> root, ok := findV2Root(); ok {
+		<span class="kw">return</span> fmt.<span class="ty">Sprintf</span>(<span class="st">"cgroup v2 (%s)"</span>, root)
+	}
+	<span class="kw">if</span> roots, ok := findV1Roots(); ok {
+		<span class="kw">var</span> names []<span class="kw">string</span>
+		<span class="kw">for</span> _, ctrl := <span class="kw">range</span> v1Controllers {
+			<span class="kw">if</span> _, ok := roots[ctrl]; ok {
+				names = <span class="kw">append</span>(names, ctrl)
+			}
+		}
+		<span class="kw">return</span> fmt.<span class="ty">Sprintf</span>(<span class="st">"cgroup v1 (/sys/fs/cgroup, 利用可能: %s)"</span>, strings.<span class="ty">Join</span>(names, <span class="st">" "</span>))
+	}
+	<span class="kw">return</span> <span class="st">"利用不可"</span>
+}</code></pre>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>mydocker info</code> は、この <code>Describe()</code> の結果をそのまま表示します。この環境で実行すると、判定が v1 に落ちたことが読み取れます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker info
+<span class="out">状態の置き場: /var/lib/mydocker
+資源制限:     cgroup v1 (/sys/fs/cgroup, 利用可能: memory cpu pids)
+overlayfs:    利用可能
+overlay 数:   0 件
+実行中:       0 件</span></code></pre>
+      <p><code>cgroup v1</code> と出ています。<strong>Step 4 で手で調べた結論と、プログラムの判定が一致しました。</strong>そして <code>利用可能: memory cpu pids</code> —— 必要な3つは v1 側で全部揃っています。</p>
+    </div>
+
+    <h2 class="step" id="step-6"><span class="step-no">Step 6</span>cgroup v1 の作法 — コントローラごとに別の階層</h2>
+
+    <p>判定が v1 に落ちたので、v1 の実装が必要です。作法の違いを表で押さえます。</p>
+
+    <table>
+      <tr><th>上限の種類</th><th>v2</th><th>v1</th></tr>
+      <tr><td>メモリ</td><td><code>memory.max</code></td><td><code>memory.limit_in_bytes</code></td></tr>
+      <tr><td>スワップ込み</td><td><code>memory.swap.max</code></td><td><code>memory.memsw.limit_in_bytes</code></td></tr>
+      <tr><td>CPU</td><td><code>cpu.max</code>（quota と period を1行に）</td><td><code>cpu.cfs_quota_us</code> と <code>cpu.cfs_period_us</code>（2ファイルに分かれる）</td></tr>
+      <tr><td>プロセス数</td><td><code>pids.max</code></td><td><code>pids.max</code>（同じ）</td></tr>
+      <tr><td>所属プロセス</td><td><code>cgroup.procs</code></td><td><code>cgroup.procs</code>（同じ）</td></tr>
+      <tr><td>コントローラの有効化</td><td><code>cgroup.subtree_control</code> が必要</td><td><strong>不要</strong>（木そのものが専用）</td></tr>
+      <tr><td>作るディレクトリ</td><td>1つ（葉）</td><td><strong>使うコントローラの数だけ</strong></td></tr>
+    </table>
+
+    <p>最後の2行が実装に効きます。v1 は木が分かれているので <code>subtree_control</code> がありません。<strong>そのぶん素直</strong>です。ディレクトリを作れば、そこにはもう <code>memory.limit_in_bytes</code> が生えています。</p>
+
+    <p>代わりに、<strong>コントローラの数だけディレクトリを作る</strong>ことになります。メモリと CPU と PID 数の3つを制限したければ、<code>/sys/fs/cgroup/memory/mydocker/&lt;ID&gt;/</code>、<code>/sys/fs/cgroup/cpu/mydocker/&lt;ID&gt;/</code>、<code>/sys/fs/cgroup/pids/mydocker/&lt;ID&gt;/</code> の3つです。当然、<strong>後片付けの対象も3つ</strong>になりますし、<strong>PID を書き込む <code>cgroup.procs</code> も3つ</strong>あります。</p>
+
+    <div class="ascii">v1 の階層 — コントローラごとに、まったく別の木
+
+  /sys/fs/cgroup/memory/            /sys/fs/cgroup/cpu/           /sys/fs/cgroup/pids/
+  └ mydocker/                       └ mydocker/                   └ mydocker/
+    └ a10f2703bb37/                   └ a10f2703bb37/               └ a10f2703bb37/
+      ├ memory.limit_in_bytes           ├ cpu.cfs_quota_us            ├ pids.max
+      ├ memory.memsw.limit_in_bytes     ├ cpu.cfs_period_us           └ cgroup.procs
+      ├ memory.failcnt                  └ cgroup.procs                     ↑
+      └ cgroup.procs                         ↑                             │
+             ↑                               │                             │
+             └───────────── 同じ PID を、3か所すべてに書く ────────────────┘
+
+  v2 なら葉1つに書けば済むところが、v1 では「使うコントローラの数だけ」書く。
+  作る対象も、消す対象も、その数だけ増える。</div>
+
+    <p>まず、コントローラごとのマウント位置を探す関数です。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — findV1Roots</div>
+<pre><code><span class="cm">// v1Controllers は v1 で使うコントローラと、そのマウント位置の候補。</span>
+<span class="kw">var</span> v1Controllers = []<span class="kw">string</span>{<span class="st">"memory"</span>, <span class="st">"cpu"</span>, <span class="st">"pids"</span>}
+
+<span class="cm">// findV1Roots は v1 のコントローラごとのマウント位置を返す。</span>
+<span class="cm">// memory が見つからなければ v1 は使えないと判断する（メモリ上限がこの教材の Must なので）。</span>
+<span class="kw">func</span> findV1Roots() (<span class="kw">map</span>[<span class="kw">string</span>]<span class="kw">string</span>, <span class="kw">bool</span>) {
+	roots := <span class="kw">map</span>[<span class="kw">string</span>]<span class="kw">string</span>{}
+	<span class="kw">for</span> _, ctrl := <span class="kw">range</span> v1Controllers {
+		dir := filepath.<span class="ty">Join</span>(<span class="st">"/sys/fs/cgroup"</span>, ctrl)
+		<span class="kw">if</span> fi, err := os.<span class="ty">Stat</span>(dir); err == <span class="kw">nil</span> &amp;&amp; fi.<span class="ty">IsDir</span>() {
+			<span class="cm">// cgroup v1 のディレクトリなら必ず cgroup.procs がある</span>
+			<span class="kw">if</span> _, err := os.<span class="ty">Stat</span>(filepath.<span class="ty">Join</span>(dir, <span class="st">"cgroup.procs"</span>)); err == <span class="kw">nil</span> {
+				roots[ctrl] = dir
+			}
+		}
+	}
+	<span class="kw">if</span> _, ok := roots[<span class="st">"memory"</span>]; !ok {
+		<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">false</span>
+	}
+	<span class="kw">return</span> roots, <span class="kw">true</span>
+}</code></pre>
+
+    <p>判定の考え方は v2 のときと同じです。<strong>「ディレクトリがある」だけでは信用しません。</strong>その中に <code>cgroup.procs</code> があるかまで確かめます。cgroupfs がマウントされていれば必ずあるファイルなので、<strong>「本当に cgroup として機能しているディレクトリか」の証拠</strong>になります。tmpfs の上に同名の空ディレクトリが偶然あっても、ここで弾かれます。</p>
+
+    <p>そして最後の <code>if</code>。<strong><code>memory</code> が見つからなければ、他が全部揃っていても <code>false</code> を返します。</strong>メモリ上限がこの教材の Must だからです。「cpu と pids は使えるので部分的にやります」という中途半端な状態を作らない、という判断です。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — newV1</div>
+<pre><code><span class="kw">func</span> newV1(roots <span class="kw">map</span>[<span class="kw">string</span>]<span class="kw">string</span>, id <span class="kw">string</span>, limits <span class="ty">Limits</span>) (*<span class="ty">Cgroup</span>, <span class="kw">error</span>) {
+	c := &amp;<span class="ty">Cgroup</span>{version: <span class="st">"v1"</span>, id: id}
+
+	<span class="cm">// v1 は「コントローラごとに別の階層」なので、使うコントローラの数だけディレクトリを作る。</span>
+	<span class="cm">// v2 のような subtree_control は無い（そのぶん素直だが、後片付けの対象が増える）。</span>
+	mk := <span class="kw">func</span>(ctrl <span class="kw">string</span>) (<span class="kw">string</span>, <span class="kw">bool</span>, <span class="kw">error</span>) {
+		root, ok := roots[ctrl]
+		<span class="kw">if</span> !ok {
+			<span class="kw">return</span> <span class="st">""</span>, <span class="kw">false</span>, <span class="kw">nil</span>
+		}
+		dir := filepath.<span class="ty">Join</span>(root, groupName, id)
+		<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(dir, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="st">""</span>, <span class="kw">false</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"cgroup(v1) ディレクトリを作れませんでした (%s): %w"</span>, dir, err)
+		}
+		c.dirs = <span class="kw">append</span>(c.dirs, dir)
+		<span class="kw">return</span> dir, <span class="kw">true</span>, <span class="kw">nil</span>
+	}
+
+	<span class="kw">if</span> limits.<span class="ty">MemoryBytes</span> &gt; <span class="st">0</span> {
+		dir, ok, err := mk(<span class="st">"memory"</span>)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			c.<span class="ty">Destroy</span>()
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+		<span class="kw">if</span> !ok {
+			c.<span class="ty">Destroy</span>()
+			<span class="kw">return</span> <span class="kw">nil</span>, errors.<span class="ty">New</span>(<span class="st">"memory コントローラが見つからないため、メモリ上限をかけられません"</span>)
+		}
+		<span class="kw">if</span> err := write(dir, <span class="st">"memory.limit_in_bytes"</span>, strconv.<span class="ty">FormatInt</span>(limits.<span class="ty">MemoryBytes</span>, <span class="st">10</span>)); err != <span class="kw">nil</span> {
+			c.<span class="ty">Destroy</span>()
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+		<span class="cm">// スワップ込みの上限。swap accounting が無い環境では失敗するので、失敗は無視する。</span>
+		_ = write(dir, <span class="st">"memory.memsw.limit_in_bytes"</span>, strconv.<span class="ty">FormatInt</span>(limits.<span class="ty">MemoryBytes</span>, <span class="st">10</span>))
+	}
+	<span class="kw">if</span> limits.<span class="ty">CPUs</span> &gt; <span class="st">0</span> {
+		dir, ok, err := mk(<span class="st">"cpu"</span>)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			c.<span class="ty">Destroy</span>()
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+		<span class="kw">if</span> ok {
+			<span class="kw">const</span> period = <span class="st">100000</span>
+			<span class="kw">if</span> err := write(dir, <span class="st">"cpu.cfs_period_us"</span>, strconv.<span class="ty">Itoa</span>(period)); err != <span class="kw">nil</span> {
+				c.<span class="ty">Destroy</span>()
+				<span class="kw">return</span> <span class="kw">nil</span>, err
+			}
+			<span class="kw">if</span> err := write(dir, <span class="st">"cpu.cfs_quota_us"</span>, strconv.<span class="ty">FormatInt</span>(<span class="kw">int64</span>(limits.<span class="ty">CPUs</span>*period), <span class="st">10</span>)); err != <span class="kw">nil</span> {
+				c.<span class="ty">Destroy</span>()
+				<span class="kw">return</span> <span class="kw">nil</span>, err
+			}
+		}
+	}
+	<span class="kw">if</span> limits.<span class="ty">PidsMax</span> &gt; <span class="st">0</span> {
+		dir, ok, err := mk(<span class="st">"pids"</span>)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			c.<span class="ty">Destroy</span>()
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+		<span class="kw">if</span> ok {
+			<span class="kw">if</span> err := write(dir, <span class="st">"pids.max"</span>, strconv.<span class="ty">FormatInt</span>(limits.<span class="ty">PidsMax</span>, <span class="st">10</span>)); err != <span class="kw">nil</span> {
+				c.<span class="ty">Destroy</span>()
+				<span class="kw">return</span> <span class="kw">nil</span>, err
+			}
+		}
+	}
+	<span class="kw">return</span> c, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>長く見えますが、同じ形が3回繰り返されているだけです。<strong>「コントローラのディレクトリを作る → 値を書く」</strong>を memory / cpu / pids でやっています。</p>
+
+    <p>共通部分は <code>mk</code> というクロージャに切り出されています。<code>mk("memory")</code> と呼ぶと、<code>/sys/fs/cgroup/memory/mydocker/&lt;ID&gt;/</code> を作って、<strong>そのパスを <code>c.dirs</code> に追記</strong>し、パスを返します。この <code>c.dirs</code> への追記が後片付けの生命線です。<strong>作ったそばからリストに載せる</strong>ので、途中で失敗しても <code>c.Destroy()</code> が「そこまでに作ったもの」を正確に消せます。</p>
+
+    <p>3つの扱いの差にも注目してください。<strong>memory は <code>!ok</code>（見つからない）をエラーにします</strong>が、<strong>cpu と pids は <code>if ok</code> で包んで、無ければ黙って飛ばします</strong>。ここでも Must と Should の区別が形になっています。</p>
+
+    <p><code>cpu</code> のところで <code>cpu.cfs_period_us</code> を先に書いているのは意図的です。<strong>period を先に確定させてから quota を書く</strong>ほうが安全だからです。カーネルは quota が period を超えるような組み合わせを拒否することがあるので、順序を逆にすると環境によっては失敗します。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · 関数の中で関数を定義する（クロージャ）</div>
+      <p><code>mk := func(ctrl string) (string, bool, error) { ... }</code> という書き方は、Go では非常によく使われます。<strong>その関数の中でしか使わない小さな処理</strong>を、パッケージレベルの関数にせずにその場で定義する形です。</p>
+      <p>利点は2つあります。1つは<strong>名前空間を汚さない</strong>こと。<code>mk</code> はこの関数の外からは見えません。もう1つは<strong>外側の変数をそのまま掴める</strong>ことです。<code>mk</code> の中で <code>c.dirs</code> や <code>roots</code> に触れているのに、引数として渡していないのに気づきましたか。クロージャは外側のスコープの変数を「閉じ込めて」持ち歩けるので、引数の受け渡しが要らないのです。</p>
+      <p>戻り値が <code>(string, bool, error)</code> の3つなのも Go らしい形です。<strong>「値」「見つかったか」「失敗したか」を分けて返す</strong>ことで、呼び出し側が「見つからなかった（正常）」と「失敗した（異常）」を区別できます。この区別があるからこそ、memory は前者もエラーにし、cpu は前者を許す、という書き分けができます。</p>
+    </div>
+
+    <h2 class="step" id="step-7"><span class="step-no">Step 7</span>Apply — 作っただけでは効かない</h2>
+
+    <p>ここまでで、ディレクトリができ、上限の数字が書き込まれました。しかし<strong>まだ誰も制限されていません</strong>。cgroup は「作った」だけでは何もしないからです。プロセスを入れて、初めて効きます。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — Apply</div>
+<pre><code><span class="cm">// Apply は pid を cgroup に入れる。ここで初めて上限が効き始める。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ 「作った」と「入れた」は別である。Apply を忘れた cgroup は</span>
+<span class="cm">// memory.max に値が入っているのに1バイトも制限しない。</span>
+<span class="kw">func</span> (c *<span class="ty">Cgroup</span>) <span class="ty">Apply</span>(pid <span class="kw">int</span>) <span class="kw">error</span> {
+	<span class="kw">for</span> _, dir := <span class="kw">range</span> c.dirs {
+		procs := filepath.<span class="ty">Join</span>(dir, <span class="st">"cgroup.procs"</span>)
+		<span class="kw">if</span> err := os.<span class="ty">WriteFile</span>(procs, []<span class="kw">byte</span>(strconv.<span class="ty">Itoa</span>(pid)), <span class="st">0o644</span>); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"cgroup.procs への書き込みに失敗しました (%s): %w"</span>, procs, err)
+		}
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>9行です。<code>c.dirs</code> —— つまり作ったディレクトリすべて —— の <code>cgroup.procs</code> に、PID を10進数の文字列として書き込みます。それだけ。</p>
+
+    <p><strong>ループになっているのは v1 のため</strong>です。v2 なら <code>c.dirs</code> は葉1つだけなので1回で終わりますが、v1 では memory / cpu / pids の3か所に同じ PID を書く必要があります。<code>c.dirs</code> という抽象のおかげで、<code>Apply</code> はバージョンの違いを一切知らずに済んでいます。</p>
+
+    <p>ここで <code>Cgroup</code> 構造体の設計が効いてきます。<code>newV2</code> と <code>newV1</code> はまったく違う作法でディレクトリを作りますが、<strong>結果として残るのは「作ったパスの一覧」という同じ形</strong>です。だから <code>Apply</code> も <code>Destroy</code> も1つで済みます。「バージョンごとの差を、なるべく早い段階で吸収する」というのは設計の定石です。</p>
+
+    <h3>タイミングの問題 — 第01章の同期パイプがここで効く</h3>
+
+    <p>さて、ここに厄介な時間の問題があります。手順を並べてみます。</p>
+
+    <div class="ascii">「いつ cgroup に入れるか」の競争
+
+  親（mydocker run）                          子（コンテナの中身）
+
+  ① cgroup.New() でディレクトリを作る
+  ② 同期パイプを作る
+  ③ /proc/self/exe を子として起動 ─────────→ 起動した（PID が決まる）
+                                                  │
+  ④ cg.Apply(pid) で cgroup.procs に書く          │ ★もしここで走り出したら?
+     ↑ ここで初めて上限が効く                     │   まだ上限が効いていない世界で
+                                                  │   メモリを確保できてしまう
+  ⑤ パイプに合図を書く ──────────────────→ ⑥ 合図を読んでから走り出す
+                                                    （ここまで待つ）
+
+  ⚠ ③ の直後に PID が分かるが、その瞬間の子はまだ cgroup の外にいる。
+     ④ を終える前に子が走り出すと、上限をすり抜けた確保が起きうる。</div>
+
+    <p>子プロセスを <code>Start()</code> した瞬間に PID は分かりますが、<strong>その時点で子はもう走っています</strong>。私たちが <code>cgroup.procs</code> に書き込むまでの間に、子が大量のメモリを確保してしまったら、上限は間に合いません。</p>
+
+    <p>これを防ぐのが、第01章で作った<strong>親子の同期パイプ</strong>です。子は起動直後に「パイプから合図が来るまで待つ」ようにしてあります。親は cgroup に入れ終えてから合図を送ります。実際のコードを見てください。</p>
+
+    <div class="file-tag">internal/container/run.go — 抜粋</div>
+<pre><code>	<span class="cm">// --- 3. 子と同期するためのパイプ ---</span>
+	<span class="cm">// 親が cgroup に PID を入れ終えるまで、子は走り出してはいけない。</span>
+	syncR, syncW, err := os.<span class="ty">Pipe</span>()
+
+	<span class="cm">// …（4. 子の起動は第01章・第02章で読んだ）</span>
+
+	<span class="cm">// --- 5. cgroup に入れてから、子に合図を送る ---</span>
+	startErr := <span class="kw">func</span>() <span class="kw">error</span> {
+		<span class="kw">if</span> cg != <span class="kw">nil</span> {
+			<span class="kw">if</span> err := cg.<span class="ty">Apply</span>(pid); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> err
+			}
+		}
+		<span class="kw">return</span> st.<span class="ty">Save</span>()
+	}()
+	<span class="kw">if</span> startErr != <span class="kw">nil</span> {
+		syncW.<span class="ty">Close</span>() <span class="cm">// 合図を送らずに閉じる → 子は何もせず終了する</span>
+		_ = cmd.<span class="ty">Wait</span>()
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, startErr
+	}</code></pre>
+
+    <p>順序が明確です。<strong><code>cg.Apply(pid)</code> が成功してから、合図を送る。</strong>そして <code>Apply</code> が失敗したら、<strong>合図を送らずにパイプを閉じます</strong>。閉じられたパイプからの読み込みは EOF を返すので、子は「合図が来なかった」と分かって何も実行せずに終了します。</p>
+
+    <p><strong>上限がかけられなかったコンテナは、走らせない。</strong>この章の最初から一貫している方針が、ここでも守られています。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 同期パイプが無いと、この競争に静かに負ける</div>
+      <p>この競争に負けても、たいていの場合<strong>何も起きません</strong>。子が走り出してから親が <code>Apply</code> するまでの時間はミリ秒以下で、その間に 10MB を確保するプログラムはそう多くないからです。</p>
+      <p>だから、同期パイプを省いた実装でも、テストは通ってしまいます。<strong>問題が出るのは、たまたま起動が遅れたときや、子が起動直後に大量確保するときだけ</strong>です。再現しないバグほど厄介なものはありません。</p>
+      <p>第01章で「なぜわざわざパイプを作って待たせるのか」と思ったかもしれません。理由の半分がこれです。<strong>cgroup に入れ終えるまで、子を走らせないため</strong>です。層を先に積んでおいたおかげで、この章では <code>Apply</code> を呼ぶ位置を決めるだけで済みました。</p>
+    </div>
+
+    <h2 class="step" id="step-8"><span class="step-no">Step 8</span>後片付け — <code>rm -rf</code> では消えない</h2>
+
+    <p>コンテナが終わったら、作った cgroup を消します。ここで最初に驚くのが、<strong><code>rm -rf</code> が効かない</strong>ことです。</p>
+
+    <p>cgroupfs は通常のファイルシステムではありません。中のファイル（<code>memory.max</code> など）は<strong>カーネルが提供している窓口</strong>であって、実体のあるファイルではありません。だから <code>unlink</code> できません。<code>rm -rf</code> は「中のファイルを全部消してからディレクトリを消す」という手順で動くので、最初の一歩で失敗します。</p>
+
+    <p>正しいのは <strong><code>rmdir</code>（ディレクトリだけを消す）</strong>です。カーネルは「このディレクトリを消せ」という指示を受け取ると、中の窓口ファイルごと片付けてくれます。Go では <code>os.Remove</code> がそれに当たります。</p>
+
+    <div class="file-tag">internal/cgroup/cgroup.go — Destroy</div>
+<pre><code><span class="cm">// Destroy は cgroup ディレクトリを片付ける。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ cgroupfs は通常のファイルシステムではないので rm -rf では消えない。rmdir を使う。</span>
+<span class="cm">// ⚠ 中にプロセスが残っていると rmdir は EBUSY で失敗する。これは正しい挙動なので、</span>
+<span class="cm">// 握りつぶさずエラーとして返す。</span>
+<span class="kw">func</span> (c *<span class="ty">Cgroup</span>) <span class="ty">Destroy</span>() <span class="kw">error</span> {
+	<span class="kw">var</span> firstErr <span class="kw">error</span>
+	<span class="kw">for</span> _, dir := <span class="kw">range</span> c.dirs {
+		<span class="kw">if</span> err := os.<span class="ty">Remove</span>(dir); err != <span class="kw">nil</span> &amp;&amp; !os.<span class="ty">IsNotExist</span>(err) {
+			<span class="kw">if</span> firstErr == <span class="kw">nil</span> {
+				firstErr = fmt.<span class="ty">Errorf</span>(<span class="st">"cgroup ディレクトリを削除できませんでした (%s): %w"</span>, dir, err)
+			}
+			<span class="kw">continue</span>
+		}
+		<span class="cm">// 親（.../mydocker）も空になったら片付ける。</span>
+		<span class="cm">// 他のコンテナが動いていれば ENOTEMPTY で失敗するが、それが正しいので無視してよい。</span>
+		_ = os.<span class="ty">Remove</span>(filepath.<span class="ty">Dir</span>(dir))
+	}
+	<span class="kw">return</span> firstErr
+}</code></pre>
+
+    <p>読みどころが3つあります。</p>
+
+    <p><strong>① <code>os.IsNotExist(err)</code> は許す。</strong>「もう無い」のは目的が達成されている状態なので、エラーにしません。<code>Destroy</code> を2回呼んでも安全（冪等）にするための配慮です。実際、<code>newV2</code> や <code>newV1</code> の失敗経路で <code>c.Destroy()</code> が呼ばれ、そのあと呼び出し側の <code>cleanup</code> でもう一度呼ばれることがあります。</p>
+
+    <p><strong>② <code>EBUSY</code> は握りつぶさない。</strong>中にまだプロセスが残っているとき、<code>rmdir</code> は <code>EBUSY</code> で失敗します。ここで「まあいいか」と無視すると、<strong>「消したつもりで消えていない cgroup」が積み上がっていきます</strong>。それは、コンテナが終わったつもりで終わっていない、ということでもあります。だからエラーとして返し、上位に報告させます。<strong>失敗を失敗として扱うことが、この関数のいちばんの仕事です。</strong></p>
+
+    <p><strong>③ 親も消す。ただし失敗は無視する。</strong><code>filepath.Dir(dir)</code> は葉の親、つまり <code>.../mydocker</code> です。ここを <code>os.Remove</code> にかけますが、<strong>戻り値は <code>_</code> で捨てています</strong>。他のコンテナが同時に走っていれば、<code>mydocker/</code> の中には別の葉が残っているので <code>ENOTEMPTY</code> で失敗します。<strong>それが正しい</strong>のです。「空なら消す、空でないなら消さない」という挙動が、<code>rmdir</code> の仕様だけで自然に実現されています。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 親ディレクトリが残り続ける</div>
+      <p>③ の処理は、最初の実装には<strong>ありませんでした</strong>。葉（<code>.../mydocker/&lt;ID&gt;</code>）は消えるのに、<strong>親の <code>.../mydocker/</code> が残り続けていた</strong>のです。</p>
+      <p>タチが悪いのは、これで E2E テストが通ってしまったことです。「配下にコンテナのディレクトリが残っていない」という検査は成功します。残っているのは空の親だけなので。しかし <code>ls /sys/fs/cgroup/memory/mydocker</code> が成功してしまう —— つまり<strong>痕跡が残っている</strong>状態でした。</p>
+      <p>検査のほうも直しました。<code>find /sys/fs/cgroup -type d -name mydocker -exec find {} -mindepth 1 -maxdepth 1 -type d \;</code> のように<strong>「中身のあるものだけ」を数える</strong>ようにし、あわせて <code>Destroy</code> で親も <code>rmdir</code> するようにしています。</p>
+      <p>教訓は、<strong>「残っていないこと」の検査は、何を数えているかを疑ってかかる</strong>ということです。0 件という結果は、正しく片付いた場合にも、間違ったものを数えている場合にも出ます。</p>
+    </div>
+
+    <h2 class="step" id="step-9"><span class="step-no">Step 9</span>終了コードの翻訳 — 255 では伝わらない</h2>
+
+    <p>最後の1段です。ここまでで上限は効くようになりました。しかし、実際に mydocker で試したとき、終了コードが <strong>255</strong> になっていました。</p>
+
+    <p>期待していたのは 137 です。Step 2 で <code>python3 /tmp/hog.py</code> を直接動かしたときは <code>exit=137</code> でした。同じ SIGKILL のはずなのに、mydocker 経由だと 255 になる。なぜでしょう。</p>
+
+    <p>犯人は Go の標準ライブラリの仕様でした。<strong><code>exec.ExitError</code> の <code>ExitCode()</code> は、シグナルで殺された場合 <code>-1</code> を返します。</strong>シグナル死には「終了コード」というものが存在しないので、Go は「無い」を <code>-1</code> で表しているわけです。</p>
+
+    <p>そして <code>os.Exit(-1)</code> を呼ぶと、実際にプロセスが返すのは <strong>255</strong> です。終了コードは 8 ビットに丸められるので、<code>-1</code> は <code>0xFF</code> = 255 になります。</p>
+
+    <div class="ascii">終了コードが 255 に化けるまで
+
+  カーネル            Go の標準ライブラリ          mydocker            シェル
+  ────────            ──────────────────           ────────            ──────
+  SIGKILL(9) で
+  子を殺した
+      │
+      └→ WaitStatus に
+         「シグナル 9 で死んだ」
+         と記録される
+              │
+              └→ ExitError.ExitCode()
+                 → -1（「終了コードは無い」の意味）
+                        │
+                        └→ os.Exit(-1)
+                                 │
+                                 └→ 8ビットに丸められて… → 255 ✗
+
+  欲しいのは:  WaitStatus.Signaled() が true なら
+               128 + int(WaitStatus.Signal())  →  128 + 9 = 137 ○</div>
+
+    <p>直し方は、シェルの慣習に合わせることです。<strong>シグナル N で死んだプロセスの終了コードは 128+N</strong>、という約束が UNIX 系にはあります。SIGKILL は 9 番なので 137。SIGTERM(15) なら 143。この翻訳を自分で書きます。</p>
+
+    <div class="file-tag">internal/container/run.go — exitCode</div>
+<pre><code><span class="cm">// exitCode は子プロセスの終了状況をシェルの終了コードに翻訳する。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ シグナルで殺されたプロセスの ExitCode() は -1 を返す。これをそのまま os.Exit に渡すと</span>
+<span class="cm">// 255 になり、「OOM で殺された」ことが利用者に伝わらない。</span>
+<span class="cm">// シェルの慣習に合わせて 128+シグナル番号 を返す（OOM kill なら SIGKILL(9) で 137）。</span>
+<span class="kw">func</span> exitCode(err <span class="kw">error</span>) <span class="kw">int</span> {
+	<span class="kw">if</span> err == <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>
+	}
+	<span class="kw">var</span> ee *exec.<span class="ty">ExitError</span>
+	<span class="kw">if</span> errors.<span class="ty">As</span>(err, &amp;ee) {
+		<span class="kw">if</span> ws, ok := ee.<span class="ty">Sys</span>().(syscall.<span class="ty">WaitStatus</span>); ok &amp;&amp; ws.<span class="ty">Signaled</span>() {
+			<span class="kw">return</span> <span class="st">128</span> + <span class="kw">int</span>(ws.<span class="ty">Signal</span>())
+		}
+		<span class="kw">return</span> ee.<span class="ty">ExitCode</span>()
+	}
+	<span class="kw">return</span> <span class="st">1</span>
+}</code></pre>
+
+    <p><code>ee.Sys()</code> は、OS 固有の生の終了情報を <code>any</code> として返します。Linux では中身が <code>syscall.WaitStatus</code> なので、型アサーションで取り出します。そこに <code>Signaled()</code> と <code>Signal()</code> というメソッドがあり、<strong>「シグナルで死んだか」「何番のシグナルか」</strong>を教えてくれます。</p>
+
+    <p>あとは <code>128 + int(ws.Signal())</code> を返すだけ。これで OOM kill が <strong>137</strong> になります。</p>
+
+    <p>この変更の値打ちは、<strong>テストで検査できるようになったこと</strong>です。255 は「何かよく分からない失敗」ですが、137 は「SIGKILL で殺された」という具体的な事実です。E2E テストにこう書けます —— <code>上限超過が OOM による強制終了として報告される (exit 137)</code>。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · <code>errors.As</code> と型アサーション</div>
+      <p><code>errors.As(err, &amp;ee)</code> は「err のエラー連鎖のどこかに <code>*exec.ExitError</code> があれば、それを <code>ee</code> に入れて true を返す」という関数です。<code>err.(*exec.ExitError)</code> という単純な型アサーションと違い、<strong><code>fmt.Errorf("...: %w", err)</code> で包まれたエラーの中身まで辿ってくれます</strong>。</p>
+      <p>もう1つの <code>ee.Sys().(syscall.WaitStatus)</code> は普通の型アサーションで、<code>, ok</code> の形にしてあります。こうすると、型が違ったときに panic せず <code>ok</code> が false になります。<strong>OS 固有の値を扱うところでは、必ずこの形にする</strong>のが安全です。Linux 以外では中身が別の型かもしれないからです。</p>
+      <p>ちなみに <code>errors.As</code> の第2引数がポインタのポインタ（<code>&amp;ee</code>、<code>ee</code> 自体が <code>*exec.ExitError</code>）なのは、関数の中から <code>ee</code> に代入するためです。Go に参照渡しは無いので、書き換えたい変数はアドレスを渡します。</p>
+    </div>
+
+    <h2>★関所 — 上限を超えさせて、実際に殺されるところを見る</h2>
+
+    <p>この章の合格判定です。<strong>必ず2回走らせてください。</strong>上限なしと、上限ありの両方です。</p>
+
+    <p>使うコマンドは <code>dd if=/dev/zero of=/dev/null bs=100M count=1</code>。<code>bs=100M</code> によって、<strong>1回のブロック読み込みで 100MB のバッファを確保</strong>させます。Step 2 の落とし穴で見たとおり、ここを <code>head | wc</code> にすると<strong>メモリを溜めないので上限に当たりません</strong>。溜める操作であることが重要です。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 — 対照とペアで見る</div>
+      <p><strong>① 上限なし。</strong>100MB のバッファは問題なく確保でき、成功します。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="out">1+0 records in
+1+0 records out
+104857600 bytes (100.0MB) copied, 0.047161 seconds, 2.1GB/s</span>
+<span class="ps">$</span> echo $?
+<span class="out">0</span></code></pre>
+      <p><strong>② 上限 10m。</strong>同じコマンドです。違うのは <code>--memory 10m</code> だけ。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet --memory 10m alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="ps">$</span> echo $?
+<span class="out">137</span></code></pre>
+      <p><strong>何も出力されていません。</strong><code>records in</code> の行すら出ていない。<code>dd</code> はバッファを確保した時点で殺されたので、1バイトもコピーできなかったのです。そして終了コードは <strong>137</strong>。</p>
+    </div>
+
+    <p>この2つを<strong>並べて</strong>見ることが大事です。①だけを見せられても「上限が無いときは動く」ことしか分かりませんし、②だけを見せられても<strong>失敗の原因が上限なのか、コマンドの書き間違いなのか、mydocker のバグなのか、区別がつきません</strong>。</p>
+
+    <p>2つ並べて初めて、<strong>「違いは <code>--memory 10m</code> の有無だけ。だから死因は上限である」</strong>と言い切れます。実装中に <code>head | wc</code> で転んだのは、まさにこの対照を取っていなかったからでした。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>head -c 100M /dev/zero | wc -c</code> ではメモリを溜めない</div>
+      <p>もう一度書いておきます。この章でいちばん時間を溶かした失敗です。</p>
+      <p><code>head -c 100000000 /dev/zero | wc -c</code> は、100MB 分のバイトを<strong>読んで、数えて、捨てる</strong>だけです。パイプを通り抜けるだけなので、どの瞬間にもプロセスが保持しているメモリはごくわずかです。10MB の上限には<strong>絶対に当たりません</strong>。</p>
+      <p>これを見て「上限が効いていない」と判断すると、正しく動いている実装を延々と直そうとすることになります。<strong>疑うべきはテストのほうでした。</strong></p>
+      <p>メモリ上限を確かめたいなら、<strong>「大きな塊を一度に確保する」操作</strong>を選んでください。<code>dd</code> に大きな <code>bs</code> を与えるか、Step 2 の Python のように <code>bytearray</code> を積むか、です。「流す」操作ではなく「溜める」操作を。</p>
+    </div>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>結局、cgroup ってカーネルの何をしているんですか? ファイルを書いているだけには見えないのですが。</summary>
+      <div class="qa-body"><p>ファイルを書いているだけ、で合っています。ただし<strong>書いた先がカーネルの中</strong>です。</p>
+      <p>cgroupfs のファイルは、ディスク上に実体を持ちません。<code>memory.max</code> に書き込むと、その write システムコールをカーネルが受け取り、そのグループのメモリ会計に上限値をセットします。読み出すと、カーネルが現在の値を文字列にして返します。<strong>ファイルの形をした窓口</strong>だと思ってください。</p>
+      <p>この設計は Linux のあちこちで使われています。<code>/proc</code> も <code>/sys</code> も同じ考え方です。「専用の API を作らず、ファイルとして見せる」ことで、シェルからも、どんな言語からも、追加のライブラリなしで触れるようになります。この章で外部ライブラリを1つも使わずに済んだのは、そのおかげです。</p></div>
+    </details>
+
+    <details class="qa"><summary>v2 が使えない環境なんて、そんなに珍しくないんですか? 最近のディストリはみんな v2 だと聞きましたが。</summary>
+      <div class="qa-body"><p>最近のディストリのホストは、確かにほとんど v2 単独（unified hierarchy）です。Ubuntu 22.04 以降も、Fedora も、Debian 11 以降もそうです。</p>
+      <p>問題になるのは<strong>コンテナの中</strong>や、<strong>管理システムが介在する実行環境</strong>です。この教材の開発環境がまさにそれで、<code>/sys/fs/cgroup</code> は tmpfs、v1 が個別マウント、<code>unified/</code> に v2 も同居、という hybrid 構成でした。CI サービスやクラウドの実行環境、少し古い Docker のホストなどでも同様の構成に出会います。</p>
+      <p>そして厄介なのは、<strong>こういう環境ほど「v2 が見つかる」判定を通してしまう</strong>ことです。<code>unified/</code> に cgroup2 は本当にマウントされているのですから。だからこそ、判定を「マウントされているか」ではなく「<strong>memory が使えるか</strong>」にする必要がありました。</p></div>
+    </details>
+
+    <details class="qa"><summary><code>memory.max</code> に書けたのに制限されない、というのが起きるのはどういうときですか?</summary>
+      <div class="qa-body"><p>主に3つです。</p>
+      <p><strong>(1) <code>cgroup.procs</code> に PID を書いていない。</strong>いちばん多い原因です。上限を設定しても、そのグループに誰も入っていなければ、誰も制限されません。Step 7 の <code>Apply</code> がこれを担当しています。</p>
+      <p><strong>(2) 制限したいプロセスが子孫を作り、その子孫が別のグループにいる。</strong>cgroup の所属は fork したときに引き継がれるので、普通は起きません。ただし途中で誰かが別のグループに移すと起きます。</p>
+      <p><strong>(3) スワップに逃げている。</strong>物理メモリの上限は超えているのに、スワップに書き出されて生き延びているケースです。これを防ぐために mydocker は <code>memory.swap.max</code>（v1 なら <code>memory.memsw.limit_in_bytes</code>）も締めています。</p>
+      <p>いずれの場合も、確認方法は同じです。<strong>実際に超過させてみる。</strong><code>cat</code> で値を読んで満足しないことです。</p></div>
+    </details>
+
+    <details class="qa"><summary>「内部プロセス禁止」って、既にプロセスが入っているディレクトリで <code>subtree_control</code> を書いたらどうなるんですか?</summary>
+      <div class="qa-body"><p>書き込みが <code>EBUSY</code> で失敗します。カーネルは「このディレクトリは既にプロセスを持っているので、コントローラを子に配る役には回れない」と判断するからです。</p>
+      <p>逆の順序でも同じです。コントローラを子に配っているディレクトリの <code>cgroup.procs</code> に PID を書こうとすると、やはり <code>EBUSY</code> になります。<strong>どちらの操作を先にやっても、両立はできません。</strong></p>
+      <p>ここでよくハマるのが、<strong><code>/sys/fs/cgroup</code> のルートには既にシステムのプロセスが全部入っている</strong>というケースです。ルートは例外扱いなので <code>subtree_control</code> を書けますが、その1段下は違います。だから mydocker は「<code>mydocker/</code> という空の中間ノードを作って、そこから子に配り、実際のコンテナは葉に置く」という形にしています。<strong>中間ノードを意図的に空のまま維持する</strong>のが、v2 での階層設計の基本です。</p></div>
+    </details>
+
+    <details class="qa"><summary>コンテナを強制終了させたら cgroup のディレクトリが残ってしまいました。どうすればいいですか?</summary>
+      <div class="qa-body"><p><code>rmdir</code> で消してください。<code>rm -rf</code> は効きません。</p>
+      <p>ただし、<strong>まず中にプロセスが残っていないか確認</strong>してください。<code>cat &lt;ディレクトリ&gt;/cgroup.procs</code> で PID が出てくるなら、そのプロセスがまだ生きています。生きている限り <code>rmdir</code> は <code>EBUSY</code> で失敗します。これは正しい挙動です。先にプロセスを終了させてください。</p>
+      <p>v1 の場合は、<strong>コントローラの数だけディレクトリがある</strong>ことを忘れずに。<code>/sys/fs/cgroup/memory/mydocker/&lt;ID&gt;</code> を消しても、<code>/sys/fs/cgroup/cpu/mydocker/&lt;ID&gt;</code> と <code>/sys/fs/cgroup/pids/mydocker/&lt;ID&gt;</code> が残っています。<code>Cgroup.dirs</code> がこの一覧を持っているのは、まさにこのためです。</p></div>
+    </details>
+
+    <details class="qa"><summary>終了コード 137 以外に、覚えておくべき値はありますか?</summary>
+      <div class="qa-body"><p>128+N の形で覚えると全部同じです。よく見るのは次の3つでしょう。</p>
+      <p><strong>137 = 128+9（SIGKILL）</strong>。OOM killer か、誰かが <code>kill -9</code> した。この章で扱ったのはこれです。</p>
+      <p><strong>143 = 128+15（SIGTERM）</strong>。行儀のよい終了要求。<code>docker stop</code> がまずこれを送ります。</p>
+      <p><strong>130 = 128+2（SIGINT）</strong>。ターミナルで Ctrl-C を押したとき。</p>
+      <p>128 未満の値は、プログラム自身が <code>exit()</code> で返したものです。<code>0</code> は成功、それ以外は失敗を意味しますが、具体的な意味はプログラムごとに違います。<strong>128 を境に「自分で終わったのか、殺されたのか」が分かれる</strong>と覚えておくと便利です。</p></div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。</p>
+
+    <details class="qa"><summary>Q1. cgroup で上限をかけるのに必要な操作を3つ挙げてください。それぞれ、どんなシステムコールに相当しますか?</summary>
+      <div class="qa-body"><p><strong>① ディレクトリを作る</strong>（<code>mkdir</code>）。これで新しいグループができます。中のファイルはカーネルが勝手に生やします。</p>
+      <p><strong>② 上限のファイルに数値を書く</strong>（<code>write</code>）。<code>memory.max</code> や <code>memory.limit_in_bytes</code> に、バイト数を10進の文字列として書きます。</p>
+      <p><strong>③ <code>cgroup.procs</code> に PID を書く</strong>（<code>write</code>）。これで初めて上限が効き始めます。</p>
+      <p>専用のシステムコールは1つもありません。全部 <code>mkdir</code> と <code>write</code> です。Go の実装でも <code>os.MkdirAll</code> と <code>os.WriteFile</code> しか使っていません。<strong>唯一の例外が <code>syscall.Statfs</code></strong> ですが、これは上限をかけるためではなく「そこが cgroup2fs かどうか」を判定するためのものです。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q2. <code>cat memory.limit_in_bytes</code> が 10485760 を返しました。これで上限が効いていると言えますか? 言えないなら、どう確かめますか?</summary>
+      <div class="qa-body"><p><strong>言えません。</strong>それは「ファイルに値が入っている」ことの証明でしかありません。</p>
+      <p>効いていないケースは実際にあります。いちばん多いのは <code>cgroup.procs</code> に PID を書き忘れているときで、値は入っているのに誰も制限されません。</p>
+      <p>確かめ方は<strong>実際に超過させること</strong>です。しかも<strong>対照とペアで</strong>。上限なしなら成功し、上限ありなら殺されることを、同じコマンドで確認します。</p>
+      <p>そのとき使うコマンドは<strong>メモリを溜めるもの</strong>でなければいけません。<code>dd if=/dev/zero of=/dev/null bs=100M count=1</code> は 100MB のバッファを一度に確保するので有効です。<code>head -c 100M /dev/zero | wc -c</code> は流すだけなので<strong>無効</strong>です。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q3. この環境で <code>stat -fc %T /sys/fs/cgroup/</code> は <code>tmpfs</code> を返しました。これは「cgroup v2 が無い」ことを意味しますか?</summary>
+      <div class="qa-body"><p><strong>意味しません。</strong>実際、この環境には <code>/sys/fs/cgroup/unified</code> に cgroup2 がマウントされていました。<code>mount | grep cgroup</code> の最後の行がそれです。</p>
+      <p><code>/sys/fs/cgroup</code> が tmpfs なのは、そこが<strong>ただの置き場</strong>だからです。その下に v1 のコントローラが1つずつ、それぞれ別のマウントとしてぶら下がり、さらに <code>unified/</code> に v2 も同居している —— hybrid 構成です。</p>
+      <p>そして、v2 があっても<strong>使えるとは限りません</strong>。この環境の <code>unified/cgroup.controllers</code> は <code>cpuset hugetlb</code> だけで、<code>memory</code> は v1 側に取られていました。<strong>1つのコントローラは v1 と v2 のどちらか一方にしか結び付きません。</strong></p>
+      <p>だから判定は3段階にしました。<strong>(1) <code>statfs</code> の <code>f_type</code> が cgroup2fs か、(2) <code>cgroup.controllers</code> が読めるか、(3) そこに <code>memory</code> が語として見えるか。</strong>3つ目まで通って初めて「v2 が使える」と判断します。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q4. <code>hasField</code> の代わりに <code>strings.Contains</code> を使うと、どんな問題が起きますか?</summary>
+      <div class="qa-body"><p><strong>部分一致による誤検出</strong>が起きます。<code>strings.Contains("memory_foo bar", "memory")</code> は true を返しますが、<code>memory</code> というコントローラは実在しません。</p>
+      <p>誤検出の結果は深刻です。「v2 で memory が使える」と誤判定して <code>newV2</code> に進み、しかし葉に <code>memory.max</code> が生えないので書き込みに失敗する —— あるいは、失敗を握りつぶしていれば<strong>上限が効かないままコンテナが起動します</strong>。この章でいちばん避けたい結末です。</p>
+      <p><code>hasField</code> は <code>strings.Fields</code> で空白分割してから完全一致で比べるので、こうした誤りが起きません。<strong>「空白区切りの一覧」を扱うときは、必ず語単位で見る。</strong>これは cgroup に限らず、<code>/proc</code> や <code>/sys</code> の他のファイルを読むときにも通用する作法です。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q5. <code>Destroy</code> が親ディレクトリの削除失敗を無視しているのに、葉の削除失敗はエラーにしているのはなぜですか?</summary>
+      <div class="qa-body"><p><strong>失敗の意味が違うから</strong>です。</p>
+      <p>葉（<code>.../mydocker/&lt;ID&gt;</code>）の削除が失敗するのは、たいてい <code>EBUSY</code> —— <strong>中にまだプロセスが残っている</strong>ときです。これは異常事態です。コンテナが終わったつもりなのに終わっていない、ということですから、握りつぶさずに報告しなければいけません。無視すると「消したつもりで消えていない cgroup」が積み上がります。</p>
+      <p>親（<code>.../mydocker</code>）の削除が失敗するのは、たいてい <code>ENOTEMPTY</code> —— <strong>他のコンテナがまだ動いている</strong>ときです。これは正常です。むしろ消えてしまったら困ります。だから <code>_ = os.Remove(...)</code> と戻り値を捨てています。</p>
+      <p>「空なら消す、空でないなら消さない」が <code>rmdir</code> の仕様なので、条件分岐を書かずに済んでいます。<strong>システムコールの仕様をそのまま利用して、判断を1行減らす</strong>という書き方です。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q6. OOM で殺されたコンテナの終了コードが 255 になっていました。原因と直し方を説明してください。</summary>
+      <div class="qa-body"><p>原因は Go の <code>exec.ExitError.ExitCode()</code> が、<strong>シグナルで殺された場合に <code>-1</code> を返す</strong>ことです。シグナル死には終了コードが存在しないので、Go は「無い」を <code>-1</code> で表しています。それを <code>os.Exit(-1)</code> に渡すと、終了コードは8ビットに丸められて 255 になります。</p>
+      <p>直し方は、シェルの慣習に合わせて <strong>128 + シグナル番号</strong> を返すことです。<code>ee.Sys()</code> を <code>syscall.WaitStatus</code> に型アサーションし、<code>ws.Signaled()</code> が true なら <code>128 + int(ws.Signal())</code> を返します。SIGKILL は 9 番なので 137 になります。</p>
+      <p>この修正の値打ちは、<strong>テストで検査できるようになること</strong>です。255 は「何かよく分からない失敗」ですが、137 は「SIGKILL で殺された」という具体的な事実です。E2E に <code>上限超過が OOM による強制終了として報告される (exit 137)</code> という項目を書けるようになりました。</p></div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>同じコマンドを、上限なしと上限 10m で走らせて、結果が変わればこの章は完了です。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="out">1+0 records in
+1+0 records out
+104857600 bytes (100.0MB) copied, 0.047161 seconds, 2.1GB/s</span>
+<span class="ps">$</span> echo $?
+<span class="out">0</span>
+<span class="ps">$</span> mydocker run --quiet --memory 10m alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="ps">$</span> echo $?
+<span class="out">137</span></code></pre>
+      <p>E2E テストでも、この章に対応するセクションが通ります。</p>
+      <pre class="term"><code><span class="ps">$</span> ./e2e_test.sh
+<span class="out">== 3. 資源の上限 (FR-4) ==
+  OK   メモリ上限 10m を超える確保が実際に失敗する（設定値の確認では済ませない）
+  OK   上限超過が OOM による強制終了として報告される (exit 137)</span></code></pre>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>この章で、コンテナの世界に<strong>底</strong>が入りました。名前空間が「見えるもの」を仕切ったのに対し、cgroup は「使えるもの」を仕切ります。やったことは、ディレクトリを作り、ファイルに数字を書き、<code>cgroup.procs</code> に PID を書く —— それだけでした。外部ライブラリはゼロ、システムコールも <code>Statfs</code> が1つだけ。<strong>cgroup はただのファイル操作である</strong>という一点を、手で確かめて、コードで確かめて、対照実験で確かめました。同時に、「書けた」と「効いた」がまったく別のことも学びました。<code>cat</code> で値が読めても何の証明にもならず、実際に超過させて <code>exit 137</code> を見るまでは信じてはいけない。そして、この環境では v2 が使えないという実測から、判定を「マウントされているか」ではなく「<strong>memory が語として見えるか</strong>」に変え、2つのバックエンドを持つに至りました。</p>
+
+    <p>しかし、まだ大きな不自然さが残っています。<strong>コンテナが立つ rootfs を、私たちは手で用意しています。</strong>第03章で <code>pivot_root</code> の実験をしたとき、<code>/tmp/rootfs</code> のようなディレクトリはどこから来たのでしょう。誰かがどこかから展開して置いたものです。<code>alpine</code> という名前でコンテナを起動できるのも、たまたまそこに alpine の中身が置いてあるからにすぎません。ここまでの4章を通して、<strong>「イメージ」という言葉が一度も出てきていない</strong>ことに気づいたでしょうか。プロセスを隔離し、根を挿げ替え、上限をかける道具は揃いました。けれど、<strong>その根に何を置くかを、まだ自分で決められていない</strong>のです。<code>docker run ubuntu</code> と打つだけで ubuntu の中身が現れるあの体験は、まだ1ミリも再現できていません。</p>
+
+    <p>次章では、そこに取りかかります。<code>docker pull</code> が裏で何をしているのかを、HTTP のレベルから自分で書きます。認証トークンを取り、マニフェストを読み、レイヤの実体をダウンロードする —— レジストリ API は公開された仕様なので、<code>curl</code> で叩いて目で見ることができます。実際、この環境では途中で足をすくわれました。<strong>返ってきたマニフェストに <code>layers</code> が無かった</strong>のです。なぜそうなるのか、どう対処するのかを含めて、イメージという言葉の中身を開けにいきます。</p>
+
+    <div class="chap-foot">
+      <a class="pager" href="03-pivotroot.html"><span class="dir">← 前へ</span>第03章 · 根を挿げ替える</a>
+      <a class="pager next" href="05-registry.html"><span class="dir">次へ →</span>第05章 · イメージを取ってくる</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
