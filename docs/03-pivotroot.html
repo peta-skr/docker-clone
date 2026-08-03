@@ -259,7 +259,7 @@ os.chroot(<span class="st">"."</span>)                      <span class="cm"># �
       <pre class="term"><code><span class="ps">$</span> wc -l &lt; /proc/mounts
 <span class="out">22</span></code></pre>
       <p>この確認は自動テストにも入れてあります。テスト全体を走らせた前後で数が一致することを見ています。</p>
-      <pre class="term"><code><span class="ps">$</span> ./e2e_test.sh
+      <pre class="term"><code><span class="ps">$</span> python3 e2e_test.py
 <span class="out">  OK   テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）</span></code></pre>
     </div>
 
@@ -913,7 +913,7 @@ var</span></code></pre>
     1 root      0:00 /bin/sh
     7 root      0:00 ps</span></code></pre>
       <p>あわせて、<code>ls /.old_root</code> が <code>No such file or directory</code> を返すことも確かめてください。古い世界は、もうどこにも残っていません。自動テストでもこの2点を見ています。</p>
-      <pre class="term"><code><span class="ps">$</span> ./e2e_test.sh
+      <pre class="term"><code><span class="ps">$</span> python3 e2e_test.py
 <span class="out">  OK   コンテナ内の ps にホストのプロセスが1つも出ない（行数ちょうど）
        （ホスト側の実行中プロセスは 86 個。コンテナ内は 1 個）</span></code></pre>
     </div>
