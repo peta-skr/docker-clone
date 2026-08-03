@@ -501,7 +501,7 @@
 
     <p>取り直したマニフェスト本体には、<code>layers</code> のほかに <code>config</code> という項目が1つあります。これも digest で指された blob です。中身は JSON で、<strong>コンテナをどう起動すべきかが書いてあります</strong>。</p>
 
-    <p>ここは意外と見落とされる部分です。<code>docker run alpine</code> と打ったとき、何もコマンドを指定していないのに <code>/bin/sh</code> が動きます。<code>echo $PATH</code> を打つとちゃんと <code>/usr/local/sbin:/usr/local/bin:…</code> が入っています。あの既定値は、カーネルでもランタイムでもなく、<strong>この config JSON から来ています</strong>。</p>
+    <p>ここは意外と見落とされる部分です。<code>docker run alpine</code> と打ったとき、何もコマンドを指定していないのに <code>/bin/sh</code> が動きます。<code>echo $PATH</code> を打つとちゃんと値が入っています。あの既定値は、カーネルでもランタイムでもなく、<strong>この config JSON から来ています</strong>。</p>
 
     <p>私たちが要るのは4つだけです。</p>
 
