@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第03章 根を挿げ替える — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第03章 / 全10章 · 層: ROOT · 読了目安 3〜5時間</div>
+    <div class="eyebrow"><span>Root</span><span class="depth">— 世界の底を入れ替える</span></div>
+    <h1>根を挿げ替える</h1>
+    <p class="lede">前章で PID 名前空間を作ったのに、<code>ps</code> はまだホストのプロセスをずらりと並べます。名前空間は効いているのに、です。犯人は <code>/proc</code> でした。この章では、コンテナが立つ地面そのものを入れ替えます。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p><code>internal/container/init.go</code> の <code>pivot_root</code> 前後を読み切り、7つの手順がなぜその順番でなければならないかを自分の言葉で説明できるようになる。仕上げに、<strong>コンテナの中で <code>ps</code> を打って、自分のプロセスだけが並ぶ</strong>ことを確認する。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#step-1">まず chroot を試して、破ってみる</a></li>
+        <li><a href="#step-2">伝播を切る — なぜ最初にこれが要るのか</a></li>
+        <li><a href="#step-3">rootfs を自分自身に bind mount する</a></li>
+        <li><a href="#step-4">根を挿げ替える — pivot_root を呼ぶ</a></li>
+        <li><a href="#step-5">/proc を貼り直す — 02章の謎が解ける</a></li>
+        <li><a href="#step-6">古い root を捨てる — MNT_DETACH</a></li>
+        <li><a href="#step-7">/sys と /dev を用意する</a></li>
+      </ol>
+    </div>
+
+    <h2>前章の宿題 — 名前空間は効いていた。それなのに</h2>
+
+    <p>前章で私たちは <code>Cloneflags</code> に <code>CLONE_NEWUTS</code>、<code>CLONE_NEWPID</code>、<code>CLONE_NEWNS</code>、<code>CLONE_NEWIPC</code> の4枚を並べました。ホスト名は変わりました。<code>$$</code>（自分の PID）も <code>1</code> になりました。ところが <code>ps</code> を打つと、ホストで動いているプロセスがずらずらと出てきます。</p>
+
+    <p>ここで多くの人が「名前空間の作り方を間違えたのだろう」と考えます。私も最初はそう思って <code>Cloneflags</code> を何度も見直しました。<strong>しかしフラグは正しかった</strong>のです。この章の Step 5 で、その種明かしをします。先に結論だけ言っておくと、犯人は名前空間ではなく<strong>ファイルシステム</strong>でした。つまり、コンテナが立っている「地面」の方です。</p>
+
+    <p>だから、この章のテーマは「地面の入れ替え」になります。順番としてもここが正しい。名前空間で<strong>見え方</strong>を区切っただけでは、コンテナはまだホストと同じディレクトリツリーの上に立っています。同じ <code>/etc</code>、同じ <code>/usr</code>、同じ <code>/root</code>。これでは「別の世界」とは呼べません。</p>
+
+    <div class="ascii">02章を終えた時点のコンテナ
+
+  ホスト                        コンテナ (PID 1)
+  ------------------------      ------------------------
+   PID 名前空間          別々    PID 名前空間
+   UTS 名前空間          別々    UTS 名前空間
+   IPC 名前空間          別々    IPC 名前空間
+   マウント名前空間       別々    マウント名前空間
+        |                            |
+        +--------------+-------------+
+                       |
+                 同じ / を見ている        ← ここがまだ分かれていない
+                 (/etc /usr /root ...)</div>
+
+    <p>「マウント名前空間は分けたのに、なぜ同じ <code>/</code> を見ているの?」という疑問はもっともです。マウント名前空間を分けると、<strong>マウントの一覧が複製されて、以後の変更が互いに伝わらなくなる</strong>だけで、複製された時点の中身は元と同じです。分身を作っただけで、まだ何も入れ替えていない。ここから先が本章の仕事になります。</p>
+
+    <h2>「地面を入れ替える」とは何をすることか</h2>
+
+    <p>Linux のファイルシステムは <code>/</code> を頂点とした1本の木です。<code>/usr/bin/ls</code> というパスは、<code>/</code> から <code>usr</code> → <code>bin</code> → <code>ls</code> と降りていく道順を書いたものにすぎません。ということは、<strong>その <code>/</code> が別のものに差し替わってしまえば、同じパスを書いても全く別の場所に着く</strong>わけです。</p>
+
+    <p>私たちの手元には、これから使いたい「別の世界の中身」があります。alpine のイメージを展開したディレクトリ（この本ではこれを <code>rootfs</code> と呼びます）です。中には <code>bin</code>、<code>etc</code>、<code>lib</code>、<code>usr</code> といった、いかにも root らしい顔ぶれが入っています。ただし、今のところそれはホストから見れば<strong>ただの一つのディレクトリ</strong>です。</p>
+
+    <div class="ascii">やりたいこと
+
+  【今】                                【したい】
+  /                  ← ホストの root     /                ← rootfs が root になる
+  |- bin                                |- bin
+  |- etc                                |- etc
+  |- usr                                |- lib
+  |- root                               |- usr
+  +- var                                +- var
+     +- lib
+        +- mydocker
+           +- .../merged   ← rootfs      (ホストの / はどこにも見えない)
+              |- bin
+              |- etc
+              +- usr</div>
+
+    <p>この「差し替え」をやってくれるシステムコールが2つあります。<code>chroot</code> と <code>pivot_root</code> です。名前からすると <code>chroot</code>（change root）の方が素直に見えます。実際、まずはそちらを試すべきです。<strong>試して、破れることを自分の目で見てから</strong> <code>pivot_root</code> に進む。それがこの章の進み方です。</p>
+
+    <h2>この章で出てくる言葉</h2>
+
+    <p>知らない単語が続くと読む速度が落ちるので、先に表にしておきます。今は眺めるだけで結構です。各ステップで一つずつ実物に触ります。</p>
+
+    <table>
+      <tr><th>言葉</th><th>意味</th></tr>
+      <tr><td><code>rootfs</code></td><td>コンテナの <code>/</code> になる予定のディレクトリ。イメージを展開した中身が入っている</td></tr>
+      <tr><td><code>chroot</code></td><td>プロセスから見た <code>/</code> の位置を付け替えるシステムコール。<strong>付け替えるだけ</strong></td></tr>
+      <tr><td><code>pivot_root</code></td><td>マウント名前空間の root そのものを入れ替え、古い root を指定した場所に押し出すシステムコール</td></tr>
+      <tr><td>マウントポイント</td><td>何かのファイルシステムが接続されているディレクトリ。<code>/proc</code> や <code>/sys</code> がそれ</td></tr>
+      <tr><td>bind mount</td><td>既にあるディレクトリを、別の場所にもう一度「生やす」マウント。中身は同一のものが二か所から見える</td></tr>
+      <tr><td>伝播 (propagation)</td><td>あるマウント名前空間で行ったマウントを、他の名前空間にも自動で反映する仕組み</td></tr>
+      <tr><td><code>MS_PRIVATE</code></td><td>伝播を切るフラグ。「ここから先は自分だけの話にする」</td></tr>
+      <tr><td><code>MS_REC</code></td><td>再帰。指定したディレクトリの下にぶら下がる全マウントに同じ処理を及ぼす</td></tr>
+      <tr><td><code>put_old</code></td><td><code>pivot_root</code> が古い root を押し出す先のディレクトリ。本実装では <code>/.old_root</code></td></tr>
+      <tr><td><code>MNT_DETACH</code></td><td>遅延アンマウント。まだ誰かが使っていても、とりあえずマウント木から切り離す</td></tr>
+      <tr><td><code>mknod</code></td><td>デバイスファイル（<code>/dev/null</code> など）を作るシステムコール</td></tr>
+      <tr><td><code>tmpfs</code></td><td>メモリ上に作る小さなファイルシステム。再起動で消えて構わないものを置く</td></tr>
+    </table>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>まず chroot を試して、破ってみる</h2>
+
+    <p>素朴な案から始めます。<code>chroot("/tmp/jail")</code> を呼べば、そのプロセスにとって <code>/tmp/jail</code> が <code>/</code> になります。牢屋（jail）という呼び方が定着しているくらいで、いかにも閉じ込められそうです。</p>
+
+    <p>実験用に <code>/tmp/jail</code> を作り、中に <code>bin</code> と <code>inner</code> という2つのディレクトリだけを置いておきました。ここに <code>chroot</code> したプロセスからは、世界にこの2つしか無いように見えるはずです。そして実際そう見えます。問題は<strong>その後</strong>です。</p>
+
+    <p>次の Python スクリプトを読んでください。Go ではなく Python なのは、<code>os.chroot</code> が標準ライブラリにあって短く書けるからです。やっていることに言語は関係ありません。</p>
+
+    <div class="file-tag">escape.py（この章だけの実験用。実装には含まれない）</div>
+<pre><code><span class="kw">import</span> os
+fd = os.open(<span class="st">"/"</span>, os.O_RDONLY)      <span class="cm"># ★chroot する前に、外の / を掴んでおく</span>
+os.chroot(<span class="st">"/tmp/jail"</span>)              <span class="cm"># 牢に入る</span>
+os.chdir(<span class="st">"/"</span>)
+<span class="kw">print</span>(<span class="st">"chroot 直後の ls / :"</span>, sorted(os.listdir(<span class="st">"/"</span>)))
+os.fchdir(fd)                       <span class="cm"># 掴んでおいた外のディレクトリへ戻る</span>
+<span class="kw">for</span> _ <span class="kw">in</span> <span class="kw">range</span>(<span class="st">64</span>):
+    os.chdir(<span class="st">".."</span>)                  <span class="cm"># 上へ登り切る</span>
+os.chroot(<span class="st">"."</span>)                      <span class="cm"># 牢を「今いる場所」に付け替える</span>
+<span class="kw">print</span>(<span class="st">"脱獄後の  ls / :"</span>, sorted(os.listdir(<span class="st">"/"</span>))[:<span class="st">12</span>])</code></pre>
+
+    <p>手口は4手です。順に見ます。</p>
+
+    <ol>
+      <li><strong><code>chroot</code> する前に、外側のディレクトリを <code>open</code> しておく。</strong> これで、そのプロセスは「外の <code>/</code> を指すファイルディスクリプタ」を1本、手に握った状態になります。</li>
+      <li><strong><code>chroot</code> する。</strong> ここでプロセスから見た <code>/</code> は <code>/tmp/jail</code> になります。<code>ls /</code> をすれば <code>bin</code> と <code>inner</code> しか出ません。牢は閉まったように見えます。</li>
+      <li><strong><code>fchdir(fd)</code> で、掴んでおいた場所へ移動する。</strong> ここが要です。<code>fchdir</code> はパス名を辿りません。<strong>ディスクリプタが直接指している場所へ、一瞬で移る</strong>のです。パスを辿らないのだから <code>/</code> がどこに付け替えられていようと関係ありません。</li>
+      <li><strong><code>..</code> を登り切ってから <code>chroot(".")</code>。</strong> 今いる場所は牢の外なので、そこから <code>..</code> を繰り返せば本物の <code>/</code> に着きます（64 回も登れば十分です）。そして今いる場所を新しい root として <code>chroot</code> し直せば、牢は消えます。</li>
+    </ol>
+
+    <div class="ascii">chroot が変えるもの / 変えないもの
+
+  プロセスが持っている情報
+  ------------------------------------------------
+   fs-&gt;root  = /tmp/jail          ← chroot が書き換えるのはここだけ
+   fs-&gt;pwd   = /tmp/jail          ← chdir("/") でここに来る
+   fd[3]     = (chroot 前の /)    ← 誰も無効化してくれない  ★ここが穴
+                                     fchdir(3) でいつでも戻れる</div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>実際に走らせた結果です。1行目が牢の中の眺め、2行目が脱獄後の眺めです（長いので先頭 12 件だけ表示しています）。</p>
+      <pre class="term"><code><span class="ps">$</span> python3 escape.py
+<span class="out">chroot 直後の ls / : ['bin', 'inner']
+脱獄後の  ls / : ['bin', 'bin.usr-is-merged', 'boot', 'container_info.json', 'dev', 'etc', 'home', 'lib', 'lib.usr-is-merged', 'lib64', 'lost+found', 'media']</span></code></pre>
+      <p>2行目に <code>boot</code> や <code>etc</code>、<code>home</code> が並んでいます。<strong>これはホストの <code>/</code> です。</strong> 牢の中から、たった数行で外に出てしまいました。</p>
+    </div>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · chroot は「見え方」しか変えない</div>
+      <p><code>chroot</code> がやることは、カーネルの中にあるそのプロセスの情報のうち「root はここ」という1項目を書き換えることだけです。パス名を <code>/</code> から解決するとき、その項目が起点として使われます。だから <code>/etc/passwd</code> と書けば <code>/tmp/jail/etc/passwd</code> が開きます。</p>
+      <p>問題は、<strong>プロセスが既に持っている参照には手を触れない</strong>ことです。開いてあるファイルディスクリプタ、現在の作業ディレクトリ、他のプロセスから受け取ったディスクリプタ——これらは「パス名で辿る」ものではなく「もう掴んでいる」ものなので、root の付け替えの影響を受けません。上の実験は、その性質をそのまま突いています。</p>
+      <p>ここから導かれる教訓は「<code>chroot</code> は間違っている」ではなく、<strong>「<code>chroot</code> はセキュリティ境界として設計されていない」</strong>です。もともとはビルド環境を切り替えるための道具でした。隔離のために使うなら、別の道具が要ります。</p>
+    </div>
+
+    <p>ではどうするか。穴の正体が「外側への参照が生き残ること」なら、対策は一つしかありません。<strong>外側そのものを、マウント木から消してしまう</strong>ことです。参照先が木から切り離されていれば、そこへ <code>fchdir</code> で戻ったところで、そこから上へ登る道がありません。</p>
+
+    <p>それをやるのが <code>pivot_root</code> です。<code>pivot_root(new_root, put_old)</code> は、マウント名前空間の root を <code>new_root</code> に付け替えると同時に、<strong>古い root を <code>put_old</code> の位置へ「押し出し」ます</strong>。押し出されたものは普通のマウントとして <code>put_old</code> にぶら下がっているだけなので、後から <code>umount</code> で切り離せます。切り離せば、参照ごと消えます。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// pivotRoot は rootfs をコンテナの新しい / にする。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ この順序を崩すと必ず失敗する。1つずつ理由がある。</span>
+<span class="cm">//</span>
+<span class="cm">// chroot ではなく pivot_root を使うのは、chroot には抜け出す既知の手口があり、</span>
+<span class="cm">// 古い root のマウントも残るため。pivot_root は古い root を完全に切り離せる。</span>
+<span class="kw">func</span> pivotRoot(rootfs <span class="kw">string</span>) <span class="kw">error</span> {
+	<span class="cm">// …（中身は Step 2 から1つずつ）</span>
+}</code></pre>
+
+    <p>この関数の中身は5つのブロックに分かれています。<strong>どのブロックも、一つ前のブロックが済んでいることを前提にしています。</strong> 順番を入れ替えると、たいてい <code>EINVAL</code>（引数が不正）という素っ気ないエラーで落ちます。以降のステップで1ブロックずつ、なぜその位置なのかを確かめていきます。</p>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>伝播を切る — なぜ最初にこれが要るのか</h2>
+
+    <p>最初のブロックは、一見すると何もしていないように見えます。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code>	<span class="cm">// 1. マウントの伝播をホストから切る。</span>
+	<span class="cm">//    これをやらないと、この後の bind mount や /proc のマウントがホスト側に漏れる。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">""</span>, <span class="st">"/"</span>, <span class="st">""</span>, syscall.<span class="ty">MS_PRIVATE</span>|syscall.<span class="ty">MS_REC</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"マウントの伝播を切れませんでした: %w"</span>, err)
+	}</code></pre>
+
+    <p>第1引数（source）は空文字、第3引数（fstype）も空文字、最後のデータも空文字。実質的に指定しているのは<strong>「<code>/</code> に対して <code>MS_PRIVATE|MS_REC</code> という属性を設定する」</strong>ことだけです。何かを新しくマウントしているわけではありません。マウントの<strong>性質</strong>を変える呼び出しです。</p>
+
+    <p>では、変えている性質とは何か。「伝播」です。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · マウントの伝播（shared subtree）</div>
+      <p>マウントには「伝播」という性質があります。ある名前空間でマウントを追加したとき、<strong>それを他の名前空間にも自動で反映するかどうか</strong>を決める設定です。既定値は多くのディストリビューションで <code>shared</code>（共有）になっています。理由はもっともで、たとえば USB メモリを挿したとき、システム中のあらゆる名前空間からそれが見えてほしいからです。</p>
+      <p>主な種類は3つです。<strong><code>shared</code></strong> は双方向に伝わる。<strong><code>slave</code></strong> は親から子へは伝わるが逆は伝わらない。<strong><code>private</code></strong> はどちらにも伝わらない。コンテナが欲しいのは <code>private</code> です。コンテナの中で <code>/proc</code> を貼り直したからといって、ホストの <code>/proc</code> まで貼り替わっては困ります。</p>
+      <p><code>MS_REC</code>（recursive）は「<code>/</code> の下にぶら下がっている<strong>すべての</strong>マウントにも同じ設定を及ぼす」という意味です。ホストには <code>/proc</code>、<code>/sys</code>、<code>/dev</code>、<code>/run</code> など多くのマウントがあり、この環境では合計 22 個ありました。1つでも <code>shared</code> のまま取り残すと、そこから漏れます。だから再帰なのです。</p>
+    </div>
+
+    <div class="ascii">伝播を切る前と後
+
+  【切る前】shared                     【切った後】private
+
+  ホストのマウント木                    ホストのマウント木
+        |                                    |
+        | 双方向に伝わる                       X  伝わらない
+        |                                    |
+  コンテナのマウント木                  コンテナのマウント木
+        |                                    |
+        +- ここで mount すると               +- ここで何をしても
+           ホストにも同じものが増える            ホストは 22 個のまま</div>
+
+    <p>「マウント名前空間を分けたのに、まだ伝わるのか?」と思うかもしれません。私も同じところで引っかかりました。<strong>名前空間を分けることと、伝播を切ることは別の操作です。</strong> 名前空間を分けるのは「マウント一覧の写しを作る」こと。伝播はその写しと元の間に張られたパイプで、写しを作っただけではパイプは残っています。<code>MS_PRIVATE</code> はそのパイプを外す操作です。</p>
+
+    <p>実は前章の <code>run.go</code> にも、この件に関する仕込みが1行入っていました。</p>
+
+    <div class="file-tag">internal/container/run.go（第02章で見た箇所）</div>
+<pre><code>	cmd.SysProcAttr = &amp;syscall.<span class="ty">SysProcAttr</span>{
+		<span class="ty">Cloneflags</span>: syscall.<span class="ty">CLONE_NEWUTS</span> | <span class="cm">// ホスト名</span>
+			syscall.<span class="ty">CLONE_NEWPID</span> | <span class="cm">// プロセス番号</span>
+			syscall.<span class="ty">CLONE_NEWNS</span> | <span class="cm">// マウント</span>
+			syscall.<span class="ty">CLONE_NEWIPC</span>, <span class="cm">// プロセス間通信</span>
+		<span class="cm">// ⚠ これを忘れると、コンテナ内で行ったマウントがホスト側にも伝播する。</span>
+		<span class="cm">//    pivot_root が EINVAL で落ちる原因にもなる。「なぜか動かない」の筆頭。</span>
+		<span class="ty">Unshareflags</span>: syscall.<span class="ty">CLONE_NEWNS</span>,
+	}</code></pre>
+
+    <p><code>Unshareflags</code> は Go の <code>os/exec</code> が用意している仕掛けで、子プロセスを起動する直前に <code>unshare(2)</code> を呼ばせるものです。<code>Cloneflags</code> にも <code>CLONE_NEWNS</code> があるのに二重に見えますが、この2行は<strong>ホスト側で先に伝播の縁を切っておく</strong>ために効いてきます。そして子の側では、いま見た <code>MS_PRIVATE|MS_REC</code> でもう一度、確実に切ります。ベルトと吊りひもの両方を着けているわけです。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 伝播を切らないと、ホストのマウントが増えていく</div>
+      <p>この1ブロックを省いても、コンテナはしばらく普通に動いてしまいます。だから気付きにくい。しかし裏では、コンテナを起動するたびにホストのマウント一覧に <code>overlay</code> や bind mount が積み上がっていきます。何十回か起動したあとにホストが妙に遅くなり、<code>mount</code> の出力が画面に収まらなくなって、ようやく気付く——という壊れ方をします。</p>
+      <p>さらに悪いことに、この状態では <code>pivot_root</code> 自体が <code>EINVAL</code> で落ちることがあります。<code>pivot_root</code> は「新しい root が <code>shared</code> なマウントであってはならない」という条件を持っているためです。<strong>「<code>pivot_root</code> が EINVAL」と出たら、まず伝播を疑う。</strong> これは覚えておく価値のある対応関係です。</p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>ホスト側のマウント数を数えておきます。コンテナを何度起動しても、この数が変わらないのが正しい状態です。</p>
+      <pre class="term"><code><span class="ps">$</span> wc -l &lt; /proc/mounts
+<span class="out">22</span></code></pre>
+      <p>この確認は自動テストにも入れてあります。テスト全体を走らせた前後で数が一致することを見ています。</p>
+      <pre class="term"><code><span class="ps">$</span> ./e2e_test.sh
+<span class="out">  OK   テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）</span></code></pre>
+    </div>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>rootfs を自分自身に bind mount する</h2>
+
+    <p>2つめのブロックは、初めて見ると一番わけが分からない箇所です。<strong>同じパスを2回書いています。</strong></p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code>	<span class="cm">// 2. ⚠ 新しい root は「マウントポイント」でなければならない。</span>
+	<span class="cm">//    普通のディレクトリを渡すと pivot_root は EINVAL で落ちる。</span>
+	<span class="cm">//    自分自身に bind mount することでマウントポイントの条件を満たす。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(rootfs, rootfs, <span class="st">""</span>, syscall.<span class="ty">MS_BIND</span>|syscall.<span class="ty">MS_REC</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"rootfs を自分自身に bind mount できませんでした (%s): %w"</span>, rootfs, err)
+	}</code></pre>
+
+    <p><code>syscall.Mount(rootfs, rootfs, ...)</code>。source も target も同じ <code>rootfs</code> です。何も移動していないのだから、実行後にファイルの見え方は1バイトも変わりません。それなのに、この行が無いと <code>pivot_root</code> は動きません。</p>
+
+    <p>理由は <code>pivot_root(2)</code> の規則にあります。<strong>新しい root に渡せるのは「マウントポイント」だけ</strong>で、ただのディレクトリは受け付けてくれません。ところが私たちの <code>rootfs</code> は、イメージを展開しただけの普通のディレクトリです（第06章で overlayfs を導入すると <code>merged</code> は本物のマウントポイントになりますが、それでもこの行は残しておきます。理由は後述します）。</p>
+
+    <p>そこで <code>MS_BIND</code> の出番です。bind mount は「あるディレクトリを、別の場所にもう一度生やす」マウントで、行き先を自分自身にすることもできます。自分の上に自分を重ねると、見え方は変わらないまま、<strong>そのパスは「マウントポイントである」という資格を得ます</strong>。カーネルのマウント一覧に1行増えるからです。まさに、規則を満たすためだけの操作です。</p>
+
+    <div class="ascii">bind mount 前と後（見え方は同じ、資格だけが変わる）
+
+  【前】カーネルのマウント一覧              rootfs は…
+   / on /                    ext4         ただのディレクトリ
+   /proc on /proc            proc         → pivot_root は EINVAL
+   ... (全 22 行)
+
+  【後】カーネルのマウント一覧              rootfs は…
+   / on /                    ext4         マウントポイント
+   /proc on /proc            proc         → pivot_root の条件を満たす
+   ... (全 22 行)
+   ROOTFS on ROOTFS          bind    ← この1行が増えただけ</div>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · pivot_root(2) の規則</div>
+      <p><code>pivot_root(new_root, put_old)</code> には、満たさなければならない条件がいくつもあります。実装で効いてくるのは次の3つです。</p>
+      <p><strong>(1) <code>new_root</code> はマウントポイントでなければならない。</strong> 普通のディレクトリでは <code>EINVAL</code>。Step 3 の bind mount はこれを満たすためのものです。</p>
+      <p><strong>(2) <code>put_old</code> は <code>new_root</code> の配下（下の階層）でなければならない。</strong> 古い root を新しい root の外に置くことはできません。「押し出した先」が新しい世界から見えないと、後で <code>umount</code> できないからです。本実装が <code>rootfs/.old_root</code> を作るのはこの規則のためです。</p>
+      <p><strong>(3) <code>new_root</code> も現在の root も、伝播が <code>shared</code> であってはならない。</strong> Step 2 の <code>MS_PRIVATE</code> はこれを満たすためのものでもあります。3つの条件が「Step 2 → Step 3 → Step 4」という順序を決めているわけです。</p>
+      <p>ちなみに <code>MS_REC</code> を付けているのは、<code>rootfs</code> の下に既に何かがマウントされていた場合に、それも一緒に持っていくためです。イメージを展開しただけの状態では下に何もありませんが、付けておいて損はありません。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · EINVAL は「引数が不正」としか言ってくれない</div>
+      <p><code>pivot_root</code> が失敗したときのエラーは、多くの場合 <code>invalid argument</code> の一言です。5つある条件のどれを破ったのかは教えてくれません。私はここで半日溶かしました。落ちたときに疑う順番を決めておくと早いです。</p>
+      <ol>
+        <li><strong>Step 2 を省いていないか</strong>（伝播が <code>shared</code> のまま）</li>
+        <li><strong>Step 3 を省いていないか</strong>（<code>new_root</code> がただのディレクトリ）</li>
+        <li><strong><code>put_old</code> が <code>new_root</code> の中にあるか</strong>（<code>/tmp/old</code> のような外側の場所を渡していないか）</li>
+        <li><strong>そもそもマウント名前空間の中にいるか</strong>（<code>CLONE_NEWNS</code> を付け忘れていないか）</li>
+      </ol>
+      <p>この4つを上から順に見れば、まず当たります。</p>
+    </div>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>根を挿げ替える — pivot_root を呼ぶ</h2>
+
+    <p>下ごしらえが済みました。ここが山場です。3つのブロックが続きます。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code>	<span class="cm">// 3. 古い root の置き場を新しい root の中に用意する。</span>
+	<span class="cm">//    ⚠ put_old は new_root の配下でなければならない。これも規則。</span>
+	putOld := filepath.<span class="ty">Join</span>(rootfs, oldRoot)
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(putOld, <span class="st">0o700</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"古い root の置き場を作れませんでした: %w"</span>, err)
+	}
+
+	<span class="cm">// 4. 根の挿げ替え。ここで / が入れ替わる。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">PivotRoot</span>(rootfs, putOld); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"pivot_root に失敗しました: %w"</span>, err)
+	}
+
+	<span class="cm">// 5. 作業ディレクトリは古い root を指したままなので、新しい / に移る。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Chdir</span>(<span class="st">"/"</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"新しい / へ移動できませんでした: %w"</span>, err)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p><code>oldRoot</code> はファイルの先頭で定義されている定数です。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// oldRoot は pivot_root で押し出された古い root の一時的な置き場。</span>
+<span class="kw">const</span> oldRoot = <span class="st">"/.old_root"</span></code></pre>
+
+    <p><code>filepath.Join(rootfs, oldRoot)</code> で、たとえば <code>/var/lib/mydocker/containers/xxxx/merged/.old_root</code> という絶対パスができます。これが <code>put_old</code> です。規則 (2) のとおり、<code>new_root</code> の<strong>配下</strong>に作っています。パーミッションが <code>0o700</code>（所有者だけが読み書きできる）なのは、一時的とはいえホストの root がぶら下がる場所だからです。</p>
+
+    <p>そして <code>syscall.PivotRoot(rootfs, putOld)</code>。この1行で世界が入れ替わります。</p>
+
+    <div class="ascii">pivot_root の前後
+
+  【前】                                【後】
+  /                  ← ホストの root     /                    ← 元 rootfs
+  |- bin                                |- bin                （イメージの中身）
+  |- etc                                |- etc
+  |- usr                                |- usr
+  +- var                                +- .old_root         ← 元の / （この後捨てる）
+     +- lib                                |- bin
+        +- mydocker                        |- etc
+           +- .../merged  ← rootfs         |- usr
+              |- bin                       +- var
+              |- etc                          +- lib
+              +- usr                             +- mydocker</div>
+
+    <p>図をよく見てください。<strong>ホストの <code>/</code> は消えていません。</strong> <code>/.old_root</code> という場所に移動しただけです。この時点ではまだ、コンテナの中から <code>ls /.old_root</code> と打てばホストの中身が丸見えです。これを消すのが Step 6 の仕事になります。</p>
+
+    <p>最後の <code>syscall.Chdir("/")</code> も省けません。<code>pivot_root</code> は root を入れ替えますが、<strong>プロセスの現在の作業ディレクトリまでは面倒を見てくれません</strong>。呼び出し直後、作業ディレクトリはまだ古い root（今は <code>/.old_root</code> の側）を指しています。ここで <code>/</code> へ移っておかないと、Step 6 で古い root を切り離すときに「使用中」で失敗しかねません。</p>
+
+    <p>気付いた人もいるかもしれません。<strong>これは Step 1 で見た脱獄の手口と同じ形</strong>です。作業ディレクトリという「外側への参照」を握ったままにしない。<code>chroot</code> ではその参照を放置できてしまうから破られる。<code>pivot_root</code> では自分で始末をつけます。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · syscall.PivotRoot と syscall.Mount の引数</div>
+      <p>Go の <code>syscall</code> パッケージは、Linux のシステムコールをほぼそのままの形で公開しています。だから <code>man 2 pivot_root</code> と見比べながら読めます。</p>
+      <p><code>syscall.PivotRoot(newroot, putold string) error</code> — C の <code>pivot_root(2)</code> そのままです。返り値が <code>int</code> と <code>errno</code> ではなく <code>error</code> になっているのが Go らしいところで、失敗すると <code>syscall.Errno</code> 型の値が返ります。これは <code>error</code> インターフェースを満たすので、そのまま <code>%w</code> で包めます。</p>
+      <p><code>syscall.Mount(source, target, fstype string, flags uintptr, data string) error</code> — 引数は5つ。<code>mount(2)</code> と同じ並びです。<strong>使わない引数には空文字を渡す</strong>のが作法で、Step 2 で <code>Mount("", "/", "", ...)</code> と書けたのはそのためです。<code>flags</code> はビット OR で重ねます（<code>MS_BIND|MS_REC</code>）。</p>
+      <p><code>fmt.Errorf</code> の <code>%w</code> は「元のエラーを包んだまま新しいエラーを作る」動詞です。包んでおくと、呼び出し元で <code>errors.Is(err, syscall.EINVAL)</code> のような判定ができます。本実装ではそこまではしていませんが、エラーメッセージを日本語にしつつ原因を失わない書き方として一貫して使っています。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · pivot_root の後、ホスト側のパスはもう使えない</div>
+      <p><code>pivot_root</code> が成功した瞬間から、<code>/usr/bin/ls</code> と書けばそれは<strong>イメージの中の</strong> <code>ls</code> を指します。ホストのバイナリは（<code>/.old_root</code> 経由を除いて）もう見えません。</p>
+      <p>だから <code>Init</code> の中では、実行するコマンドを探すのが <code>pivot_root</code> の<strong>後</strong>になっています。<code>init.go</code> にはこう書いてあります。</p>
+      <pre><code>	<span class="cm">// 実行するコマンドを新しい root の中から探す。</span>
+	<span class="cm">// ⚠ ここは pivot_root の **後** でなければならない。前に探すとホスト側の</span>
+	<span class="cm">//    /bin/sh を掴んでしまい、「コンテナの中なのにホストのバイナリが動く」ことになる。</span></code></pre>
+      <p>順序を逆にしても<strong>動いてしまう</strong>のがこの落とし穴の嫌なところです。ホストの <code>/bin/sh</code> が起動して、それらしく見える。しかしイメージを alpine から別のものに差し替えても挙動が変わらない、という形で後から矛盾が出ます。</p>
+    </div>
+
+    <p>ここまでを1つの関数として通して読んでおきます。5つのブロックが、それぞれ前のブロックの結果に乗っているのが見えるはずです。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// pivotRoot は rootfs をコンテナの新しい / にする。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ この順序を崩すと必ず失敗する。1つずつ理由がある。</span>
+<span class="cm">//</span>
+<span class="cm">// chroot ではなく pivot_root を使うのは、chroot には抜け出す既知の手口があり、</span>
+<span class="cm">// 古い root のマウントも残るため。pivot_root は古い root を完全に切り離せる。</span>
+<span class="kw">func</span> pivotRoot(rootfs <span class="kw">string</span>) <span class="kw">error</span> {
+	<span class="cm">// 1. マウントの伝播をホストから切る。</span>
+	<span class="cm">//    これをやらないと、この後の bind mount や /proc のマウントがホスト側に漏れる。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">""</span>, <span class="st">"/"</span>, <span class="st">""</span>, syscall.<span class="ty">MS_PRIVATE</span>|syscall.<span class="ty">MS_REC</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"マウントの伝播を切れませんでした: %w"</span>, err)
+	}
+
+	<span class="cm">// 2. ⚠ 新しい root は「マウントポイント」でなければならない。</span>
+	<span class="cm">//    普通のディレクトリを渡すと pivot_root は EINVAL で落ちる。</span>
+	<span class="cm">//    自分自身に bind mount することでマウントポイントの条件を満たす。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(rootfs, rootfs, <span class="st">""</span>, syscall.<span class="ty">MS_BIND</span>|syscall.<span class="ty">MS_REC</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"rootfs を自分自身に bind mount できませんでした (%s): %w"</span>, rootfs, err)
+	}
+
+	<span class="cm">// 3. 古い root の置き場を新しい root の中に用意する。</span>
+	<span class="cm">//    ⚠ put_old は new_root の配下でなければならない。これも規則。</span>
+	putOld := filepath.<span class="ty">Join</span>(rootfs, oldRoot)
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(putOld, <span class="st">0o700</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"古い root の置き場を作れませんでした: %w"</span>, err)
+	}
+
+	<span class="cm">// 4. 根の挿げ替え。ここで / が入れ替わる。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">PivotRoot</span>(rootfs, putOld); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"pivot_root に失敗しました: %w"</span>, err)
+	}
+
+	<span class="cm">// 5. 作業ディレクトリは古い root を指したままなので、新しい / に移る。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Chdir</span>(<span class="st">"/"</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"新しい / へ移動できませんでした: %w"</span>, err)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>完成した状態のコンテナで、<code>/</code> の中身と <code>/.old_root</code> の有無を見ます。<code>chroot</code> の実験で見えていたホストの <code>boot</code> や <code>home</code> が、ここには1つも無いことを確かめてください。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'ls -a / | head -20; echo "--- 古い root は残っているか:"; ls /.old_root 2&gt;&amp;1'
+<span class="out">.
+..
+bin
+dev
+etc
+home
+lib
+media
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+tmp
+usr
+var
+--- 古い root は残っているか:
+ls: /.old_root: No such file or directory</span></code></pre>
+      <p>最後の行が肝心です。<strong><code>.old_root</code> が無い。</strong> ホストの root は押し出されただけでなく、既に切り離されて消えています。Step 1 の脱獄と同じ手を打とうにも、戻る先がマウント木に存在しません。</p>
+    </div>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span>/proc を貼り直す — 02章の謎が解ける</h2>
+
+    <p>ここが、前章から持ち越した宿題の答え合わせです。</p>
+
+    <p>まず現象をもう一度きちんと見ます。<code>unshare</code> コマンドを使うと、私たちのコードを1行も書かずに同じ状況を再現できます。<code>--pid --fork</code> は「PID 名前空間を作って、その中で子を起こす」という指定です。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>3つ並べて打ってみてください。1つめがコンテナ相当（<code>/proc</code> はそのまま）、2つめがホスト、3つめが <code>/proc</code> を貼り直した場合です。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork sh -c 'ps -e --no-headers | wc -l'
+<span class="out">87</span>
+<span class="ps">$</span> ps -e --no-headers | wc -l          # ホスト側
+<span class="out">85</span>
+
+<span class="ps">$</span> unshare --pid --fork --mount-proc sh -c 'ps -e --no-headers | wc -l'
+<span class="out">3</span></code></pre>
+    </div>
+
+    <p>この3つの数字を、順に噛みしめてください。</p>
+
+    <p><strong>87。</strong> PID 名前空間の中で数えたのに、ホストの 85 より<strong>多い</strong>のです。隔離されているはずの内側が、外側より多くのプロセスを見ている。これは「隔離が効いていない」では説明がつきません。効いていないなら同じ数になるはずです。多くなる理由が要ります。</p>
+
+    <p><strong>85。</strong> これがホストの実数。<code>unshare</code> 自身と、その下の <code>sh</code> と <code>ps</code> が増えた分だけ、内側が 87 になっている——そう考えると数が合います。<strong>内側は、ホストのプロセス一覧をそのまま読んで、そこに自分たちの分を足して数えていた</strong>のです。</p>
+
+    <p><strong>3。</strong> <code>--mount-proc</code> を足しただけで、いきなり 3 になりました。名前空間のフラグは1文字も変えていません。<code>--mount-proc</code> がやることはただ一つ、<strong><code>/proc</code> を新しくマウントし直すこと</strong>だけです。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 「namespace が壊れている」と誤診する</div>
+      <p>この症状に出会ったとき、9割の人は名前空間のフラグを疑います。<code>CLONE_NEWPID</code> のスペルを確かめ、<code>Cloneflags</code> の <code>|</code> を数え直し、カーネルのバージョンを調べ始めます。<strong>そこには何の問題もありません。</strong></p>
+      <p><code>init.go</code> のコメントは、この誤診を先回りして書いてあります。</p>
+      <pre><code><span class="cm">// ⚠ /proc を貼り直さないと PID 名前空間が効いていないように見える。</span>
+<span class="cm">// 実際には効いているのに、/proc がホストのものを指したままなので</span>
+<span class="cm">// ps がホストの全プロセスを出す。「namespace が壊れている」と誤診する典型である。</span></code></pre>
+      <p>診断の決め手は <code>echo $$</code> です。<strong><code>$$</code> が <code>1</code> なのに <code>ps</code> がホストを出すなら、名前空間は効いていて <code>/proc</code> だけが古い</strong>——この組み合わせを覚えておけば、二度と半日を失いません。</p>
+    </div>
+
+    <h3>なぜ /proc なのか</h3>
+
+    <p>種明かしをします。<strong><code>ps</code> はプロセスの一覧をカーネルに問い合わせているわけではありません。</strong> <code>/proc</code> の下にあるディレクトリを読んでいるだけです。<code>/proc/1</code>、<code>/proc/42</code>、<code>/proc/1337</code>——数字の名前が付いたディレクトリを片っ端から開き、その中の <code>stat</code> や <code>cmdline</code> を読んで表を作っています。<code>ps</code> は、言ってしまえば <code>ls /proc</code> の親戚です。</p>
+
+    <p>そして <code>/proc</code> は procfs という特別なファイルシステムで、<strong>マウントされたその瞬間の PID 名前空間に結び付けられます</strong>。ホストで起動時にマウントされた <code>/proc</code> は、ホストの PID 名前空間を映す鏡です。コンテナがその鏡をそのまま覗いていれば、映るのはホストの世界です。</p>
+
+    <div class="ascii">/proc がどこを指しているか
+
+  【貼り直す前】
+   コンテナのプロセス
+        |
+        | ps が読む
+        v
+   /proc  ────────→  ホストの PID 名前空間      ← 起動時にホストがマウントした鏡
+                        (85 個のプロセス)
+
+   ※ PID 名前空間そのものは分かれている。$$ はちゃんと 1 になる。
+      分かれていないのは「鏡」の方。
+
+  【貼り直した後】
+   コンテナのプロセス
+        |
+        | ps が読む
+        v
+   /proc  ────────→  コンテナの PID 名前空間    ← 自分でマウントし直した鏡
+                        (1 個のプロセス)</div>
+
+    <p>だから正しい言い方はこうなります。<strong>PID 名前空間は効いていた。見えていたのは <code>/proc</code> の中身であって、名前空間の中身ではなかった。</strong> 私たちは名前空間を疑っていたのに、実際には「古い鏡を見続けていた」だけだったのです。</p>
+
+    <p>コードを見ます。<code>mountSpecialFilesystems</code> の冒頭です。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// mountSpecialFilesystems は /proc /sys /dev を新しい root に貼り直す。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ /proc を貼り直さないと PID 名前空間が効いていないように見える。</span>
+<span class="cm">// 実際には効いているのに、/proc がホストのものを指したままなので</span>
+<span class="cm">// ps がホストの全プロセスを出す。「namespace が壊れている」と誤診する典型である。</span>
+<span class="kw">func</span> mountSpecialFilesystems() <span class="kw">error</span> {
+	<span class="cm">// /proc は必須。ps が動くための最低条件。</span>
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(<span class="st">"/proc"</span>, <span class="st">0o555</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">"proc"</span>, <span class="st">"/proc"</span>, <span class="st">"proc"</span>, <span class="st">0</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"/proc をマウントできませんでした: %w"</span>, err)
+	}
+
+	<span class="cm">// …（この続きは Step 6 と Step 7 で）</span>
+}</code></pre>
+
+    <p><code>os.MkdirAll("/proc", 0o555)</code> でディレクトリを用意します。alpine のイメージには最初から空の <code>/proc</code> が入っているので普段は何もしませんが、無いイメージでも動くように作っておきます。<code>0o555</code>（読み取りと実行だけ、書き込み不可）なのは、ここに直接ファイルを置く用途が無いからです。</p>
+
+    <p>そして <code>syscall.Mount("proc", "/proc", "proc", 0, "")</code>。引数が3つとも <code>proc</code> に見えて紛らわしいので、分解しておきます。</p>
+
+    <table>
+      <tr><th>位置</th><th>値</th><th>意味</th></tr>
+      <tr><td>source</td><td><code>"proc"</code></td><td>デバイスに相当する名前。procfs は実体を持たないので慣習的な名札</td></tr>
+      <tr><td>target</td><td><code>"/proc"</code></td><td>マウント先。<strong>pivot_root 後なので、これはコンテナの中の <code>/proc</code></strong></td></tr>
+      <tr><td>fstype</td><td><code>"proc"</code></td><td>ファイルシステムの種類。これが本質</td></tr>
+      <tr><td>flags</td><td><code>0</code></td><td>特に指定なし</td></tr>
+      <tr><td>data</td><td><code>""</code></td><td>オプションなし</td></tr>
+    </table>
+
+    <p>この呼び出しが「<strong>今この瞬間の PID 名前空間を映す新しい鏡</strong>」を作り、コンテナの <code>/proc</code> に取り付けます。<code>ps</code> はもう、この鏡しか見ません。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · procfs は「ファイルに見せかけたカーネルの窓口」</div>
+      <p><code>/proc</code> の下にあるものはディスク上に存在しません。読もうとした瞬間にカーネルがその場で内容を作って返します。<code>/proc/self/status</code> を <code>cat</code> するたびに値が変わるのはそのためです。</p>
+      <p>この「その場で作る」性質があるから、<strong>マウントするときにどの名前空間に結び付けるかが決まる</strong>のです。ファイルの実体を移動しているのではなく、窓口をどこに向けるかを決めている。<code>/proc</code> を貼り直すという操作は、実体のコピーではなく<strong>宛先の変更</strong>だと考えると腑に落ちます。</p>
+      <p>ついでに言うと、<code>/proc/self/exe</code> を使って自分自身を起動する第01章の re-exec も、<code>/proc/&lt;pid&gt;/ns/pid</code> を開いて名前空間に参加する第07章の <code>exec</code> も、すべてこの窓口の上に成り立っています。<code>/proc</code> が無いコンテナは、道具箱を持たずに現場に来たようなものです。</p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>/proc</code> を貼り直した名前空間の中で <code>ps aux</code> を打つと、こうなります。ホストの 85 個はどこにもありません。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork --mount-proc ps aux
+<span class="out">USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.0   7900  3932 ?        R    22:14   0:00 ps aux</span></code></pre>
+      <p><code>ps aux</code> 自身が PID 1 として、たった1行だけ映っています。</p>
+    </div>
+
+    <h2 class="step" id="step-6"><span class="step-no">Step 6</span>古い root を捨てる — MNT_DETACH</h2>
+
+    <p>Step 4 の図を思い出してください。ホストの root はまだ <code>/.old_root</code> にぶら下がっています。このままでは、Step 1 の脱獄と同じ理屈で外へ出られます。というより、<code>cd /.old_root</code> と打つだけで出られます。捨てなければ意味がありません。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// dropOldRoot は古い root を切り離して捨てる。</span>
+<span class="cm">// ⚠ /proc を貼り直した後に呼ぶこと。順序を逆にすると /proc のマウントで古い root を掴む。</span>
+<span class="kw">func</span> dropOldRoot() <span class="kw">error</span> {
+	<span class="cm">// MNT_DETACH は遅延アンマウント。まだ参照が残っていても切り離せる。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Unmount</span>(oldRoot, syscall.<span class="ty">MNT_DETACH</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"古い root を切り離せませんでした: %w"</span>, err)
+	}
+	<span class="kw">if</span> err := os.<span class="ty">Remove</span>(oldRoot); err != <span class="kw">nil</span> &amp;&amp; !os.<span class="ty">IsNotExist</span>(err) {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"古い root の置き場を消せませんでした: %w"</span>, err)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>2段構えです。まず <code>syscall.Unmount</code> で<strong>マウント木から切り離し</strong>、次に <code>os.Remove</code> で<strong>空になったディレクトリを消し</strong>ます。切り離した後の <code>/.old_root</code> は、中身が空の普通のディレクトリに戻っています。だから <code>os.Remove</code>（空ディレクトリしか消せない安全な方）で足ります。<code>os.RemoveAll</code> ではありません。<strong>順序を間違えて <code>Remove</code> を先にしたら、マウント越しにホストのファイルを消しにいくことになります。</strong></p>
+
+    <p><code>!os.IsNotExist(err)</code> の条件は「既に無いなら、それは成功と同じ」という意味です。冪等（何度やっても同じ結果）にしておくと、後片付けの処理は書きやすくなります。</p>
+
+    <div class="ascii">古い root が切り離される様子
+
+  【pivot_root 直後】                  【dropOldRoot の後】
+  /                                    /
+  |- bin                               |- bin
+  |- etc                               |- etc
+  |- proc      ← Step 5 で貼った        |- proc
+  +- .old_root ← ホストの root が        (.old_root は消滅)
+     |- bin       まるごと見えている
+     |- etc                             ホストへ戻る道は
+     |- home                            マウント木から消えた
+     +- var</div>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · MNT_DETACH（遅延アンマウント）</div>
+      <p>普通の <code>umount</code> は、そのファイルシステムを誰かが使っていると <code>EBUSY</code>（デバイスが使用中）で失敗します。誰かが開いているファイル、誰かの作業ディレクトリ——1つでもあれば断られます。</p>
+      <p><code>MNT_DETACH</code> はこの制約を外します。<strong>マウント木からの切り離しだけを直ちに行い、実際の解放は最後の参照が消えるまで待つ</strong>という動きです。「遅延アンマウント」と呼ばれます。<code>umount -l</code> の <code>-l</code>（lazy）がこれです。</p>
+      <p>私たちの場面ではこれが理想的に働きます。切り離した瞬間から、<strong>新しく <code>/.old_root</code> を辿ってホストへ行くことはできなくなる</strong>。まだ古い参照を握っているプロセスがいたとしても、その参照は木から浮いた孤島を指しているだけで、そこから上へは登れません。<code>chroot</code> の穴が、ここで塞がります。</p>
+      <p>裏返しの注意もあります。<code>MNT_DETACH</code> は失敗しにくいぶん、<strong>「切れたつもり」で先に進みやすい</strong>。第07章で後片付けを書くときには、<code>umount</code> の結果を無視して <code>rm -rf</code> に進む実装が<strong>イメージの実体まで消す</strong>という事故につながります。そちらでは <code>MNT_DETACH</code> に頼らず、エラーを見て止まる作りにしています。</p>
+    </div>
+
+    <p>さて、この関数を<strong>どこから呼ぶか</strong>が本題です。<code>mountSpecialFilesystems</code> の中、<code>/proc</code> をマウントした<strong>直後</strong>です。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code>	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">"proc"</span>, <span class="st">"/proc"</span>, <span class="st">"proc"</span>, <span class="st">0</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"/proc をマウントできませんでした: %w"</span>, err)
+	}
+
+	<span class="cm">// ここまで来れば古い root はもう要らない。</span>
+	<span class="cm">// ⚠ /proc より先に捨てると、/proc のマウントが古い root を掴んで失敗することがある。</span>
+	<span class="kw">if</span> err := dropOldRoot(); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}</code></pre>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · /proc より先に古い root を捨てると失敗する</div>
+      <p>直感的には「危ないものは早く捨てたい」ので、<code>pivot_root</code> の直後に <code>dropOldRoot</code> を呼びたくなります。実際、私は最初そう書きました。そして <code>/proc</code> のマウントが失敗しました。</p>
+      <p>理由はこうです。<code>pivot_root</code> の直後、プロセスはまだ古い root に紐づいた状態をいくつも引きずっています。その状態で古い root を切り離してしまうと、続く <code>mount</code> の処理が足場を失って転びます。<strong><code>/proc</code> を先に貼って足場を作り、それから古い足場を蹴る。</strong> 順序はこれで固定です。</p>
+      <p>2つの「⚠」がコード中で向かい合っているのはそのためです。<code>dropOldRoot</code> のコメントは「<code>/proc</code> を貼り直した後に呼ぶこと」、呼び出し側のコメントは「<code>/proc</code> より先に捨てると失敗する」。同じ規則を、書く側と呼ぶ側の両方から釘を刺してあります。</p>
+    </div>
+
+    <h2 class="step" id="step-7"><span class="step-no">Step 7</span>/sys と /dev を用意する</h2>
+
+    <p>残りは2つです。どちらも <code>/proc</code> ほど死活的ではありませんが、無いと不便な場面が出ます。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code>	<span class="cm">// /sys は無くても ps は動く。失敗しても致命ではないので警告に留める。</span>
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(<span class="st">"/sys"</span>, <span class="st">0o555</span>); err == <span class="kw">nil</span> {
+		<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">"sysfs"</span>, <span class="st">"/sys"</span>, <span class="st">"sysfs"</span>,
+			syscall.<span class="ty">MS_NOSUID</span>|syscall.<span class="ty">MS_NOEXEC</span>|syscall.<span class="ty">MS_NODEV</span>|syscall.<span class="ty">MS_RDONLY</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+			fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"警告: /sys をマウントできませんでした: %v\n"</span>, err)
+		}
+	}
+
+	<span class="cm">// /dev は tmpfs を敷いて、必要な最小限のデバイスノードだけを自分で作る。</span>
+	<span class="cm">// ホストの /dev をそのまま見せるとコンテナからホストのディスクが触れてしまう。</span>
+	<span class="kw">if</span> err := mountDev(); err != <span class="kw">nil</span> {
+		fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"警告: /dev を用意できませんでした: %v\n"</span>, err)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p><code>/sys</code> のマウントには4つのフラグが並んでいます。読み方は素直です。<code>MS_NOSUID</code>（setuid ビットを無視する）、<code>MS_NOEXEC</code>（このファイルシステム上のバイナリを実行させない）、<code>MS_NODEV</code>（デバイスファイルとして扱わない）、<code>MS_RDONLY</code>（読み取り専用）。<strong>sysfs はカーネルの設定を書き換えられる窓口</strong>なので、コンテナからは読むだけにしておきます。</p>
+
+    <p>そして <code>/proc</code> と違うのは、<strong>失敗してもエラーを返さない</strong>点です。<code>fmt.Fprintf(os.Stderr, ...)</code> で警告を出すだけで先に進みます。<code>/proc</code> が無ければ <code>ps</code> すら動かないので致命的ですが、<code>/sys</code> が無くてもシェルは普通に使えます。<strong>どこを致命扱いにし、どこを警告で流すか</strong>は設計判断で、この判断はコメントに書き残してあります。</p>
+
+    <h3>/dev を自分で組み立てる</h3>
+
+    <p><code>/dev</code> は、この章で唯一「借りてこない」場所です。<strong>ホストの <code>/dev</code> を bind mount すれば1行で済むのに、そうしていません。</strong> なぜか。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · ホストの /dev を bind mount するとホストのディスクに手が届く</div>
+      <p><code>/dev</code> にあるのはファイルの形をしたデバイスへの入口です。<code>/dev/sda</code> や <code>/dev/nvme0n1</code> は<strong>ホストのディスクそのもの</strong>で、root 権限で開いて書き込めば、ファイルシステムを飛び越えて生のブロックを書き換えられます。パーティションテーブルを壊すことも、他のファイルを直接読み出すこともできます。</p>
+      <p>コンテナの中は（この実装では）root です。そこにホストの <code>/dev</code> をそのまま見せるということは、<strong>隔離のためにここまで積み上げてきたものを、最後の1行で全部無効にする</strong>ということです。<code>pivot_root</code> でホストのファイルツリーを消したのに、<code>/dev/sda</code> 経由でその中身に手が届いてしまう。</p>
+      <p>だから <code>/dev</code> だけは、借りずに<strong>自分で組み立てます</strong>。空の tmpfs を敷いて、そこに本当に必要なノードだけを <code>mknod</code> で作る。作らなかったものは存在しません。</p>
+    </div>
+
+    <div class="ascii">/dev の作り方の違い
+
+  【bind mount する案】                 【tmpfs + mknod の案（採用）】
+  /dev  ──→ ホストの /dev              /dev  = tmpfs (64k, mode=755)
+             |- null                            |- null      1:3
+             |- zero                            |- zero      1:5
+             |- sda      ★ホストのディスク       |- full      1:7
+             |- nvme0n1  ★ホストのディスク       |- random    1:8
+             |- kmsg                            |- urandom   1:9
+             +- ... (数百)                      |- tty       5:0
+                                                |- fd     -> /proc/self/fd
+                                                |- stdin  -> /proc/self/fd/0
+                                                |- stdout -> /proc/self/fd/1
+                                                +- stderr -> /proc/self/fd/2
+
+  1行で済むが穴が空く                    書く量は増えるが、無いものは触れない</div>
+
+    <p>実装を全文見ます。まず、作りたいノードを表すための小さな型があります。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// devNode は最小限のデバイスノード定義。</span>
+<span class="kw">type</span> devNode <span class="kw">struct</span> {
+	path  <span class="kw">string</span>
+	mode  <span class="kw">uint32</span>
+	major <span class="kw">uint32</span>
+	minor <span class="kw">uint32</span>
+}
+
+<span class="kw">func</span> mountDev() <span class="kw">error</span> {
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(<span class="st">"/dev"</span>, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">"tmpfs"</span>, <span class="st">"/dev"</span>, <span class="st">"tmpfs"</span>, syscall.<span class="ty">MS_NOSUID</span>, <span class="st">"mode=755,size=64k"</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	nodes := []devNode{
+		{<span class="st">"/dev/null"</span>, syscall.<span class="ty">S_IFCHR</span> | <span class="st">0o666</span>, <span class="st">1</span>, <span class="st">3</span>},
+		{<span class="st">"/dev/zero"</span>, syscall.<span class="ty">S_IFCHR</span> | <span class="st">0o666</span>, <span class="st">1</span>, <span class="st">5</span>},
+		{<span class="st">"/dev/full"</span>, syscall.<span class="ty">S_IFCHR</span> | <span class="st">0o666</span>, <span class="st">1</span>, <span class="st">7</span>},
+		{<span class="st">"/dev/random"</span>, syscall.<span class="ty">S_IFCHR</span> | <span class="st">0o666</span>, <span class="st">1</span>, <span class="st">8</span>},
+		{<span class="st">"/dev/urandom"</span>, syscall.<span class="ty">S_IFCHR</span> | <span class="st">0o666</span>, <span class="st">1</span>, <span class="st">9</span>},
+		{<span class="st">"/dev/tty"</span>, syscall.<span class="ty">S_IFCHR</span> | <span class="st">0o666</span>, <span class="st">5</span>, <span class="st">0</span>},
+	}
+	<span class="kw">for</span> _, n := <span class="kw">range</span> nodes {
+		<span class="kw">if</span> err := syscall.<span class="ty">Mknod</span>(n.path, n.mode, <span class="kw">int</span>(mkdev(n.major, n.minor))); err != <span class="kw">nil</span> {
+			fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"警告: %s を作れませんでした: %v\n"</span>, n.path, err)
+		}
+	}
+	<span class="cm">// 標準入出力へのシンボリックリンク。シェルが期待することがある。</span>
+	_ = os.<span class="ty">Symlink</span>(<span class="st">"/proc/self/fd"</span>, <span class="st">"/dev/fd"</span>)
+	_ = os.<span class="ty">Symlink</span>(<span class="st">"/proc/self/fd/0"</span>, <span class="st">"/dev/stdin"</span>)
+	_ = os.<span class="ty">Symlink</span>(<span class="st">"/proc/self/fd/1"</span>, <span class="st">"/dev/stdout"</span>)
+	_ = os.<span class="ty">Symlink</span>(<span class="st">"/proc/self/fd/2"</span>, <span class="st">"/dev/stderr"</span>)
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>順に読みます。</p>
+
+    <p><strong><code>tmpfs</code> を <code>size=64k</code> で敷く。</strong> デバイスノードは実体を持たない（番号の組を書いたエントリがあるだけ）ので、64 キロバイトもあれば十分すぎます。小さく取ることで、コンテナが <code>/dev</code> にファイルを書き込んでホストのメモリを食い潰す道も塞いでいます。<code>mode=755</code> は <code>/dev</code> 自体のパーミッション、<code>MS_NOSUID</code> はここでも setuid 封じです。</p>
+
+    <p><strong>6つのノードを作る。</strong> それぞれ「メジャー番号:マイナー番号」の組でカーネル内のドライバに結び付いています。<code>1:3</code> が <code>null</code>、<code>1:5</code> が <code>zero</code>、<code>1:8</code> が <code>random</code>——これらは Linux で固定された番号です。<code>syscall.S_IFCHR</code> は「キャラクタデバイスである」という印で、<code>0o666</code>（誰でも読み書き可）と OR して <code>mode</code> にします。<strong>ディスクのようなブロックデバイス（<code>S_IFBLK</code>）は1つも作っていません。</strong> これがこの設計の要点です。</p>
+
+    <p><strong>失敗しても警告だけ。</strong> <code>Mknod</code> がエラーでもループは止まりません。たとえば <code>/dev/tty</code> が作れなくても、多くのコマンドは動きます。全部か無かにしない、というのはここでも同じ方針です。</p>
+
+    <p><strong>4本のシンボリックリンク。</strong> <code>/dev/stdout</code> に書けば標準出力に流れる、という約束をシェルやツールが期待することがあります。実体は <code>/proc/self/fd/1</code> なので、リンクを張るだけで済みます。<strong>Step 5 で <code>/proc</code> を貼っていなければ、このリンクは全部壊れたリンクになります。</strong> 順序がここでも効いています。返り値を <code>_</code> で捨てているのは、失敗しても構わないという意思表示です。</p>
+
+    <p>最後に、デバイス番号を1つの数値にまとめる関数です。ビット演算だけの小さな関数ですが、載せておきます。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="kw">func</span> mkdev(major, minor <span class="kw">uint32</span>) <span class="kw">uint64</span> {
+	<span class="kw">return</span> <span class="kw">uint64</span>(minor&amp;<span class="st">0xff</span>) | (<span class="kw">uint64</span>(major&amp;<span class="st">0xfff</span>) &lt;&lt; <span class="st">8</span>) |
+		((<span class="kw">uint64</span>(minor) &amp;^ <span class="st">0xff</span>) &lt;&lt; <span class="st">12</span>) | ((<span class="kw">uint64</span>(major) &amp;^ <span class="st">0xfff</span>) &lt;&lt; <span class="st">32</span>)
+}</code></pre>
+
+    <p><code>mknod(2)</code> は major と minor を別々ではなく、1つの整数に詰めた形で受け取ります。詰め方が歴史的な事情でこの通り歪んでいて、下位 8 ビットに minor の下位、その上に major の下位 12 ビット、さらに上へ残りを追い出す、という配置になっています。<code>&amp;^</code> は Go 独特の演算子（AND NOT、ビットクリア）で、<code>uint64(minor) &amp;^ 0xff</code> は「minor の下位 8 ビットを落とした残り」を意味します。<strong>この関数は暗記するものではありません。</strong> C のマクロ <code>makedev()</code> と同じことをしている、と分かれば十分です。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · エラーを返すか、警告で流すか</div>
+      <p>この章のコードには2つの流儀が混在しています。<code>return fmt.Errorf(...)</code> で止めるものと、<code>fmt.Fprintf(os.Stderr, "警告: ...")</code> で先に進むものです。使い分けの基準は<strong>「それが無いとコンテナが目的を果たせないか」</strong>の一点です。</p>
+      <p>止めるのは <code>pivot_root</code> の5ブロックと <code>/proc</code>。これらが欠けたコンテナは、隔離されていないか、<code>ps</code> すら動かないので、動かす意味がありません。</p>
+      <p>流すのは <code>/sys</code> と <code>/dev</code>、それに個々のデバイスノード。無くても大半の用は足ります。ここで止めてしまうと、環境の些細な違いで起動しないコンテナランタイムになります。</p>
+      <p>大事なのは<strong>黙って流さない</strong>ことです。標準エラーに1行出しておけば、後で「なぜか <code>/dev/tty</code> が無い」と悩んだときに手がかりが残ります。<code>_ = os.Symlink(...)</code> のように完全に捨てているのは、失敗しても実害がほぼ無いと判断した箇所だけです。</p>
+    </div>
+
+    <p>ここまでで <code>mountSpecialFilesystems</code> は完成です。全文を通して読むと、Step 5・6・7 が1本の流れになっているのが分かります。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// mountSpecialFilesystems は /proc /sys /dev を新しい root に貼り直す。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ /proc を貼り直さないと PID 名前空間が効いていないように見える。</span>
+<span class="cm">// 実際には効いているのに、/proc がホストのものを指したままなので</span>
+<span class="cm">// ps がホストの全プロセスを出す。「namespace が壊れている」と誤診する典型である。</span>
+<span class="kw">func</span> mountSpecialFilesystems() <span class="kw">error</span> {
+	<span class="cm">// /proc は必須。ps が動くための最低条件。</span>
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(<span class="st">"/proc"</span>, <span class="st">0o555</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">"proc"</span>, <span class="st">"/proc"</span>, <span class="st">"proc"</span>, <span class="st">0</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"/proc をマウントできませんでした: %w"</span>, err)
+	}
+
+	<span class="cm">// ここまで来れば古い root はもう要らない。</span>
+	<span class="cm">// ⚠ /proc より先に捨てると、/proc のマウントが古い root を掴んで失敗することがある。</span>
+	<span class="kw">if</span> err := dropOldRoot(); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+
+	<span class="cm">// /sys は無くても ps は動く。失敗しても致命ではないので警告に留める。</span>
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(<span class="st">"/sys"</span>, <span class="st">0o555</span>); err == <span class="kw">nil</span> {
+		<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">"sysfs"</span>, <span class="st">"/sys"</span>, <span class="st">"sysfs"</span>,
+			syscall.<span class="ty">MS_NOSUID</span>|syscall.<span class="ty">MS_NOEXEC</span>|syscall.<span class="ty">MS_NODEV</span>|syscall.<span class="ty">MS_RDONLY</span>, <span class="st">""</span>); err != <span class="kw">nil</span> {
+			fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"警告: /sys をマウントできませんでした: %v\n"</span>, err)
+		}
+	}
+
+	<span class="cm">// /dev は tmpfs を敷いて、必要な最小限のデバイスノードだけを自分で作る。</span>
+	<span class="cm">// ホストの /dev をそのまま見せるとコンテナからホストのディスクが触れてしまう。</span>
+	<span class="kw">if</span> err := mountDev(); err != <span class="kw">nil</span> {
+		fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"警告: /dev を用意できませんでした: %v\n"</span>, err)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>そして呼び出し側。<code>Init</code> の中では、この2つが並んでいるだけです。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code>	<span class="kw">if</span> err := pivotRoot(args.<span class="ty">Rootfs</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">if</span> err := mountSpecialFilesystems(); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}</code></pre>
+
+    <p>7つのステップが、たった6行に畳まれています。<strong>読みやすさの正体は、順序をコメントと関数境界に埋め込んだこと</strong>です。この2行を入れ替えて動くコードにはなりません。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>すべてを通して動かします。<code>ps</code>、<code>hostname</code>、<code>ls /</code> の3つを一度に。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh -c 'ps; echo ---; hostname; echo ---; ls /'
+<span class="out">キャッシュ: mirror.gcr.io/library/alpine:latest（ネットワークにはアクセスしません）
+コンテナ a169666dadfc を起動しました (PID 23900)
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh -c ps; echo ---; hostname; echo ---; ls /
+    7 root      0:00 ps
+---
+mydocker
+---
+bin
+dev
+etc
+home
+lib
+media
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+tmp
+usr
+var</span></code></pre>
+      <p>3つとも変わりました。<strong>プロセスは自分たちの2つだけ</strong>（PID 1 が <code>/bin/sh</code>、7 が <code>ps</code>）。<strong>ホスト名は <code>mydocker</code></strong>。<strong><code>/</code> の中身は alpine の中身</strong>で、ホストにあった <code>boot</code> や <code>lost+found</code> はどこにもありません。</p>
+    </div>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>chroot ではだめなんですか? 実際に動いてはいますよね。</summary>
+      <div class="qa-body"><p>動きます。ただ、<strong>抜け出す方法が知られています</strong>。Step 1 で実際に破ってみせたとおり、<code>chroot</code> する前にディレクトリのファイルディスクリプタを掴んでおけば、<code>fchdir</code> でそこへ戻れてしまいます。<code>chroot</code> はパス名の起点を付け替えるだけで、既に握られている参照には触らないからです。</p>
+      <p>これは <code>chroot</code> のバグではありません。<code>chroot(2)</code> はもともとビルド環境を切り替えるための道具で、<strong>敵対的なプロセスを閉じ込める目的で設計されていない</strong>のです。man ページにも「セキュリティ機構として意図されていない」という趣旨のことが書かれています。</p>
+      <p><code>pivot_root</code> を選ぶ理由は2つあります。(1) 古い root を <code>put_old</code> に押し出して<strong>マウント木ごと切り離せる</strong>ので、戻る道自体が消える。(2) 古い root にぶら下がっていたマウントも一緒に片付くので、後始末が確実になる。第03章の実装がこの順序で書かれているのは、この2点のためです。</p></div>
+    </details>
+
+    <details class="qa"><summary>pivot_root したのに、なぜ /proc を貼り直さないと ps が壊れるんですか? root は入れ替わったのに。</summary>
+      <div class="qa-body"><p><code>pivot_root</code> が入れ替えるのは<strong>マウント木の根</strong>であって、既にマウントされているものの中身ではありません。ホストの <code>/proc</code> は、ホスト起動時に「ホストの PID 名前空間を映す鏡」としてマウントされたもので、<code>pivot_root</code> の後もその性質のままです。</p>
+      <p>ただし本実装では、<code>pivot_root</code> の直後にコンテナの <code>/proc</code> は<strong>空のディレクトリ</strong>です（イメージの中の <code>/proc</code> は空だから）。だから貼り直さないと <code>ps</code> は何も読めません。<code>unshare --pid --fork</code> で 87 と出たのは、<code>pivot_root</code> をしていないためにホストの <code>/proc</code> をそのまま見ていたケースです。</p>
+      <p>いずれにせよ結論は同じで、<strong>「PID 名前空間を作ったら、その中で <code>/proc</code> を新しくマウントする」がワンセット</strong>です。片方だけでは成立しません。</p></div>
+    </details>
+
+    <details class="qa"><summary>MS_PRIVATE と MS_REC の違いが分かりません。両方要るんですか?</summary>
+      <div class="qa-body"><p>役割が別なので両方要ります。</p>
+      <p><strong><code>MS_PRIVATE</code> は「何をするか」</strong>です。伝播の種類を <code>private</code>（どちらにも伝えない）にします。<code>shared</code> のままだと、コンテナ内のマウントがホストに漏れ、ホストのマウント一覧が起動のたびに増えます。</p>
+      <p><strong><code>MS_REC</code> は「どこまでやるか」</strong>です。指定したディレクトリの<strong>下にぶら下がっている全マウント</strong>にも同じ処理を及ぼします。<code>/</code> だけを <code>private</code> にしても、その下の <code>/proc</code>、<code>/sys</code>、<code>/run</code> などが <code>shared</code> のまま残ってしまい、そこから漏れます。この環境ではホストに 22 個のマウントがありました。1つ残らず切るために再帰が要ります。</p>
+      <p>覚え方としては「<strong>private が動詞、rec が範囲</strong>」です。<code>MS_BIND|MS_REC</code> の <code>MS_REC</code> も同じで、「bind するのは分かった、で、下も一緒に持っていくのか?」に答えています。</p></div>
+    </details>
+
+    <details class="qa"><summary>pivot_root が EINVAL で落ちます。何を疑えばいいですか?</summary>
+      <div class="qa-body"><p><code>EINVAL</code> は「引数が不正」としか言わないので、条件を上から潰します。頻度順に4つです。</p>
+      <p><strong>(1) 伝播を切っていない。</strong> Step 2 の <code>Mount("", "/", "", MS_PRIVATE|MS_REC, "")</code> が抜けていないか。親側の <code>Unshareflags: syscall.CLONE_NEWNS</code> も確認してください。<code>init.go</code> と <code>run.go</code> の両方に警告コメントがあるのは、ここが最頻出だからです。</p>
+      <p><strong>(2) <code>new_root</code> がマウントポイントでない。</strong> Step 3 の自分自身への bind mount が抜けていないか。イメージを展開しただけのディレクトリは、そのままでは条件を満たしません。</p>
+      <p><strong>(3) <code>put_old</code> が <code>new_root</code> の外にある。</strong> <code>/tmp/old</code> のような場所を渡していないか。本実装は <code>filepath.Join(rootfs, "/.old_root")</code> で必ず内側になるようにしています。</p>
+      <p><strong>(4) マウント名前空間の中にいない。</strong> <code>CLONE_NEWNS</code> を付け忘れていないか。名前空間の外で <code>pivot_root</code> を呼ぶのは、ホストの root を挿げ替えるということなので、当然拒まれます。</p></div>
+    </details>
+
+    <details class="qa"><summary>/dev はホストのを bind mount した方が早いのでは? わざわざ mknod する意味がありますか?</summary>
+      <div class="qa-body"><p>早いです。そして<strong>そこまでの隔離が全部無駄になります</strong>。</p>
+      <p>ホストの <code>/dev</code> には <code>/dev/sda</code> のようなブロックデバイスが並んでいます。これはホストのディスクへの生の入口で、root なら開いて書けます。ファイルシステムを介さないので、<code>pivot_root</code> でホストのファイルツリーを見えなくしたことは何の防御にもなりません。ディスクの中身を直接読み書きできてしまいます。</p>
+      <p>だから本実装は、<code>/dev</code> に <code>size=64k</code> の tmpfs を敷き、<code>null</code>・<code>zero</code>・<code>full</code>・<code>random</code>・<code>urandom</code>・<code>tty</code> の6つだけを <code>mknod</code> で作ります。<strong>すべてキャラクタデバイスで、ブロックデバイスは1つもありません。</strong> 作らなかったものはコンテナから見て存在しないので、触りようがありません。</p>
+      <p>「無いものは壊せない」という考え方は、この本を通して何度も出てきます。許可リストを短く保つのが、いちばん安上がりな防御です。</p></div>
+    </details>
+
+    <details class="qa"><summary>.old_root を消し忘れたらどうなりますか? 見えているだけなら害は無い気もしますが。</summary>
+      <div class="qa-body"><p>害しかありません。<code>/.old_root</code> はホストの root がそのままぶら下がっている場所なので、コンテナの中で <code>cd /.old_root</code> と打つだけで、ホストの <code>/etc</code> も <code>/root</code> も読めます。<strong>Step 1 で見た脱獄の、もっと簡単な版</strong>が成立します。</p>
+      <p>加えて、切り離していないと古い root のマウントが掴まれたままになり、コンテナ終了後の後片付け（第07章）で <code>umount</code> が <code>EBUSY</code> で失敗する原因にもなります。「見えている」だけでなく「掴んでいる」のが問題なのです。</p>
+      <p>本実装では <code>dropOldRoot</code> が <code>MNT_DETACH</code> で切り離し、空になったディレクトリを <code>os.Remove</code> で消します。消えていることは実測で確認できます — コンテナの中で <code>ls /.old_root</code> と打つと <code>No such file or directory</code> が返ります。</p></div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。すらすら言えなければ、対応するステップに戻ると効率がいいです。</p>
+
+    <details class="qa"><summary>Q1. rootfs を自分自身に bind mount するのはなぜ? これをしないと何が起きますか?</summary>
+      <div class="qa-body"><p><code>pivot_root(2)</code> には「<strong><code>new_root</code> はマウントポイントでなければならない</strong>」という規則があります。イメージを展開しただけの <code>rootfs</code> はただのディレクトリなので、この条件を満たしません。自分自身に bind mount すると、見え方は1バイトも変わらないままカーネルのマウント一覧に1行増え、<strong>「マウントポイントである」という資格だけが得られます</strong>。</p>
+      <p>これをしないと <code>pivot_root</code> は <code>EINVAL</code>（invalid argument）で落ちます。エラーメッセージは理由を教えてくれないので、原因に辿り着くのに時間がかかる部類の失敗です。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q2. 02章の時点で PID 名前空間は正しく作れていた。それなのに ps がホストのプロセスを表示したのはなぜですか?</summary>
+      <div class="qa-body"><p><strong><code>ps</code> はカーネルに問い合わせているのではなく、<code>/proc</code> の下の数字ディレクトリを読んでいるだけ</strong>だからです。そして <code>/proc</code>（procfs）は、<strong>マウントされた時点の PID 名前空間</strong>に結び付けられます。ホスト起動時にマウントされた <code>/proc</code> は、ホストの PID 名前空間を映す鏡のままです。</p>
+      <p>つまり、<strong>PID 名前空間は効いていた。見えていたのは <code>/proc</code> の中身であって、名前空間の中身ではなかった</strong>のです。実測でも、<code>unshare --pid --fork</code> の中で数えると 87 個（ホストの 85 個より多い!）、<code>--mount-proc</code> を足すと 3 個になりました。名前空間のフラグは1文字も変えていません。</p>
+      <p>診断の決め手は <code>echo $$</code> です。<code>$$</code> が <code>1</code> なら名前空間は効いています。そのうえで <code>ps</code> がホストを出すなら、犯人は <code>/proc</code> です。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q3. chroot から抜け出す手口を、3行で説明してください。</summary>
+      <div class="qa-body"><p>(1) <code>chroot</code> する<strong>前に</strong>ディレクトリを <code>open</code> して、外側を指すファイルディスクリプタを掴んでおく。</p>
+      <p>(2) <code>chroot</code> の後、<code>fchdir(fd)</code> でそこへ移る。<strong><code>fchdir</code> はパス名を辿らない</strong>ので、<code>/</code> がどこに付け替えられていようと関係ない。</p>
+      <p>(3) <code>..</code> を登り切って本物の <code>/</code> に着いたら、<code>chroot(".")</code> で牢を今いる場所に付け替える。以上で外に出られます。</p>
+      <p>本質は「<strong><code>chroot</code> はパス解決の起点を変えるだけで、既に持っている参照を無効化しない</strong>」ことです。<code>pivot_root</code> + <code>MNT_DETACH</code> は参照先そのものをマウント木から切り離すので、同じ手が通りません。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q4. dropOldRoot を /proc のマウントより先に呼ぶと何が起きますか?</summary>
+      <div class="qa-body"><p><code>/proc</code> のマウントが失敗することがあります。<code>pivot_root</code> の直後、プロセスはまだ古い root に紐づいた状態を引きずっており、その足場を先に蹴ってしまうと、続くマウント処理が転びます。<code>init.go</code> にも「<strong>⚠ /proc より先に捨てると、/proc のマウントが古い root を掴んで失敗することがある</strong>」と書いてあります。</p>
+      <p>正しい順序は「<strong>/proc を貼って新しい足場を作る → 古い足場を捨てる</strong>」です。<code>dropOldRoot</code> の関数コメントと呼び出し側のコメントの両方に同じ規則が書かれているのは、どちらから読んでも間違えないようにするためです。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q5. mount("", "/", "", MS_PRIVATE|MS_REC, "") を省くと、ホスト側に何が起きますか?</summary>
+      <div class="qa-body"><p>マウントの伝播が <code>shared</code> のまま残るので、<strong>コンテナの中で行ったマウントがホスト側にも現れます</strong>。コンテナを起動するたびにホストのマウント一覧が増えていき、この環境なら 22 個から静かに膨らんでいきます。すぐには壊れないので気付きにくいのが厄介です。</p>
+      <p>さらに、<code>pivot_root</code> には「<code>new_root</code> も現在の root も <code>shared</code> であってはならない」という条件があるため、<strong><code>pivot_root</code> 自体が <code>EINVAL</code> で落ちる</strong>こともあります。「<code>pivot_root</code> が EINVAL」→「まず伝播を疑う」という対応関係を覚えておくと早いです。</p>
+      <p>正しく切れていれば、テストの前後でホストのマウント数は変わりません（開始 22 → 終了 22）。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q6. /dev を tmpfs + mknod で作るのはなぜ? ホストの /dev を bind mount した場合と何が違いますか?</summary>
+      <div class="qa-body"><p>ホストの <code>/dev</code> を bind mount すると、<code>/dev/sda</code> のような<strong>ブロックデバイス</strong>がコンテナから見えます。これはホストのディスクへの生の入口で、root なら開いて書き込めます。ファイルシステムを経由しないので、<code>pivot_root</code> でホストのファイルツリーを隠したことが<strong>まったく防御になりません</strong>。</p>
+      <p>本実装は <code>size=64k</code> の tmpfs を敷き、<code>null</code>(1:3)・<code>zero</code>(1:5)・<code>full</code>(1:7)・<code>random</code>(1:8)・<code>urandom</code>(1:9)・<code>tty</code>(5:0) の6つだけを <code>mknod</code> で作ります。すべて <code>S_IFCHR</code>、つまりキャラクタデバイスで、<strong>ブロックデバイスは1つもありません</strong>。</p>
+      <p>加えて <code>/dev/fd</code>・<code>/dev/stdin</code>・<code>/dev/stdout</code>・<code>/dev/stderr</code> を <code>/proc/self/fd</code> 系へのシンボリックリンクとして張ります。これは Step 5 で <code>/proc</code> を貼った後でなければ意味を持ちません。</p></div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>コンテナの中で <code>ps</code> を打って、自分のプロセスだけが並べばこの章は完了です。</p>
+      <pre class="term"><code><span class="ps">/ #</span> ps
+<span class="out">PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    7 root      0:00 ps</span></code></pre>
+      <p>あわせて、<code>ls /.old_root</code> が <code>No such file or directory</code> を返すことも確かめてください。古い世界は、もうどこにも残っていません。自動テストでもこの2点を見ています。</p>
+      <pre class="term"><code><span class="ps">$</span> ./e2e_test.sh
+<span class="out">  OK   コンテナ内の ps にホストのプロセスが1つも出ない（行数ちょうど）
+       （ホスト側の実行中プロセスは 86 個。コンテナ内は 1 個）</span></code></pre>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>コンテナは、ようやく「別の世界」になりました。第02章までは、名前空間で<strong>見え方</strong>を区切っただけで、地面はホストと同じものを踏んでいました。この章で <code>pivot_root</code> を通し、古い root を <code>MNT_DETACH</code> で切り離したことで、コンテナの中からホストのファイルへ辿り着く道はマウント木から消えました。<code>chroot</code> を実際に破ってみたのは、この「切り離す」という一手が飾りではないと納得するためです。そして <code>/proc</code> を貼り直したことで、前章から持ち越した謎も解けました——PID 名前空間は最初から効いていて、私たちが古い鏡を覗いていただけでした。</p>
+
+    <p>しかし、この世界には<strong>底がありません</strong>。中で動くプロセスは、メモリを好きなだけ確保できます。CPU を独占できます。プロセスをいくらでも生やせます。ホストのファイルは見えないのに、ホストの<strong>資源</strong>は無制限に食えるのです。試しにコンテナの中でメモリを確保し続けるプログラムを走らせれば、ホストごと巻き添えにできます。隔離とは「見えないこと」だけではなく「<strong>他人の分を奪えないこと</strong>」でもあった、というのが次に突き当たる壁です。1つのコンテナが暴走してホスト全体を道連れにできるうちは、まだ道具として使えません。</p>
+
+    <p>次章では、この世界に上限を設けます。使う仕組みは <strong>cgroup</strong>（control group）です。名前がいかにも難しそうで、私も最初は身構えました。ところが正体は拍子抜けするほど素直で、<strong>ディレクトリを作り、ファイルに数字を書き、別のファイルにプロセス番号を書く</strong>——それだけです。新しいシステムコールは1つも出てきません。しかも「設定できた」ことと「実際に効いた」ことは別物なので、10MB の上限をかけたコンテナで 100MB を確保しにいって、本当に殺されるところまで確かめます。</p>
+
+    <div class="chap-foot">
+      <a class="pager" href="02-namespace.html"><span class="dir">← 前へ</span>第02章 · 見える世界を区切る</a>
+      <a class="pager next" href="04-cgroup.html"><span class="dir">次へ →</span>第04章 · 資源に上限をかける</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

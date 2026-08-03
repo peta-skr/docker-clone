@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第01章 自分をもう一度起動する — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第01章 / 全10章 · 層: REEXEC · 読了目安 3〜4時間</div>
+    <div class="eyebrow"><span>Reexec</span><span class="depth">— 自分自身を別の顔で呼ぶ</span></div>
+    <h1>自分をもう一度起動する</h1>
+    <p class="lede">コンテナの中で <code>ps</code> を打つと、いちばん上に <code>PID 1</code> が座っています。あの 1 番は、いったい誰が、いつ、どうやって作ったのでしょうか。この章はその「1 番」を自分の手で生み出す章です。素直に書いたコードが素直に失敗するところから始めます。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p><code>internal/container/run.go</code> の <code>Run</code> と <code>internal/container/init.go</code> の <code>Init</code> を読み切り、<strong>なぜ「自分自身をもう一度起動する」という一見おかしな手を使わなければならないのか</strong>を、自分の言葉で説明できるようになる。あわせて、親と子をつなぐ 1 本のパイプが何を守っているのかを理解する。仕上げに <code>mydocker run alpine /bin/sh</code> を打ち、コンテナの中の <code>ps</code> で <strong>自分が PID 1 として並んでいる</strong>ことを確認する。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#step-1">素朴案を試して、壊す</a></li>
+        <li><a href="#step-2"><code>/proc/self/exe</code> とは何か</a></li>
+        <li><a href="#step-3"><code>exec.Command</code> に <code>Cloneflags</code> を渡す</a></li>
+        <li><a href="#step-4">親子の同期パイプ — 合図が来るまで一歩も動かない</a></li>
+        <li><a href="#step-5"><code>Init</code> の全体像</a></li>
+      </ol>
+    </div>
+
+    <h2>その「1 番」は誰なのか</h2>
+
+    <p>序章で私たちは <code>mydocker run</code> を動かして、コンテナの中の <code>ps</code> がこう出るのを見ました。</p>
+
+<pre class="term"><code><span class="ps">/ #</span> ps
+<span class="out">PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    7 root      0:00 ps</span></code></pre>
+
+    <p>これを見て、私は最初「ふーん」で流してしまいました。よく考えると変です。ホストの側では、番号 1 は <code>init</code> や <code>systemd</code> という、マシンが起動したときにいちばん最初に作られる特別なプロセスのものです。それ以外のプロセスが 1 番を名乗ることはできません。番号は先着順に配られるからです。</p>
+
+    <p>ところがコンテナの中では <code>/bin/sh</code> が堂々と 1 番に座っている。つまり <strong>番号を配る台帳そのものが別になっている</strong>ということです。この「台帳」が PID 名前空間（PID namespace）です。名前空間ごとに 1 から番号を配り直すので、同じ 1 番が世界に複数あってもぶつかりません。</p>
+
+    <div class="ascii">番号の台帳が 2 冊ある
+
+  ホストの台帳                    コンテナの台帳
+  ─────────────────           ─────────────────
+   1  systemd                    1  /bin/sh   ← 同じプロセスを
+   …                             7  ps           2 通りの番号で呼べる
+   23900  mydocker init …
+   23901  /bin/sh   ←────────────┘</div>
+
+    <p>この図がこの章のすべてです。ホストから見れば PID 23900 番台のただのプロセス、コンテナの中から見れば PID 1。<strong>同じプロセスに 2 つの番号がついている</strong>。私たちがこれから書くコードは、この「2 冊目の台帳」を作り、そこに最初の 1 人を送り込む仕事をします。</p>
+
+    <p>そして、この章の主題はこう言い換えられます — <em>2 冊目の台帳の 1 番を、どうやって自分で作るか</em>。</p>
+
+    <h2>素朴案 — 「<code>unshare</code> して <code>exec</code> すればいい」</h2>
+
+    <p>ここで一度、自分の頭で考えてみてください。名前空間を作るシステムコールに <code>unshare(2)</code> というものがあります（名前のとおり「共有をやめる」という意味です）。コマンドラインにも同名の <code>unshare</code> コマンドがあります。だとすれば、やることはこうではないでしょうか。</p>
+
+    <ol>
+      <li>自分のプロセスの中で <code>unshare(CLONE_NEWPID)</code> を呼ぶ → 新しい PID 名前空間ができる</li>
+      <li>続けて <code>exec</code> で目的のコマンド（たとえば <code>/bin/sh</code>）に成り代わる</li>
+      <li>成り代わった <code>/bin/sh</code> は新しい名前空間の中にいるので、めでたく PID 1</li>
+    </ol>
+
+    <div class="ascii">素朴案（これは動かない）
+
+  mydocker run alpine /bin/sh
+     │
+     ├ unshare(CLONE_NEWPID)   ← 名前空間そのものは、たしかに作られる
+     │
+     └ exec /bin/sh            ← ところが自分は PID 1 にならない
+                                  （なぜかは Step 1 で実測する）</div>
+
+    <p>筋が通っているように見えます。私も最初はこれで書きました。そして動かず、半日溶かしました。<strong>この素朴案は原理的に成立しません。</strong>「実装が下手だったから」ではなく「カーネルがそういう作りだから」です。</p>
+
+    <p>まずはその破綻を、コードを書く前に、コマンド 2 つで自分の目で見ます。理屈を先に読むと「ふーん」で終わりますが、壊れる様子を見てからだと理屈が刺さります。</p>
+
+    <h2>この章で出てくる言葉</h2>
+
+    <p>先に用語を並べておきます。今は眺めるだけで構いません。各ステップで実物に出会うたびにここへ戻ってきてください。</p>
+
+    <table>
+      <tr><th>言葉</th><th>意味</th><th>この章での役どころ</th></tr>
+      <tr><td>名前空間<br>(namespace)</td><td>カーネルが管理する資源（プロセス番号・マウント・ホスト名など）の「台帳」を分ける仕組み</td><td>作るのが目的。中身は第02章</td></tr>
+      <tr><td><code>unshare(2)</code></td><td>今あるプロセスを、新しい名前空間へ移すシステムコール</td><td>Step 1 で「効かない」ことを確認する</td></tr>
+      <tr><td><code>clone(2)</code></td><td><strong>子プロセスを作りながら</strong>、同時に新しい名前空間も作るシステムコール</td><td>私たちが実際に使うもの</td></tr>
+      <tr><td>re-exec</td><td>自分自身の実行ファイルを、別のサブコマンドとしてもう一度起動する手口</td><td>この章の主題</td></tr>
+      <tr><td><code>/proc/self/exe</code></td><td>「今このコードを走らせている実行ファイル」を指すシンボリックリンク</td><td>Step 2 で扱う</td></tr>
+      <tr><td>fd（ファイルディスクリプタ）</td><td>プロセスが開いているファイルにつく番号。0/1/2 は標準入出力とエラー</td><td>Step 4 の同期パイプは fd 3</td></tr>
+      <tr><td>cgroup</td><td>資源（メモリ・CPU）に上限をかける仕組み</td><td>Step 4 で「間に合わない」問題の当事者。本体は第04章</td></tr>
+    </table>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>素朴案を試して、壊す</h2>
+
+    <p>Go を書く前に、シェルで確かめます。<code>unshare</code> コマンドは、指定した名前空間を新しく作ってからコマンドを実行してくれる道具です。<code>--pid</code> を付ければ PID 名前空間を作ってくれます。</p>
+
+    <p>実行するコマンドは <code>sh -c 'echo "自分の PID: $$"'</code> にします。シェルの <code>$$</code> は「このシェル自身の PID」です。素朴案が正しいなら、新しい PID 名前空間の中で最初に走るこのシェルは <strong>1</strong> と表示するはずです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>2 つ打ちます。違いは <code>--fork</code> が付いているかどうかだけです。まず 1 つ目だけを打って、出た番号を見てください。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 25171</span>
+<span class="ps">$</span> unshare --pid --fork sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 1</span></code></pre>
+      <p>（上の <code>25171</code> はこの環境で実際に出た番号です。あなたの手元では別の数字になりますが、<strong>1 ではない</strong>ことが肝心なところです。）</p>
+    </div>
+
+    <p>1 つ目。<code>--pid</code> を付けて PID 名前空間を作ったのに、シェルは <code>25171</code> と答えました。ホストの番号のままです。名前空間の作成に失敗したのでしょうか。いいえ、成功しています。名前空間はちゃんと作られています。<strong>作られた名前空間が、その中にいるはずの自分に効いていない</strong>のです。</p>
+
+    <p>2 つ目。<code>--fork</code> を足しただけで <code>1</code> になりました。<code>--fork</code> は「<code>unshare</code> したあと、コマンドを直接 <code>exec</code> するのではなく、いったん子プロセスを作ってからその子で実行する」というオプションです。子を 1 つ挟んだ。それだけで結果がひっくり返りました。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · PID 名前空間は「呼んだ本人」には効かない</div>
+      <p><strong>PID 名前空間は、<code>unshare</code> を呼んだプロセス自身には適用されません。適用されるのは、その後に作られた子プロセスからです。</strong>つまり「自分が PID 1 になる」ことは、どんなに上手にコードを書いても<strong>原理的にできません</strong>。</p>
+      <p>理由を聞くと納得できます。プロセスの PID は、そのプロセスが生まれた瞬間に決まり、以後は変わらないものとして扱われます。走っている最中に自分の番号が <code>25171</code> から <code>1</code> に化けたら、その番号を握って <code>kill</code> したり <code>wait</code> したりしている親や兄弟が全員混乱します。だからカーネルは番号を途中で振り直さない。新しい台帳が適用されるのは、<strong>その台帳ができた後に生まれた者</strong>からだけです。</p>
+      <p>ここを知らないと、「名前空間を作ったのに <code>ps</code> の見え方が変わらない、実装のどこかにバグがある」と延々コードを疑うことになります。バグではありません。仕様です。</p>
+    </div>
+
+    <p>もうひとつ、Go 特有の事情があります。素朴案の「自分のプロセスの中で <code>unshare</code> を呼ぶ」は、Go では PID 以外の名前空間についても素直にいきません。<strong>Go のランタイムはマルチスレッドだからです。</strong></p>
+
+    <p>Go は、あなたが goroutine を 1 つも作らなくても、ガベージコレクションやシステムコールの面倒を見るために裏で複数の OS スレッドを走らせています。ところが <code>unshare(CLONE_NEWNS)</code>（マウント名前空間）のような操作は、<strong>プロセス単位ではなくスレッド単位</strong>で効きます。「今このコードが動いているスレッド」だけが新しいマウント名前空間へ移り、残りのスレッドはホストに残る。しかも Go のスケジューラは goroutine をどのスレッドで走らせるかを自由に決めるので、「次の 1 行がどのスレッドで実行されるか」をこちらから保証できません。移った先のスレッドで続きが動く保証がないのです。</p>
+
+    <p>C で書くなら、<code>fork</code> の直後・スレッドを 1 本しか持たない状態で名前空間をいじる、という手が使えます。Go ではその「スレッドが 1 本だけの瞬間」がそもそも存在しません。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · clone(2) と名前空間</div>
+      <p>Linux で新しいプロセスを作るシステムコールは <code>clone(2)</code> です（<code>fork(2)</code> も内部的にはこれの薄い皮です）。<code>clone</code> の引数にはフラグを渡せて、<code>CLONE_NEWPID</code> や <code>CLONE_NEWNS</code> を指定すると、<strong>子プロセスを作るのと同時に、その子のための新しい名前空間も作る</strong>ことができます。</p>
+      <p>ここが <code>unshare</code> との決定的な違いです。</p>
+      <ul>
+        <li><code>unshare(flags)</code> … <strong>今いる自分</strong>を新しい名前空間へ移す。PID 名前空間だけは例外的に「自分ではなく、以後の子に効く」という振る舞いになる</li>
+        <li><code>clone(flags)</code> … <strong>これから生まれる子</strong>を、最初から新しい名前空間の中に置く。子は生まれながらにしてその中の住人</li>
+      </ul>
+      <p>私たちが欲しいのは後者です。「あとから移す」のではなく「最初からそこに生む」。<code>unshare --fork</code> が動いたのも、内部で子を作ったからでした。Go から <code>clone</code> のフラグを指定する方法は Step 3 で出てきます。</p>
+    </div>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · 名前空間は 6 種類ある</div>
+      <p>この章では PID 名前空間ばかり話題にしていますが、名前空間は 1 種類ではありません。プロセス番号（PID）、マウント（MNT）、ホスト名（UTS）、プロセス間通信（IPC）、ネットワーク（NET）、ユーザー（USER）と、区切る対象ごとに独立して存在します。<code>clone</code> のフラグとしては <code>CLONE_NEWPID</code>、<code>CLONE_NEWNS</code>、<code>CLONE_NEWUTS</code>、<code>CLONE_NEWIPC</code>、<code>CLONE_NEWNET</code>、<code>CLONE_NEWUSER</code> という名前で並んでいます。</p>
+      <p>この章では「どれをいくつ作るか」は深追いしません。<strong>作る仕組みそのもの</strong>を先に固めます。1 つずつ何が区切られるのかは第02章で扱います。</p>
+    </div>
+
+    <p>整理します。素朴案が壊れる理由は 2 つありました。</p>
+
+    <ol>
+      <li><strong>PID 名前空間は呼んだ本人に効かない。</strong>自分が PID 1 になることはできない</li>
+      <li><strong>Go はマルチスレッドなので、スレッド単位の <code>unshare</code> を素直に扱えない</strong></li>
+    </ol>
+
+    <p>どちらも「子プロセスを 1 つ挟む」ことで解けます。子を <code>clone</code> で作り、そのときに名前空間も一緒に作ってしまえばいい。<code>unshare --fork</code> がやっていたのはまさにこれでした。</p>
+
+    <p>では、その子として何を起動すればいいでしょうか。ここで気の利いた答えが要ります。<strong>「自分自身」を起動するのです。</strong></p>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span><code>/proc/self/exe</code> とは何か</h2>
+
+    <p>「自分自身をもう一度起動する」と言われても、最初はぎょっとします。無限に増えるのでは、と。増えません。<strong>別の顔（＝別のサブコマンド）で起動する</strong>からです。</p>
+
+    <p><code>mydocker run alpine /bin/sh</code> と打たれたとき、<code>mydocker</code> は自分自身を <code>mydocker init &lt;rootfs&gt; &lt;hostname&gt; &lt;workdir&gt; /bin/sh</code> という引数で起動します。同じ実行ファイルですが、渡す引数が違うので中で走る道筋がまったく違う。<code>run</code> の顔で走っているときは親の仕事を、<code>init</code> の顔で走っているときは子の仕事をします。1 つの実行ファイルが 2 つの役を演じるわけです。</p>
+
+    <div class="ascii">1 つの実行ファイル、2 つの顔
+
+  /usr/local/bin/mydocker
+        ├── 引数が run …   → 親の顔。名前空間を作って子を起動し、片付ける
+        └── 引数が init …  → 子の顔。名前空間の中の PID 1 として地面を整える</div>
+
+    <p>そのとき困るのが、「自分自身の実行ファイルはどこにあるのか」という素朴な問題です。<code>os.Args[0]</code> を使えばいいでしょうか。あれは危ういのです。<code>os.Args[0]</code> は<strong>起動時に渡された文字列</strong>にすぎません。<code>./mydocker</code> のような相対パスかもしれず、その後にカレントディレクトリが変わっていたら辿れません。<code>PATH</code> 越しに <code>mydocker</code> とだけ書かれているかもしれず、その場合は探し直しになります。呼び出し側が <code>argv[0]</code> に嘘を入れることさえできます。</p>
+
+    <p>Linux にはもっと確実な答えがあります。<code>/proc/self/exe</code> です。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · /proc/self/exe</div>
+      <p><code>/proc</code> は、ディスク上のファイルではなく<strong>カーネルが今この瞬間の状態を見せてくれる窓</strong>です（procfs という特殊なファイルシステムです）。<code>/proc/1234/</code> を覗けば PID 1234 のプロセスの情報が見えます。</p>
+      <p><code>/proc/self</code> は「それを読んでいるプロセス自身」を指す特別な名前です。PID を調べてから <code>/proc/&lt;自分の PID&gt;</code> を組み立てなくても、<code>/proc/self</code> と書くだけで自分の分を見られます。</p>
+      <p>そして <code>/proc/self/exe</code> は、<strong>そのプロセスが今実行している実行ファイル</strong>を指すシンボリックリンクです。<code>ls -l /proc/self/exe</code> と打つと、そのとき <code>/proc/self</code> を読んでいるのは <code>ls</code> 自身なので、リンクは <code>ls</code> の実体（<code>/usr/bin/ls</code> など）を指しているのが見えます。<strong>「自分自身のパスを、自分で調べなくても手に入れられる」</strong>のがこのリンクの値打ちです。</p>
+      <p>さらにありがたい性質があります。このリンクはカーネルが管理している<strong>実体そのものへの参照</strong>なので、実行ファイルが起動後にリネームされても、削除されても、<code>/proc/self/exe</code> を <code>exec</code> すれば同じ中身が起動します。名前ではなく実体を掴んでいるからです。</p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>手元で 1 度打ってみてください。<code>ls</code> のインストール場所は環境によって違うので、ここに出力は貼りません（この教材が貼る出力は実測したものだけ、という決まりです）。</p>
+      <pre class="term"><code><span class="ps">$</span> ls -l /proc/self/exe</code></pre>
+      <p>表示される矢印の先が <code>ls</code> コマンドの実体になっていれば、読み方は合っています。<strong>「自分自身を指す」の「自分」とは、そのリンクを読んだプロセスのこと</strong>です。<code>ls</code> が読めば <code>ls</code> を指し、<code>mydocker</code> が読めば <code>mydocker</code> を指す。だから <code>mydocker</code> のコードの中に <code>/proc/self/exe</code> と書いておけば、それは常に <code>mydocker</code> 自身のことになります。</p>
+    </div>
+
+    <p>以上をまとめると、私たちが取る手はこうなります。</p>
+
+    <div class="ascii">re-exec パターン
+
+  ホストの名前空間                      新しい名前空間
+  ─────────────────────────         ───────────────────────
+  mydocker run alpine /bin/sh
+    │
+    │ exec.Command("/proc/self/exe",
+    │              "init", …)
+    │ + Cloneflags で名前空間を要求
+    ↓
+    ├─── clone(2) ────────────────→   mydocker init …        ← PID 1
+    │                                    │
+    │                                    │ ここから先が第03章の仕事
+    │                                    ↓
+    └─── cmd.Wait() で終了を待つ ←──   syscall.Exec("/bin/sh") ← PID 1 のまま</div>
+
+    <p>肝は矢印の 1 本目です。<strong>名前空間は「子を作る操作」と同時に生まれ、子は生まれながらにして PID 1 になる。</strong>あとから移るのではないから、Step 1 の壁に当たりません。<code>unshare --fork</code> の <code>--fork</code> に相当するのが、この「<code>/proc/self/exe</code> を起動する」という一手です。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · init は利用者が直接叩くものではない</div>
+      <p>この設計には代償があります。<strong><code>init</code> という、利用者が絶対に叩かない入口が CLI に増えてしまう</strong>ことです。放っておくと <code>mydocker --help</code> に <code>init</code> が並び、読んだ人が「初期化コマンドかな」と打ってしまいます。</p>
+      <p>そこで <code>mydocker</code> では 2 つ手を打っています。1 つ、<code>--help</code> の一覧に <code>init</code> を<strong>載せない</strong>。<code>internal/cli/cli.go</code> の <code>usage</code> 文字列に <code>init</code> の行はありません（ディスパッチの <code>case "init":</code> にだけコメントで「内部用」と書いてあります）。2 つ、<code>src/README.md</code> のコマンド表に「<strong>利用者が直接叩くものではない。</strong>親プロセスが <code>/proc/self/exe</code> を使って自分自身を再実行するための入口（re-exec パターン）」と明記する。</p>
+      <p>それでも手で叩かれたときのために、<code>init</code> は引数が足りなければ「<code>init</code> は mydocker が内部で使うサブコマンドです。直接実行しないでください」と言って止まります。引数が揃っていても、次の Step 4 で見る同期用の fd が無いので、そこで安全に止まります。<strong>隠すだけでなく、踏まれたときに壊れないようにしておく</strong>のが後始末です。</p>
+    </div>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span><code>exec.Command</code> に <code>Cloneflags</code> を渡す</h2>
+
+    <p>ここからコードです。Go で外部コマンドを起動するときは <code>exec.Command</code> を使います。普段は <code>exec.Command("ls", "-l")</code> のように書いて <code>Run()</code> や <code>Start()</code> を呼ぶだけですが、私たちはこの起動に「<strong>ついでに新しい名前空間も作ってくれ</strong>」という注文を付けたい。それを担うのが <code>SysProcAttr</code> です。</p>
+
+    <p>まず <code>Run</code> の中で、実際に子を起動している部分だけを抜き出して見ます。前後は少し後で全文を読みます。</p>
+
+    <div class="file-tag">internal/container/run.go — Run の一部</div>
+<pre><code>	<span class="cm">// --- 4. 自分自身を "init" という別の顔で起動する ---</span>
+	args := <span class="kw">append</span>([]<span class="kw">string</span>{<span class="st">"init"</span>, mnt.Merged, cfg.Hostname, orSlash(cfg.Workdir)}, cfg.Argv...)
+	cmd := exec.<span class="ty">Command</span>(<span class="st">"/proc/self/exe"</span>, args...)
+	cmd.SysProcAttr = &amp;syscall.<span class="ty">SysProcAttr</span>{
+		Cloneflags: syscall.<span class="ty">CLONE_NEWUTS</span> | <span class="cm">// ホスト名</span>
+			syscall.<span class="ty">CLONE_NEWPID</span> | <span class="cm">// プロセス番号</span>
+			syscall.<span class="ty">CLONE_NEWNS</span> | <span class="cm">// マウント</span>
+			syscall.<span class="ty">CLONE_NEWIPC</span>, <span class="cm">// プロセス間通信</span>
+		<span class="cm">// ⚠ これを忘れると、コンテナ内で行ったマウントがホスト側にも伝播する。</span>
+		<span class="cm">//    pivot_root が EINVAL で落ちる原因にもなる。「なぜか動かない」の筆頭。</span>
+		Unshareflags: syscall.<span class="ty">CLONE_NEWNS</span>,
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = cfg.Env
+	cmd.ExtraFiles = []*os.<span class="ty">File</span>{syncR} <span class="cm">// 子から見て fd 3</span></code></pre>
+
+    <p>1 行ずつ読みます。</p>
+
+    <p><strong><code>args := append([]string{"init", …}, cfg.Argv...)</code></strong> — 子に渡す引数を組み立てています。先頭が <code>init</code>、続いて根にするディレクトリ（<code>mnt.Merged</code>。overlay で作った合成ディレクトリで、第06章の話です）、ホスト名、作業ディレクトリ、最後に利用者が打ったコマンド（<code>cfg.Argv</code>）。つまり <code>mydocker run alpine /bin/sh</code> は、内部的に <code>mydocker init /var/lib/mydocker/containers/…/merged mydocker / /bin/sh</code> という起動に化けます。</p>
+
+    <p><strong><code>exec.Command("/proc/self/exe", args...)</code></strong> — Step 2 のリンクがここで効いてきます。<code>mydocker</code> の実行ファイルがどこに置かれていようと、この 1 行で自分自身を指せます。</p>
+
+    <p><strong><code>cmd.SysProcAttr = &amp;syscall.SysProcAttr{…}</code></strong> — ここが本丸です。<code>SysProcAttr</code> は「OS 固有の、プロセス起動時の細かい注文」を書く場所です。Linux 版の <code>SysProcAttr</code> には <code>Cloneflags</code> という欄があり、そこに書いたフラグが、子を作るときの <code>clone(2)</code> にそのまま渡されます。</p>
+
+    <p><strong><code>Cloneflags:</code></strong> の 4 つは、<code>|</code>（ビット OR）で並べた名前空間の注文書です。ホスト名（UTS）、プロセス番号（PID）、マウント（NS）、プロセス間通信（IPC）。この 4 つを新しく作った状態で子を生んでくれ、という意味になります。<strong>この 1 か所がコンテナの「隔離」の実体</strong>で、たった 4 行です。何が起きるのかは第02章で 1 つずつ確かめます。</p>
+
+    <p>（気づいたかもしれません。ネットワーク <code>CLONE_NEWNET</code> がありません。これは意図的な未実装です。理由と、実装するなら何が要るのかは第08章でまるごと扱います。）</p>
+
+    <p><strong><code>cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr</code></strong> — 子の標準入出力を、そのまま自分（＝端末）につなぎます。これがないと、コンテナの中の <code>sh</code> に文字が届かず、出力も見えません。名前空間を作っても、この 3 本のパイプは親から素直に引き継がれます。</p>
+
+    <p><strong><code>cmd.ExtraFiles = []*os.File{syncR}</code></strong> — Step 4 の主役です。今は「余分に 1 本ファイルを渡している」とだけ見ておいてください。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · exec.Command と SysProcAttr</div>
+      <p><code>exec.Command(name, args...)</code> は <code>*exec.Cmd</code> という「これから起動するプロセスの設計図」を返します。この時点ではまだ何も起動していません。設計図のフィールドを埋めてから <code>Start()</code>（起動して戻る）か <code>Run()</code>（起動して終了まで待つ）を呼ぶと、はじめてプロセスが生まれます。</p>
+      <p>設計図の中でも <code>SysProcAttr *syscall.SysProcAttr</code> は特別で、<strong>OS ごとに中身が違います</strong>。Linux 版には <code>Cloneflags</code>、<code>Unshareflags</code>、<code>Credential</code>、<code>Pdeathsig</code> などが並び、macOS や Windows にはこれらがありません。だから <code>Cloneflags</code> を書いたコードは Linux でしかビルドが通りません。この教材が第00章で Linux 環境を用意することにこだわったのは、まさにこの一行のためです。</p>
+      <p>面白いのは、Go の標準ライブラリが <code>clone(2)</code> のフラグをそのまま素通しで渡してくれる点です。名前空間のために特別な API があるわけではありません。<strong>Go は「カーネルにこう頼め」と言う口を開けてくれているだけで、コンテナのことは何も知りません。</strong>知っているのは私たちの側です。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · Unshareflags を忘れると、ホストのマウントが増えていく</div>
+      <p>コードの <code>Unshareflags: syscall.CLONE_NEWNS</code> は、<code>Cloneflags</code> に <code>CLONE_NEWNS</code> があるのだから重複しているように見えます。<strong>消してはいけません。</strong>この 1 行を落とすと、コンテナの中でやったマウントが<strong>ホスト側にも伝播します</strong>。</p>
+      <p>マウントには「伝播（propagation）」という性質があります。多くのディストリビューションでは <code>/</code> 以下が <strong>shared</strong> という状態で、ここに繋がったマウント名前空間は、片方で行ったマウント／アンマウントがもう片方にも自動で伝わります。せっかく新しいマウント名前空間を作っても、その中身が「ホストと共有」の設定を引き継いだままだと、コンテナが <code>/proc</code> を貼ったり <code>rootfs</code> を bind mount したりするたびに、ホストのマウント表が増えていきます。コンテナを 10 回起動したらホストに残骸が 10 個。<code>mount</code> の出力がどんどん汚れ、最後には「なぜかディスクが外せない」状態になります。</p>
+      <p><code>Unshareflags: syscall.CLONE_NEWNS</code> を書くと、Go は子プロセスの中で <code>unshare(CLONE_NEWNS)</code> を追加で呼び、<strong>マウント名前空間をホストから切り離した状態</strong>にしてくれます。つまり <code>Cloneflags</code> が「新しい部屋を作れ」、<code>Unshareflags</code> が「作った部屋の壁に穴が残っていないか確かめろ」に当たります。</p>
+      <p>被害はもう 1 つあります。この設定が抜けていると、第03章で使う <code>pivot_root</code> が <code>EINVAL</code>（引数が不正）で落ちます。<code>pivot_root</code> は新しい root が shared なマウントの上にあることを許さないからです。エラーメッセージは「invalid argument」としか言ってくれないので、原因に辿り着くのは至難です。<strong>この教材で「なぜか動かない」の筆頭がこれです。</strong>だから先に警告しておきます。</p>
+      <p>ちゃんと効いていることは、あとで機械的に確かめられます。E2E テストの終わりにはこの項目が入っています — <code>OK   テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）</code>。開始も終了も 22 のまま。漏れていません。</p>
+    </div>
+
+    <p>ここまでで、名前空間を持った子を起動する部分は書けました。実際に <code>mydocker run</code> を打つと、この子の中で <code>ps</code> が自分だけを見ます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>序章で打ったデモをもう一度、今度は「どの行が誰の仕事か」を意識しながら見てください。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh -c 'ps; echo ---; hostname; echo ---; ls /'
+<span class="out">キャッシュ: mirror.gcr.io/library/alpine:latest（ネットワークにはアクセスしません）
+コンテナ a169666dadfc を起動しました (PID 23900)
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh -c ps; echo ---; hostname; echo ---; ls /
+    7 root      0:00 ps
+---
+mydocker
+---
+bin
+dev
+etc
+home
+lib
+media
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+tmp
+usr
+var</span></code></pre>
+      <p>2 行目の <code>コンテナ a169666dadfc を起動しました (PID 23900)</code> は<strong>親</strong>が出したメッセージで、この <code>23900</code> は<strong>ホストから見た子の PID</strong> です。すぐ下の <code>PID 1</code> は<strong>子自身から見た</strong>自分の番号。この章の冒頭で描いた「台帳が 2 冊」の図が、そのまま出力に現れています。同じプロセスが 23900 でもあり 1 でもある。</p>
+      <p>ちなみに 3 行目以降のコマンド一覧を出しているのは <code>ps</code> ですが、この <code>ps</code> が正しく動くには <code>/proc</code> をコンテナ用に貼り直しておく必要があります。それは第03章の仕事です。</p>
+    </div>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>親子の同期パイプ — 合図が来るまで一歩も動かない</h2>
+
+    <p>ここは、コードを見ただけでは絶対に必要性がわからない部分です。逆に言えば、<strong>ここを理解すると「並行するプロセスを扱う」という仕事の勘所が掴めます</strong>。</p>
+
+    <p>問題はこうです。親には、子を起動したあとにやることが残っています。</p>
+
+    <ol>
+      <li>子の PID を cgroup（資源の上限をかける仕組み）に登録する</li>
+      <li>コンテナの記録（<code>state.json</code>）を保存する</li>
+    </ol>
+
+    <p>1 番が厄介です。cgroup は「このディレクトリに PID を書き込むと、そのプロセスに上限がかかる」という仕組みで、<strong>PID がわからないと登録できません</strong>。PID がわかるのは子を起動した<strong>後</strong>です。順番が決まってしまっています。</p>
+
+    <p>ところが <code>cmd.Start()</code> は、子を起動したらすぐに戻ってきます。待ってはくれません。つまり親が cgroup のファイルに書き込んでいる数ミリ秒のあいだ、<strong>子はもう走り出しています</strong>。</p>
+
+    <div class="ascii">同期が無いとどうなるか（時間は左から右へ）
+
+  親  ─ Start() ─┬─ cgroup に PID を書く ─ state.json を保存 ─ Wait() …
+                 │        ↑ここが数ミリ秒
+                 │
+  子             └─ exec /bin/sh ─ メモリを確保しはじめる …
+                                   ↑上限がまだ効いていない！</div>
+
+    <p>数ミリ秒くらい、と思うでしょうか。私も思いました。ところが第00章で測ったように、コンテナの起動そのものが <strong>12〜15 ms</strong> です。同じ桁の話をしています。実際、この同期を入れる前は「メモリ上限 10MB を指定したのに 100MB 確保できてしまう」テストが、<strong>通ったり落ちたりしました</strong>。走らせるたびに結果が変わる。いちばん嫌な種類のバグです。原因が自分のコードなのか環境なのかも判断できません。</p>
+
+    <p>解き方はいくつか考えられます。実装ログに残した検討はこうでした。</p>
+
+    <table>
+      <tr><th>案</th><th>内容</th><th>結果</th></tr>
+      <tr><td>A</td><td>子を起動してすぐ cgroup に入れる（同期なし）</td><td>⚠ 競合する。上限テストが気まぐれに通ったり落ちたりする</td></tr>
+      <tr><td>B</td><td>親を先に cgroup に入れ、子に継承させる</td><td>親（<code>mydocker</code> 本体）まで上限に縛られる。cgroup v2 の「内部プロセス禁止」規則とも噛み合わない</td></tr>
+      <tr><td>C</td><td>パイプで同期する</td><td><strong>採用</strong></td></tr>
+    </table>
+
+    <p>B は一見うまそうですが、致命的です。<code>--memory 10m</code> を指定したら <code>mydocker</code> 自身が 10MB に縛られる。イメージの展開すらできなくなります。</p>
+
+    <p>そこで C。<strong>子に「待て」を教える</strong>のです。子は起動した直後、決められた合図が届くまで一歩も動かない。親は準備を全部終えてから合図を送る。合図の届け方として、Unix にはうってつけの道具があります。パイプです。</p>
+
+    <div class="ascii">同期パイプの流れ
+
+  親                                        子（init）
+  ──────────────────────────            ─────────────────────────
+  syncR, syncW := os.Pipe()
+  cmd.ExtraFiles = []*os.File{syncR}
+  cmd.Start()  ────── clone ─────→        起動（PID 1）
+  syncR.Close()（親側では使わない）         waitForParent()
+                                             fd 3 を読む → まだ空
+  cg.Apply(pid)   ← cgroup に登録            ‥‥ 止まって待つ ‥‥
+  st.Save()       ← 記録を保存               ‥‥ 止まって待つ ‥‥
+  syncW.WriteString("OK")
+  syncW.Close()   ───── 合図 ───→          "OK" を読み切って前進
+                                             pivot_root → mount → exec
+  cmd.Wait() ←──── 終了を待つ ─────        /bin/sh として走る</div>
+
+    <p>パイプというのは、片方に書いた内容がもう片方から読める 1 方向の管です。シェルの <code>|</code> と同じものです。ここでは通信の中身よりも、<strong>「読もうとすると、誰かが書くまでブロックする」</strong>という性質を使います。子はパイプを読もうとして止まる。親が書くまで、子は絶対に前へ進めない。これで順序が保証されます。</p>
+
+    <p>子側のコードを見ましょう。<code>init.go</code> の先頭に置かれた 2 つの定数と、待つ関数の全文です。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// syncFD は親から「準備ができた」合図を受け取るためのファイルディスクリプタ。</span>
+<span class="cm">//</span>
+<span class="cm">// なぜ必要か: 親は子を起動してから cgroup に PID を入れる。その間に子が走り出すと、</span>
+<span class="cm">// **上限が効く前にメモリを確保してしまう**。それでは「上限を超えたら死ぬ」テストが</span>
+<span class="cm">// 気まぐれに通ったり落ちたりする。そこで子はここで一度止まり、親の合図を待つ。</span>
+<span class="kw">const</span> syncFD = <span class="st">3</span>
+
+<span class="cm">// syncReady は親が送る合図。これ以外が来たら（＝親が失敗したら）子は何もせず終わる。</span>
+<span class="kw">const</span> syncReady = <span class="st">"OK"</span></code></pre>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// waitForParent は fd 3 から親の合図を読む。</span>
+<span class="cm">// 親が合図を送らずに閉じた（＝準備に失敗した）場合はエラーにする。</span>
+<span class="kw">func</span> waitForParent() <span class="kw">error</span> {
+	f := os.<span class="ty">NewFile</span>(<span class="kw">uintptr</span>(syncFD), <span class="st">"sync"</span>)
+	<span class="kw">if</span> f == <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"親との同期用ディスクリプタがありません（init は直接実行できません）"</span>)
+	}
+	<span class="kw">defer</span> f.<span class="ty">Close</span>()
+	b, err := io.<span class="ty">ReadAll</span>(f)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"親からの合図を読めませんでした: %w"</span>, err)
+	}
+	<span class="kw">if</span> strings.<span class="ty">TrimSpace</span>(<span class="kw">string</span>(b)) != syncReady {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"親の準備が失敗したため中止します"</span>)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>短いですが、詰まっているものが多い関数です。順に見ます。</p>
+
+    <p><strong><code>os.NewFile(uintptr(syncFD), "sync")</code></strong> — <code>syncFD</code> は <code>3</code> です。番号 3 のファイルディスクリプタを、Go の <code>*os.File</code> として扱えるようにしています。<strong>ここで新しくファイルを開いているのではありません。</strong>親から引き継いだ、すでに開いている管に名前を付けているだけです。</p>
+
+    <p>なぜ 3 なのか。プロセスが持つ fd には昔からの約束があり、<strong>0 が標準入力、1 が標準出力、2 が標準エラー</strong>です。<code>exec.Cmd</code> の <code>ExtraFiles</code> に渡したファイルは、この 3 本の次から順に子へ引き継がれます。1 本だけ渡したので 3 番。2 本渡せば 3 番と 4 番になります。<strong>親の <code>ExtraFiles</code> の並び順と、子の <code>syncFD = 3</code> という定数は、コードのどこにも書かれていない暗黙の約束で結ばれています。</strong>片方だけ直すと静かに壊れる箇所なので、両方に理由をコメントで残してあります。</p>
+
+    <p><strong><code>io.ReadAll(f)</code></strong> — ここが「待つ」の正体です。<code>ReadAll</code> は<strong>相手が書き終えて管を閉じるまで</strong>読み続けます。親がまだ何も書いていなければ、この行で止まります。goroutine も <code>time.Sleep</code> もポーリングも要りません。カーネルがプロセスを眠らせ、書き込みが来たら起こしてくれます。<strong>Unix の道具立てで待つと、待つコードは 1 行になります。</strong></p>
+
+    <p><strong><code>strings.TrimSpace(string(b)) != syncReady</code></strong> — 読み取った中身が <code>"OK"</code> かどうかを確かめます。ここが二重の意味を持っています。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · パイプは「閉じた」ことも伝えられる</div>
+      <p>パイプの読み側は、書き側が<strong>すべて閉じられた</strong>時点で「もう来ない（EOF）」を返します。ここが単なる通信路との違いです。</p>
+      <p>つまり親には 2 通りの意思表示ができます。</p>
+      <ul>
+        <li><code>"OK"</code> を書いてから閉じる → 子は <code>"OK"</code> を読む → <strong>準備できた。進め</strong></li>
+        <li>何も書かずに閉じる → 子は空っぽを読む → <strong>親が失敗した。何もせず終われ</strong></li>
+      </ul>
+      <p>異常を伝えるために別の連絡路を用意する必要がありません。<strong>「黙って閉じる」がそのままエラー通知になっています。</strong>親のコードでは、失敗の分岐で <code>syncW.Close()</code> の隣にはっきり <code>// 合図を送らずに閉じる → 子は何もせず終了する</code> と書いてあります。</p>
+      <p>おまけの効能もあります。<code>mydocker init …</code> を人間が手で叩いた場合、fd 3 は開いていないか、まったく別のものです。合図が <code>"OK"</code> にならないので、子は <strong>pivot_root に手をつける前に</strong>止まります。危険な操作の手前に関所がある、という形になっています。</p>
+    </div>
+
+    <p>親側の対応する部分も見ておきます。<code>Run</code> の中の、パイプを作るところと合図を送るところです。</p>
+
+    <div class="file-tag">internal/container/run.go — Run の一部</div>
+<pre><code>	<span class="cm">// --- 3. 子と同期するためのパイプ ---</span>
+	<span class="cm">// 親が cgroup に PID を入れ終えるまで、子は走り出してはいけない。</span>
+	syncR, syncW, err := os.<span class="ty">Pipe</span>()
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, err
+	}
+
+	<span class="cm">// …（Cloneflags の設定は Step 3 で読んだ）</span>
+
+	<span class="kw">if</span> err := cmd.<span class="ty">Start</span>(); err != <span class="kw">nil</span> {
+		syncR.<span class="ty">Close</span>()
+		syncW.<span class="ty">Close</span>()
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"コンテナの起動に失敗しました: %w"</span>, err)
+	}
+	syncR.<span class="ty">Close</span>() <span class="cm">// 親側では使わない</span>
+
+	pid := cmd.Process.Pid
+	st.PID = pid
+	st.StartTime = <span class="ty">ReadStartTime</span>(pid)
+
+	<span class="cm">// --- 5. cgroup に入れてから、子に合図を送る ---</span>
+	startErr := <span class="kw">func</span>() <span class="kw">error</span> {
+		<span class="kw">if</span> cg != <span class="kw">nil</span> {
+			<span class="kw">if</span> err := cg.<span class="ty">Apply</span>(pid); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> err
+			}
+		}
+		<span class="kw">return</span> st.<span class="ty">Save</span>()
+	}()
+	<span class="kw">if</span> startErr != <span class="kw">nil</span> {
+		syncW.<span class="ty">Close</span>() <span class="cm">// 合図を送らずに閉じる → 子は何もせず終了する</span>
+		_ = cmd.<span class="ty">Wait</span>()
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, startErr
+	}
+	<span class="kw">if</span> _, err := syncW.<span class="ty">WriteString</span>(syncReady); err != <span class="kw">nil</span> {
+		syncW.<span class="ty">Close</span>()
+		_ = cmd.<span class="ty">Wait</span>()
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, err
+	}
+	syncW.<span class="ty">Close</span>()</code></pre>
+
+    <p><code>os.Pipe()</code> は読み側 <code>syncR</code> と書き側 <code>syncW</code> の 2 本を返します。読み側を <code>ExtraFiles</code> で子に渡し、書き側は親が握る。子を起動したら、<strong>親は自分の手元の読み側をすぐ閉じます</strong>（<code>syncR.Close()</code>）。これは行儀の問題ではありません。読み側が親の手元にも残っていると、パイプの参加者が増えたままになり、閉じたことが正しく伝わらなくなります。<strong>使わない口は閉じる。</strong>パイプを扱うときの鉄則です。</p>
+
+    <p>そのあとの流れは、まさに「順序を守るために書かれたコード」です。<code>cg.Apply(pid)</code> で cgroup に登録し、<code>st.Save()</code> で記録を保存し、それが全部成功してはじめて <code>syncW.WriteString(syncReady)</code> で <code>"OK"</code> を送ります。途中で失敗したら、<strong>合図を送らずに閉じて</strong>、子の終了を待ち（<code>cmd.Wait()</code>）、後片付けをして戻ります。「上限を指定したのに黙って無視して走らせる」という、いちばん最悪の結果を避けるための造りです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>この同期が効いていることは、メモリ上限の対照実験で確かめられます。同じコマンド（100MB のブロックを 1 つ読む <code>dd</code>）を、上限なしと 10MB 上限とで走らせます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="out">1+0 records in
+1+0 records out
+104857600 bytes (100.0MB) copied, 0.047161 seconds, 2.1GB/s</span>
+<span class="ps">$</span> echo $?
+<span class="out">0</span>
+<span class="ps">$</span> mydocker run --quiet --memory 10m alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="ps">$</span> echo $?
+<span class="out">137</span></code></pre>
+      <p>上は成功（終了コード 0）、下は何も出さずに <code>137</code>。<code>137</code> は <code>128 + 9</code>、つまり <strong>SIGKILL で殺された</strong>という意味です。カーネルが上限超過を見つけて殺しました。</p>
+      <p>大事なのは、この結果が<strong>毎回同じになる</strong>ことです。同期パイプが無かった頃、この下の実験はときどき成功してしまいました。上限が効く前に <code>dd</code> が走り抜けてしまうからです。E2E テストにも「<code>OK   メモリ上限 10m を超える確保が実際に失敗する（設定値の確認では済ませない）</code>」「<code>OK   上限超過が OOM による強制終了として報告される (exit 137)</code>」という項目があり、<strong>設定ファイルに数字が書かれたことではなく、実際に殺されることを確かめています</strong>。同期パイプはこの確実さを支えている土台です。</p>
+    </div>
+
+    <div class="gonote"><div class="box-k">GO メモ · 即時実行される無名関数で「まとめて失敗を捕まえる」</div>
+      <p>親のコードに <code>startErr := func() error { … }()</code> という書き方が出てきました。関数を定義してすぐ <code>()</code> で呼んでいます。見慣れないと戸惑いますが、狙いははっきりしています。</p>
+      <p>cgroup への登録と記録の保存という<strong>2 つの処理をひとまとめにし、どちらが失敗しても同じ 1 つの後始末（合図を送らずに閉じる）へ合流させたい</strong>のです。素直に書くと同じ 4 行の後始末が 2 か所に並び、片方だけ直して壊すことになります。<code>defer</code> で書く手もありますが、ここは「失敗したら子に合図を送らない」という 1 点に集約したいので、この形が読みやすいと判断しました。</p>
+    </div>
+
+    <h2>親の全体像 — <code>Run</code> の全文</h2>
+
+    <p>部分ばかり見てきたので、ここで <code>Run</code> を頭から終わりまで通して読みます。<strong>長いですが、番号付きのコメント（1〜7）が地図になっています。</strong>今の時点で全部わからなくて構いません。<code>overlay</code>（1 の部分）は第06章、<code>cgroup</code>（2 の部分）は第04章、後片付け（7 の部分）は第07章で扱います。<strong>この章で追いかけるのは 3・4・5 です。</strong></p>
+
+    <div class="file-tag">internal/container/run.go</div>
+<pre><code><span class="cm">// Run はコンテナを1つ起動し、終了まで待って終了コードを返す。</span>
+<span class="cm">//</span>
+<span class="cm">// ★この教材でいちばん説明の要る箇所が、次の re-exec パターンである。</span>
+<span class="cm">//</span>
+<span class="cm">// 素朴に考えると「unshare して、そのあと目的のコマンドを exec すればいい」と思える。ところが:</span>
+<span class="cm">//</span>
+<span class="cm">//   - PID 名前空間は unshare を呼んだプロセス自身には適用されない。</span>
+<span class="cm">//     適用されるのは **その後に作られた子プロセス** から。「自分が PID 1 になる」ことはできない</span>
+<span class="cm">//   - Go のランタイムはマルチスレッドなので、プロセス内でスレッド単位の unshare を素直に扱えない</span>
+<span class="cm">//</span>
+<span class="cm">// そこで /proc/self/exe（＝自分自身の実行ファイル）を "init" という別の顔で起動する。</span>
+<span class="cm">// 新しい名前空間はこの起動と同時に生まれ、子は生まれながらにして PID 1 になる。</span>
+<span class="kw">func</span> <span class="ty">Run</span>(cfg <span class="ty">Config</span>) (<span class="kw">int</span>, <span class="kw">error</span>) {
+	id := <span class="ty">NewID</span>()
+	base := stateDir(id)
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(base, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">1</span>, err
+	}
+
+	<span class="cm">// --- 1. 根になるファイルシステムを用意する（レイヤの重ね合わせ）---</span>
+	mnt, err := overlay.<span class="ty">New</span>(base, cfg.Lowers)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		_ = os.<span class="ty">RemoveAll</span>(base)
+		<span class="kw">return</span> <span class="st">1</span>, err
+	}
+
+	st := &amp;<span class="ty">State</span>{
+		ID:        id,
+		Image:     cfg.Image,
+		Command:   cfg.Argv,
+		Hostname:  cfg.Hostname,
+		Workdir:   cfg.Workdir,
+		CreatedAt: time.<span class="ty">Now</span>(),
+		Merged:    mnt.Merged,
+	}
+
+	<span class="cm">// 後片付けは1か所にまとめる。途中でどこで失敗しても必ずここを通す。</span>
+	cleanup := <span class="kw">func</span>(cg *cgroup.<span class="ty">Cgroup</span>) <span class="kw">error</span> {
+		<span class="kw">var</span> firstErr <span class="kw">error</span>
+		<span class="kw">if</span> cg != <span class="kw">nil</span> {
+			<span class="kw">if</span> err := cg.<span class="ty">Destroy</span>(); err != <span class="kw">nil</span> {
+				firstErr = err
+			}
+		}
+		<span class="cm">// ⚠ アンマウントの成否を確かめずに削除へ進んではいけない。</span>
+		<span class="cm">//    失敗したまま RemoveAll すると、マウント越しに lowerdir（＝イメージの実体）まで消える。</span>
+		<span class="kw">if</span> err := mnt.<span class="ty">Unmount</span>(); err != <span class="kw">nil</span> {
+			<span class="kw">if</span> firstErr == <span class="kw">nil</span> {
+				firstErr = err
+			}
+			<span class="cm">// ★削除には進まない。状態ファイルも残して、人間が調べられるようにする。</span>
+			<span class="kw">return</span> firstErr
+		}
+		<span class="kw">if</span> err := <span class="ty">RemoveRecord</span>(st); err != <span class="kw">nil</span> &amp;&amp; firstErr == <span class="kw">nil</span> {
+			firstErr = err
+		}
+		<span class="kw">return</span> firstErr
+	}
+
+	<span class="cm">// --- 2. 資源の上限を用意する（プロセスはまだ入れない）---</span>
+	<span class="kw">var</span> cg *cgroup.<span class="ty">Cgroup</span>
+	<span class="kw">if</span> !cfg.Limits.<span class="ty">IsZero</span>() {
+		cg, err = cgroup.<span class="ty">New</span>(id, cfg.Limits)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="cm">// ⚠ 上限を指定したのに黙って無視して走らせるのが最悪の結果。必ず止める。</span>
+			_ = cleanup(<span class="kw">nil</span>)
+			<span class="kw">return</span> <span class="st">1</span>, err
+		}
+		st.CgroupDirs = cg.<span class="ty">Dirs</span>()
+		st.CgroupVersion = cg.<span class="ty">Version</span>()
+	}
+
+	<span class="cm">// --- 3. 子と同期するためのパイプ ---</span>
+	<span class="cm">// 親が cgroup に PID を入れ終えるまで、子は走り出してはいけない。</span>
+	syncR, syncW, err := os.<span class="ty">Pipe</span>()
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, err
+	}
+
+	<span class="cm">// --- 4. 自分自身を "init" という別の顔で起動する ---</span>
+	args := <span class="kw">append</span>([]<span class="kw">string</span>{<span class="st">"init"</span>, mnt.Merged, cfg.Hostname, orSlash(cfg.Workdir)}, cfg.Argv...)
+	cmd := exec.<span class="ty">Command</span>(<span class="st">"/proc/self/exe"</span>, args...)
+	cmd.SysProcAttr = &amp;syscall.<span class="ty">SysProcAttr</span>{
+		Cloneflags: syscall.<span class="ty">CLONE_NEWUTS</span> | <span class="cm">// ホスト名</span>
+			syscall.<span class="ty">CLONE_NEWPID</span> | <span class="cm">// プロセス番号</span>
+			syscall.<span class="ty">CLONE_NEWNS</span> | <span class="cm">// マウント</span>
+			syscall.<span class="ty">CLONE_NEWIPC</span>, <span class="cm">// プロセス間通信</span>
+		<span class="cm">// ⚠ これを忘れると、コンテナ内で行ったマウントがホスト側にも伝播する。</span>
+		<span class="cm">//    pivot_root が EINVAL で落ちる原因にもなる。「なぜか動かない」の筆頭。</span>
+		Unshareflags: syscall.<span class="ty">CLONE_NEWNS</span>,
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = cfg.Env
+	cmd.ExtraFiles = []*os.<span class="ty">File</span>{syncR} <span class="cm">// 子から見て fd 3</span>
+
+	<span class="kw">if</span> err := cmd.<span class="ty">Start</span>(); err != <span class="kw">nil</span> {
+		syncR.<span class="ty">Close</span>()
+		syncW.<span class="ty">Close</span>()
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"コンテナの起動に失敗しました: %w"</span>, err)
+	}
+	syncR.<span class="ty">Close</span>() <span class="cm">// 親側では使わない</span>
+
+	pid := cmd.Process.Pid
+	st.PID = pid
+	st.StartTime = <span class="ty">ReadStartTime</span>(pid)
+
+	<span class="cm">// --- 5. cgroup に入れてから、子に合図を送る ---</span>
+	startErr := <span class="kw">func</span>() <span class="kw">error</span> {
+		<span class="kw">if</span> cg != <span class="kw">nil</span> {
+			<span class="kw">if</span> err := cg.<span class="ty">Apply</span>(pid); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> err
+			}
+		}
+		<span class="kw">return</span> st.<span class="ty">Save</span>()
+	}()
+	<span class="kw">if</span> startErr != <span class="kw">nil</span> {
+		syncW.<span class="ty">Close</span>() <span class="cm">// 合図を送らずに閉じる → 子は何もせず終了する</span>
+		_ = cmd.<span class="ty">Wait</span>()
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, startErr
+	}
+	<span class="kw">if</span> _, err := syncW.<span class="ty">WriteString</span>(syncReady); err != <span class="kw">nil</span> {
+		syncW.<span class="ty">Close</span>()
+		_ = cmd.<span class="ty">Wait</span>()
+		_ = cleanup(cg)
+		<span class="kw">return</span> <span class="st">1</span>, err
+	}
+	syncW.<span class="ty">Close</span>()
+
+	<span class="kw">if</span> !cfg.Quiet {
+		fmt.<span class="ty">Fprintf</span>(os.Stderr, <span class="st">"コンテナ %s を起動しました (PID %d)\n"</span>, id, pid)
+	}
+
+	<span class="cm">// --- 6. 終了を待つ ---</span>
+	<span class="cm">// Ctrl-C は端末から子にも届く。親がここで死ぬと後片付けが走らないので、</span>
+	<span class="cm">// 親は明示的にシグナルを受け流し、子の終了を待ってから片付ける。</span>
+	sig := <span class="kw">make</span>(<span class="kw">chan</span> os.<span class="ty">Signal</span>, <span class="st">4</span>)
+	signal.<span class="ty">Notify</span>(sig, syscall.<span class="ty">SIGINT</span>, syscall.<span class="ty">SIGTERM</span>, syscall.<span class="ty">SIGHUP</span>)
+	<span class="kw">defer</span> signal.<span class="ty">Stop</span>(sig)
+	<span class="kw">go</span> <span class="kw">func</span>() {
+		<span class="kw">for</span> <span class="kw">range</span> sig {
+		}
+	}()
+
+	waitErr := cmd.<span class="ty">Wait</span>()
+	code := exitCode(waitErr)
+
+	<span class="cm">// --- 7. 後片付け（★ここを落とすと静かに壊れる）---</span>
+	<span class="kw">if</span> err := cleanup(cg); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> code, err
+	}
+	<span class="kw">return</span> code, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>いま読めるようになった箇所を確かめてください。<strong>3</strong> でパイプを作り、<strong>4</strong> で <code>/proc/self/exe</code> を <code>init</code> の顔で・名前空間付きで起動し、<strong>5</strong> で cgroup に入れてから <code>"OK"</code> を送る。この章の内容がそのまま並んでいます。</p>
+
+    <p>ついでに <strong>6</strong> にも触れておきます。<code>Ctrl-C</code> を押すと、端末はそのグループのプロセス全員にシグナルを送ります。親も子も一緒に殺されます。そこで親は <code>signal.Notify</code> でシグナルを受け取り、<code>go func(){ for range sig {} }()</code> という「受け取って何もしない」goroutine に流し込んでいます。<strong>親は勝手に死なない。</strong>子が終わるのを <code>cmd.Wait()</code> で見届けて、後片付け（7）まで責任を持つ。ここを省くと、コンテナを <code>Ctrl-C</code> で止めるたびに overlay のマウントがホストに残ります。第07章で扱う「残骸」の話につながる部分です。</p>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span><code>Init</code> の全体像</h2>
+
+    <p>ここまでずっと親の話でした。最後に、生まれたばかりの子（＝コンテナの PID 1）が何をするのかを見ます。<strong>この章では 5 つの手順のうち 1 と 5 だけを深く読み、2〜4 は「次章以降で開く箱」として置いておきます。</strong>一度に全部やると必ず溺れます。</p>
+
+    <p>まず、子が受け取る引数の定義です。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// InitArgs は init サブコマンドが受け取る引数。</span>
+<span class="cm">//</span>
+<span class="cm">//	mydocker init &lt;rootfs&gt; &lt;hostname&gt; &lt;workdir&gt; &lt;cmd&gt; [args...]</span>
+<span class="cm">//</span>
+<span class="cm">// ★この init は利用者が直接叩くものではない。</span>
+<span class="cm">// 親プロセスが /proc/self/exe を使って自分自身を「別の顔」で起動するためだけに存在する</span>
+<span class="cm">// （re-exec パターン）。</span>
+<span class="kw">type</span> <span class="ty">InitArgs</span> <span class="kw">struct</span> {
+	<span class="ty">Rootfs</span>   <span class="kw">string</span>
+	<span class="ty">Hostname</span> <span class="kw">string</span>
+	<span class="ty">Workdir</span>  <span class="kw">string</span>
+	<span class="ty">Argv</span>     []<span class="kw">string</span>
+	<span class="ty">Env</span>      []<span class="kw">string</span>
+}</code></pre>
+
+    <p>Step 3 で親が組み立てていた引数列と、きれいに対応しています。位置引数で渡しているので順番が命です（だから <code>Run</code> の中に <code>orSlash</code> という小さな関数があり、空の作業ディレクトリを <code>"/"</code> に読み替えています。空文字のままだと引数の数がずれるからです）。</p>
+
+    <p>そして本体です。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// Init は新しい名前空間の中（＝コンテナの PID 1）で走る処理である。</span>
+<span class="cm">//</span>
+<span class="cm">// ここに来た時点で、親が Cloneflags で作った namespace の中にいる。</span>
+<span class="cm">// あとは「地面を入れ替えて、目的のコマンドに成り代わる」だけ。</span>
+<span class="cm">//</span>
+<span class="cm">//  1. 親の合図を待つ（cgroup に入れてもらうまで動かない）</span>
+<span class="cm">//  2. ホスト名を変える（UTS 名前空間の効果を目に見える形にする）</span>
+<span class="cm">//  3. pivot_root で root を挿げ替える</span>
+<span class="cm">//  4. /proc /sys /dev を貼り直す</span>
+<span class="cm">//  5. syscall.Exec で目的のコマンドに成り代わる（★戻ってこない）</span>
+<span class="kw">func</span> <span class="ty">Init</span>(args <span class="ty">InitArgs</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> err := waitForParent(); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+
+	<span class="kw">if</span> args.Hostname != <span class="st">""</span> {
+		<span class="kw">if</span> err := syscall.<span class="ty">Sethostname</span>([]<span class="kw">byte</span>(args.Hostname)); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"ホスト名を設定できませんでした: %w"</span>, err)
+		}
+	}
+
+	<span class="kw">if</span> err := pivotRoot(args.Rootfs); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">if</span> err := mountSpecialFilesystems(); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+
+	<span class="cm">// 実行するコマンドを新しい root の中から探す。</span>
+	<span class="cm">// ⚠ ここは pivot_root の **後** でなければならない。前に探すとホスト側の</span>
+	<span class="cm">//    /bin/sh を掴んでしまい、「コンテナの中なのにホストのバイナリが動く」ことになる。</span>
+	env := args.Env
+	<span class="kw">if</span> <span class="kw">len</span>(env) == <span class="st">0</span> {
+		env = []<span class="kw">string</span>{<span class="st">"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"</span>, <span class="st">"HOME=/root"</span>, <span class="st">"TERM=xterm"</span>}
+	}
+	<span class="kw">if</span> err := os.<span class="ty">Setenv</span>(<span class="st">"PATH"</span>, envValue(env, <span class="st">"PATH"</span>)); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+
+	<span class="cm">// イメージが WorkingDir を指定していればそこへ移る。</span>
+	<span class="cm">// 無ければ / のまま。存在しないディレクトリを指していても起動は止めない。</span>
+	<span class="kw">if</span> args.Workdir != <span class="st">""</span> &amp;&amp; args.Workdir != <span class="st">"/"</span> {
+		<span class="kw">if</span> err := syscall.<span class="ty">Chdir</span>(args.Workdir); err != <span class="kw">nil</span> {
+			fmt.<span class="ty">Fprintf</span>(os.Stderr, <span class="st">"警告: 作業ディレクトリ %s へ移れませんでした: %v\n"</span>, args.Workdir, err)
+		}
+	}
+	path, err := exec.<span class="ty">LookPath</span>(args.Argv[<span class="st">0</span>])
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"コマンドが見つかりません: %s"</span>, args.Argv[<span class="st">0</span>])
+	}
+
+	<span class="cm">// ★syscall.Exec はプロセスを置き換える。成功すればこの行から先は実行されない。</span>
+	<span class="cm">//   fork ではないので、コンテナの PID 1 はこのまま目的のコマンドそのものになる。</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Exec</span>(path, args.Argv, env); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"%s の実行に失敗しました: %w"</span>, path, err)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span> <span class="cm">// 到達しない</span>
+}</code></pre>
+
+    <p>この関数の形を、まず遠くから眺めてください。<strong>やることが上から下へ一直線に並んでいます。</strong>分岐らしい分岐がありません。「合図を待つ → ホスト名 → 根を替える → 特殊なファイルシステム → 目的のコマンドに成り代わる」。コンテナを起動するというのは、結局これだけのことなのです。</p>
+
+    <p><strong>1. <code>waitForParent()</code></strong> — Step 4 で読んだ関所です。<code>Init</code> のいちばん最初にあることが重要です。ホスト名を変えるより前、root を挿げ替えるより前。<strong>まだ何も壊していない段階で止まれる</strong>ようにしてあります。</p>
+
+    <p><strong>2. <code>syscall.Sethostname</code></strong> — ホスト名を変えます。ふつう、走っているプログラムがホスト名を書き換えたらマシン全体のホスト名が変わってしまい、大惨事です。ところが私たちは <code>CLONE_NEWUTS</code> で UTS 名前空間を新しく作っているので、<strong>この変更はこの名前空間の中だけに閉じます</strong>。序章のデモで <code>hostname</code> が <code>mydocker</code> と答えたのに、あなたのホストの名前は変わっていない — その仕掛けがこの 1 行です。名前空間が効いていることを目で見られる、いちばん手軽な証拠でもあります。第02章で詳しく扱います。</p>
+
+    <p><strong>3. <code>pivotRoot(args.Rootfs)</code></strong> と <strong>4. <code>mountSpecialFilesystems()</code></strong> — <em>この章では中身を開きません。</em>「地面を入れ替える」「<code>/proc</code> などを貼り直す」という 2 つの仕事があることだけ覚えてください。ここは順序を 1 つ間違えるだけで失敗する、この教材でいちばん神経を使う場所で、まるごと第03章に取ってあります。</p>
+
+    <p><strong>5. <code>syscall.Exec(path, args.Argv, env)</code></strong> — 締めくくりです。ここが、この章の最初に置いた問い「PID 1 は誰か」への最終的な答えになります。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · syscall.Exec はプロセスを置き換える</div>
+      <p><code>exec.Command(...).Run()</code> は<strong>新しいプロセスを作って</strong>実行します。対して <code>syscall.Exec</code> は違います。<strong>今走っているプロセスの中身を、指定した実行ファイルで丸ごと上書きします。</strong>新しいプロセスは生まれません。PID も変わりません。</p>
+      <p>器はそのまま、中身だけが入れ替わる。だからコードにはこう書いてあります — <code>成功すればこの行から先は実行されない</code>。最後の <code>return nil</code> には <code>// 到達しない</code> というコメントが付いています（Go の型検査を通すために書いてあるだけの行です）。</p>
+      <p>これが決定的に効きます。<code>fork</code> して子で <code>/bin/sh</code> を動かしたなら、PID 1 は <code>mydocker init</code> のままで、<code>/bin/sh</code> は PID 2 あたりの子になっていたはずです。<code>ps</code> にも <code>mydocker init</code> が居座って見えたでしょう。<code>syscall.Exec</code> で置き換えるので、<strong>コンテナの PID 1 はそのまま <code>/bin/sh</code> そのものになります</strong>。</p>
+      <p>実際、序章のデモの <code>ps</code> にはこう出ていました — <code>1 root 0:00 /bin/sh -c ps; echo ---; …</code>。1 番の名前が <code>mydocker</code> ではなく利用者が打ったコマンドそのもの。<code>mydocker init</code> という顔は、役目を終えて消えたのです。</p>
+    </div>
+
+    <p>もう一度、この章で組み上げた流れを 1 枚にまとめます。</p>
+
+    <div class="ascii">起動から PID 1 まで（この章の全体）
+
+  [親] mydocker run alpine /bin/sh
+    │
+    ├ os.Pipe()                       … 合図の管を用意
+    ├ exec.Command("/proc/self/exe", "init", …)
+    │   SysProcAttr.Cloneflags = NEWUTS|NEWPID|NEWNS|NEWIPC
+    │   SysProcAttr.Unshareflags = NEWNS
+    │   ExtraFiles = [読み側]         … 子から見て fd 3
+    ├ cmd.Start() ─── clone(2) ───→ [子] mydocker init …   ← 生まれた瞬間に PID 1
+    │                                     │
+    ├ cg.Apply(pid)                       ├ waitForParent()  ← fd 3 で止まる
+    ├ st.Save()                           │
+    ├ "OK" を書いて閉じる ────────────→   ├ 読み切って前進
+    │                                     ├ Sethostname("mydocker")
+    │                                     ├ pivotRoot(rootfs)        ← 第03章
+    │                                     ├ mountSpecialFilesystems() ← 第03章
+    │                                     ↓
+    └ cmd.Wait() ←── 終了を待つ ───   syscall.Exec("/bin/sh")  ← 中身が入れ替わる
+                                          （PID 1 のまま /bin/sh になる）</div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>対話シェルで入って、自分の目で 1 番を確かめます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh
+<span class="ps">/ #</span> ps
+<span class="out">PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    7 root      0:00 ps</span>
+<span class="ps">/ #</span> hostname
+<span class="out">mydocker</span></code></pre>
+      <p>1 番はいま、あなたが打った <code>/bin/sh</code> です。<code>mydocker</code> でも <code>init</code> でもありません。<strong>この 1 行に、この章のすべてが入っています。</strong>「自分自身を別の顔で起動し、名前空間を作り、合図を待たせ、最後に中身を入れ替えた」結果がこれです。</p>
+      <p><code>exit</code> で抜けたら、ホスト側で <code>hostname</code> を打ってみてください。あなたのマシンの名前は変わっていません。区切りは効いています。</p>
+    </div>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>自分自身を再実行するって、無限ループになりませんか?</summary>
+      <div class="qa-body">
+        <p>なりません。起動するときの<strong>引数が違う</strong>からです。<code>run</code> の引数で呼ばれたときだけ <code>Run</code>（＝また自分を起動する側）が走り、<code>init</code> の引数で呼ばれたときは <code>Init</code> が走ります。<code>Init</code> の中には「自分をもう一度起動する」処理はありません。だから深さは常に 2 段で止まります。</p>
+        <p>分岐しているのは <code>internal/cli/cli.go</code> の <code>switch</code> 1 か所だけです。<code>case "run":</code> と <code>case "init":</code> が並んでいて、そこで道が分かれます。同じバイナリの中に親の道と子の道が同居している、というだけの話です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>/proc/self/exe</code> ではなく <code>os.Args[0]</code> ではだめなんですか?</summary>
+      <div class="qa-body">
+        <p>動くこともありますが、壊れる条件が多すぎます。<code>os.Args[0]</code> は<strong>起動時に渡された文字列</strong>にすぎません。<code>./mydocker</code> のような相対パスなら、カレントディレクトリが変わった後には辿れません。<code>PATH</code> 経由で <code>mydocker</code> とだけ渡っていたら、探し直しが必要です。そもそも呼び出し側は <code>argv[0]</code> に好きな文字列を入れられるので、信用に足りません。</p>
+        <p><code>/proc/self/exe</code> はカーネルが握っている<strong>実行ファイルの実体</strong>への参照です。名前の綴りに依存しないので、起動後にファイルがリネームされても削除されても、正しく同じ中身を起動できます。<strong>「自分」を確実に指せる唯一の方法</strong>だと思ってよいです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>子を作らずに、親自身が名前空間に入る方法は本当に無いんですか?</summary>
+      <div class="qa-body">
+        <p>PID 名前空間については本当にありません。Step 1 の実測がその証拠です。<code>unshare --pid</code> だけでは <code>25171</code>、<code>--fork</code> を足して初めて <code>1</code>。<strong>プロセスの PID は生まれた瞬間に決まり、途中で振り直されない</strong>ためです。振り直したら、その PID を握っている親や兄弟が全員おかしくなります。</p>
+        <p>ただし、PID 以外の名前空間（マウント・UTS・IPC など）については、<code>unshare</code> で自分自身を移すことは<strong>できます</strong>。「入れない」わけではないのです。それでも Go でそれをやらないのは、マウント名前空間の <code>unshare</code> が<strong>スレッド単位</strong>の操作で、マルチスレッドの Go ランタイムでは「移った先のスレッドで続きが動く」保証が取れないからです。理由が 2 つ重なっている、と整理しておくと混乱しません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>Cloneflags</code> と <code>Unshareflags</code> に同じ <code>CLONE_NEWNS</code> が書いてあります。片方は消していいのでは?</summary>
+      <div class="qa-body">
+        <p>消すと壊れます。役割が違うからです。<code>Cloneflags</code> は「<strong>新しいマウント名前空間を作れ</strong>」という注文。<code>Unshareflags</code> は「<strong>作った名前空間を、ホストから伝播しない状態にしておけ</strong>」という追加の注文です。</p>
+        <p>後者が抜けると、部屋は新しくなったのに壁に穴が空いたままになります。コンテナの中で <code>/proc</code> を貼るたび、<code>rootfs</code> を bind mount するたび、その操作がホストのマウント表にも現れる。起動のたびにホストにゴミが積もり、しかも第03章の <code>pivot_root</code> は <code>EINVAL</code> で落ちます。<strong>エラーメッセージからは絶対に原因がわからない</strong>種類の失敗なので、先に警告しておきました。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>同期パイプが無いとどうなるのか、いまいち実感が湧きません。数ミリ秒ですよね?</summary>
+      <div class="qa-body">
+        <p>その数ミリ秒が致命的な領域なんです。コンテナの起動そのものが <strong>12〜15 ms</strong>（ホストで <code>/bin/true</code> を直に実行すると 3 ms）です。子が <code>exec</code> を終えてメモリを触り始めるまでの時間と、親が cgroup のファイルに書き込む時間は、同じ桁で競争しています。</p>
+        <p>結果として何が起きるかというと、<strong>テストが気まぐれに通ったり落ちたりします</strong>。<code>--memory 10m</code> を付けたのに 100MB 確保できてしまう回が混じる。10 回に 1 回落ちるテストは、原因を突き止めるのがいちばん難しい種類のバグです。しかも「たまたま通った」ときに人はそれを信じてしまいます。</p>
+        <p>パイプを 1 本入れれば、この競争そのものが消えます。<strong>速くしたのではなく、順序を決めた</strong>のです。並行するものを相手にするときは、速さで殴らず順序で押さえる、と覚えておくと応用が利きます。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>誤って <code>mydocker init</code> を手で打ってしまいました。ホストが壊れたりしませんか?</summary>
+      <div class="qa-body">
+        <p>大丈夫です。二段構えで止まります。まず引数が 4 つ未満なら「<code>init</code> は mydocker が内部で使うサブコマンドです。直接実行しないでください」と表示して終わります。引数を無理やり揃えたとしても、<code>Init</code> の最初の <code>waitForParent()</code> で fd 3 を読みにいきます。手で起動したプロセスに親からのパイプは繋がっていないので、<code>"OK"</code> は届かず「親の準備が失敗したため中止します」で止まります。</p>
+        <p>大事なのは、<strong>止まる位置が <code>pivotRoot</code> より前だ</strong>ということです。root を挿げ替えたりマウントしたりする前に引き返すので、ホストには何も残りません。危ない操作の手前に関所を置く、という設計になっています。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>ネットワークの名前空間（<code>CLONE_NEWNET</code>）が入っていないのはなぜですか?</summary>
+      <div class="qa-body">
+        <p>実装していないからです。素直に書くと <code>Cloneflags</code> に <code>syscall.CLONE_NEWNET</code> を足すだけに見えますが、それだけだと<strong>コンテナから外に一切出られなくなります</strong>。新しいネットワーク名前空間には <code>lo</code> しかなく、外へ繋ぐには veth のペアを作り、ブリッジを立て、IP を配り、NAT を設定し…という一式が要ります。手を出すなら中途半端にはできません。</p>
+        <p>この教材は「できていないことをできたように書かない」を方針にしているので、現状では <code>CLONE_NEWNET</code> を入れていません。その結果、コンテナはホストのネットワークをそのまま共有しています（実測でも、コンテナの中の <code>eth0</code> にホストと同じアドレスが見えています）。なぜ難しいのか・何が必要なのかは第08章でまるごと扱います。</p>
+      </div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。答えを見て「知っていた」と思うかどうかではなく、<strong>口に出して説明できたか</strong>で判定してください。</p>
+
+    <details class="qa"><summary>Q1. <code>unshare --pid sh -c 'echo $$'</code> が 1 ではない番号を出すのはなぜ? 何を足すと 1 になりますか?</summary>
+      <div class="qa-body">
+        <p>PID 名前空間は <code>unshare</code> を呼んだプロセス自身には適用されず、<strong>その後に作られた子プロセスから</strong>効くからです。<code>sh</code> は <code>unshare</code> した本人（の後継）なので、ホストの番号（実測では <code>25171</code>）のままになります。</p>
+        <p><code>--fork</code> を足すと、<code>unshare</code> のあとに子を 1 つ作ってからコマンドを実行するので、その子は新しい名前空間の最初の住人となり <code>1</code> になります。<code>mydocker</code> における「<code>/proc/self/exe</code> を <code>init</code> の顔で起動する」が、この <code>--fork</code> に相当します。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q2. <code>/proc/self/exe</code> は何を指していますか? 「self」とは誰のことですか?</summary>
+      <div class="qa-body">
+        <p><strong>そのリンクを読んだプロセス自身</strong>が今実行している実行ファイルを指すシンボリックリンクです。<code>ls -l /proc/self/exe</code> なら <code>ls</code> の実体を、<code>mydocker</code> のコードから辿れば <code>mydocker</code> の実体を指します。</p>
+        <p>ポイントは、これがカーネルの持つ<strong>実体への参照</strong>であって、名前（パス文字列）への依存が無いことです。だから <code>os.Args[0]</code> のように相対パスや <code>PATH</code> 解決の事情に振り回されません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q3. <code>Cloneflags</code> に名前空間のフラグを並べるだけでなく、<code>Unshareflags: syscall.CLONE_NEWNS</code> も要るのはなぜ?</summary>
+      <div class="qa-body">
+        <p>新しいマウント名前空間を作っても、そのままだとホストとのマウントの<strong>伝播（shared subtree）</strong>が残り、コンテナ内のマウントがホスト側にも現れてしまうからです。<code>Unshareflags</code> を指定すると、子の中で追加の <code>unshare(CLONE_NEWNS)</code> が行われ、ホストから切り離された状態になります。</p>
+        <p>これを忘れると、①起動のたびにホストのマウントが増える、②第03章の <code>pivot_root</code> が <code>EINVAL</code> で落ちる、の 2 つが起きます。効いていることは E2E の「ホストのマウント数が元に戻る（開始 22 → 終了 22）」で機械的に確認しています。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q4. 子は起動直後に何をして待っていますか? 待たせないと何が起きますか?</summary>
+      <div class="qa-body">
+        <p><code>Init</code> の先頭で <code>waitForParent()</code> を呼び、<strong>fd 3（親から <code>ExtraFiles</code> で渡されたパイプの読み側）を <code>io.ReadAll</code> で読み切るまで止まっています</strong>。親が <code>"OK"</code> を書いて閉じるまで、1 行も先へ進みません。</p>
+        <p>待たせないと、親が cgroup に PID を登録し終える前に子が走り出し、<strong>上限が効く前にメモリを確保してしまいます</strong>。結果、上限のテストが気まぐれに通ったり落ちたりします。順序を保証するための 1 本のパイプです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q5. 親が準備に失敗したことを、子にはどうやって伝えていますか?</summary>
+      <div class="qa-body">
+        <p><strong>合図を書かずにパイプを閉じます。</strong>子の <code>io.ReadAll</code> は空のデータを受け取って戻り、<code>"OK"</code> と一致しないので「親の準備が失敗したため中止します」というエラーで終了します。</p>
+        <p>パイプは「閉じられた」こと自体が読み側に伝わるので、異常通知のための別の連絡路が要りません。<code>Run</code> の失敗分岐に <code>syncW.Close() // 合図を送らずに閉じる → 子は何もせず終了する</code> と書かれているのがそれです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q6. <code>syscall.Exec</code> と <code>exec.Command(...).Run()</code> の違いは? なぜ前者でなければならないのですか?</summary>
+      <div class="qa-body">
+        <p><code>exec.Command(...).Run()</code> は<strong>新しい子プロセスを作って</strong>実行します。<code>syscall.Exec</code> は<strong>今のプロセスの中身を置き換えます</strong>。新しいプロセスは生まれず、PID も変わりません。</p>
+        <p>もし子を作る方を使ったら、コンテナの PID 1 は <code>mydocker init</code> のままで、利用者のコマンドはその子になってしまいます。<code>syscall.Exec</code> で置き換えるからこそ、<strong>PID 1 がそのまま <code>/bin/sh</code> になる</strong>。実測の <code>ps</code> の 1 行目が <code>/bin/sh</code> であることがその証拠です。</p>
+      </div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>コンテナの中で <code>ps</code> を打って <strong>1 番があなたの打ったコマンドになっている</strong>こと、<code>hostname</code> が <code>mydocker</code> と答えること。この 2 つが出ればこの章は完了です。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh
+<span class="ps">/ #</span> ps
+<span class="out">PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    7 root      0:00 ps</span>
+<span class="ps">/ #</span> hostname
+<span class="out">mydocker</span></code></pre>
+      <p>あわせて、次の 3 つを声に出して説明できるか試してください。①なぜ <code>unshare</code> だけでは PID 1 になれないのか、②<code>/proc/self/exe</code> は何を指しているのか、③fd 3 のパイプは何を守っているのか。詰まったところが、この章のもう一度読む場所です。</p>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>この章で、私たちはコンテナの<strong>いちばん最初の一歩</strong>を手に入れました。素朴案（<code>unshare</code> してから <code>exec</code>）が原理的に成立しないことを実測で確かめ、そこから re-exec パターンの必然を導きました。<code>/proc/self/exe</code> で自分自身を確実に指し、<code>Cloneflags</code> で名前空間を注文しながら子を生み、<code>Unshareflags</code> でホストとの伝播を断ち、fd 3 の同期パイプで「cgroup が効く前に走り出す」競争を消し、最後に <code>syscall.Exec</code> で中身を入れ替えて PID 1 を目的のコマンドそのものにする。<code>Run</code> と <code>Init</code> という 2 つの顔が、1 つの実行ファイルの中で親子として噛み合う仕組みができました。</p>
+
+    <p>ただし、いま手元にあるのは<strong>入れ物</strong>だけです。名前空間という箱は作れましたが、<strong>その箱で何が区切られているのかを、私たちはまだ 1 つも確かめていません</strong>。<code>CLONE_NEWUTS</code> と <code>CLONE_NEWPID</code> と <code>CLONE_NEWNS</code> と <code>CLONE_NEWIPC</code> を並べて書いただけで、それぞれが何を隠し、何を隠さないのかは手つかずです。ホスト名が変わることだけは見えましたが、たとえば「コンテナの中の <code>ps</code> はどこまでホストを見せるのか」は説明できません。実際、この段階のコンテナには奇妙な症状が残っています。PID 名前空間は確実に効いているのに、<strong><code>ps</code> がホストのプロセスをずらりと並べてしまう</strong>のです。箱は作った、けれど中の見え方はまだ制御できていない。</p>
+
+    <p>次章では、この箱の中身を 1 つずつ開けます。名前空間 6 種類（PID・MNT・UTS・IPC・NET・USER）を順に取り上げ、それぞれが何を区切るのかを、動く実験で 1 つずつ確かめていきます。そして最後に、あの謎に正面から出会います — <strong>名前空間は効いているのに、<code>ps</code> はホストを見せ続ける</strong>。実測ではホスト側 85 個に対して、コンテナの中は 87 個。区切ったはずなのに<strong>ホストより多い</strong>のです。この矛盾の犯人を突き止めることが、第03章で「根を挿げ替える」動機になります。</p>
+
+    <div class="chap-foot">
+      <a class="pager" href="00-env.html"><span class="dir">← 前へ</span>第00章 · Linux の中に入る</a>
+      <a class="pager next" href="02-namespace.html"><span class="dir">次へ →</span>第02章 · 見える世界を区切る</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

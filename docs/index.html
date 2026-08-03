@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>コンテナをつくる — Go と Linux カーネルで Docker を再発明する</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item current" aria-current="page" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">序章 / 全10章 · 層: SETUP · 読了目安 1〜2時間</div>
+    <div class="eyebrow"><span>Setup</span><span class="depth">— 山頂を先に見る</span></div>
+    <h1>コンテナは軽量な<br>仮想マシンではない</h1>
+    <p class="lede">この一文を信じられるようになることが、この教材のゴールです。コンテナの実体は、<strong>namespace で視界を区切り、cgroup で資源を締め、pivot_root で根を挿げ替えた、ただのプロセス</strong>です。仮想の CPU も、ゲスト OS も、どこにもありません。これから 10 章かけて、その「ただのプロセス」を Go の標準ライブラリだけで自分の手で組み上げます。</p>
+
+    <div class="box goal"><div class="box-k">◈ この本のゴール</div>
+      <p><code>docker run alpine /bin/sh</code> と打ったときに Linux カーネルの中で何が起きているかを、<strong>暗記ではなく理解</strong>している状態になること。そのために、同じことをする <code>mydocker</code> というプログラムを、外部ライブラリを 1 つも使わずに自分で書きます。<code>containerd</code> も <code>runc</code> も <code>libcontainer</code> も使いません。<code>docker pull</code> も呼びません。使うのは Go の標準ライブラリと、Linux カーネルが提供するシステムコールだけです。</p>
+      <p>最終的にできあがるのは、<code>run</code> / <code>ps</code> / <code>exec</code> / <code>pull</code> / <code>rm</code> / <code>info</code> を持つ、約 9.0 MB のバイナリ 1 つです。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この序章の歩き方</div>
+      <ol>
+        <li><a href="#thesis">中心命題 — コンテナは軽量な仮想マシンではない</a></li>
+        <li><a href="#three">では何なのか — 3つの細工をされたプロセス</a></li>
+        <li><a href="#step-1">Step 1 · 完成品を 5 分だけ動かす（山頂を先に見る）</a></li>
+        <li><a href="#step-2">Step 2 · 出力を 1 行ずつ読む</a></li>
+        <li><a href="#step-3">Step 3 · 数字で体感する</a></li>
+        <li><a href="#toolbox">道具箱 — これから断りなく使う言葉</a></li>
+        <li><a href="#map">層は下から積まれる — 飛ばせない</a></li>
+        <li><a href="#prereq">前提 — 何を知っていれば読めるか</a></li>
+        <li><a href="#os">⚠ Windows / macOS では動きません</a></li>
+      </ol>
+    </div>
+
+    <h2 id="thesis">中心命題 — コンテナは軽量な仮想マシンではない</h2>
+
+    <p>「コンテナは軽い仮想マシンみたいなもの」という説明を、一度は聞いたことがあると思います。分かりやすい比喩ですし、使う側でいるあいだは、それで困りません。ただ、<strong>この比喩は作る側に回った瞬間に完全に破綻します</strong>。比喩のまま進むと、これから読むコードが 1 行も理解できません。ですからここで捨てます。</p>
+
+    <p>仮想マシンは、ハードウェアそのものを模倣します。仮想の CPU があり、仮想のメモリがあり、仮想のディスクがあり、その上に<strong>もう 1 つ別の OS カーネルが載ります</strong>。ゲスト OS はブートローダから起動し、自分専用のカーネルを初期化し、init を立ち上げ、デーモンを並べます。だから起動に時間がかかり、イメージも大きくなります。</p>
+
+    <p>コンテナには、その層が<strong>1 枚もありません</strong>。コンテナの中で動いているプロセスは、ホストのカーネルにそのまま話しかけています。<code>read()</code> も <code>write()</code> も <code>fork()</code> も、あなたが普段 Linux で走らせているプログラムとまったく同じカーネルが処理します。カーネルは 1 つしかありません。<strong>「コンテナ」という名前の実体は、カーネルの中のどこにも存在しません。</strong></p>
+
+    <div class="ascii">仮想マシンとコンテナ — 積み方が違う
+
+  【仮想マシン】                     【コンテナ】
+
+  ┌──────────────┐              ┌──────────────┐
+  │  アプリ       │              │  アプリ       │  ← ただのプロセス
+  ├──────────────┤              └──────┬───────┘
+  │  ゲスト OS    │ ★もう1枚          │  namespace で視界を区切り
+  │  （カーネル）  │   カーネルが       │  cgroup で資源を締め
+  ├──────────────┤   載る            │  pivot_root で根を替えた
+  │  仮想ハード    │                   │  「だけ」の状態
+  ├──────────────┤              ┌──────┴───────┐
+  │  ホスト OS    │              │  ホスト OS    │  ← カーネルは1つだけ
+  ├──────────────┤              ├──────────────┤
+  │  ハードウェア  │              │  ハードウェア  │
+  └──────────────┘              └──────────────┘</div>
+
+    <p>ここが腑に落ちると、Docker まわりの不思議がまとめて説明できるようになります。<strong>なぜコンテナはミリ秒で起動するのか</strong> — 起動する OS が無いからです。ただプロセスを 1 つ <code>fork</code> して <code>exec</code> しているだけだからです。<strong>なぜ Linux のコンテナが Windows でネイティブに動かないのか</strong> — namespace も cgroup も Linux カーネルの機能そのものだからです。<strong>なぜコンテナの中で <code>uname -r</code> を打つとホストのカーネルバージョンが返るのか</strong> — 本当にホストのカーネルだからです。</p>
+
+    <p>逆に言うと、この教材で作るものは魔法ではありません。<strong>カーネルに既にある機能を、正しい順番で呼ぶだけ</strong>です。難しいのは個々のシステムコールではなく、<em>順番</em>と<em>後片付け</em>です。それを間違えると、コンテナは静かに壊れます。壊れ方も含めて、全部この教材で踏みます。</p>
+
+    <h2 id="three">では何なのか — 3つの細工をされたプロセス</h2>
+
+    <p>コンテナが「ただのプロセス」なら、普通のプロセスと何が違うのでしょうか。答えは、起動する瞬間に<strong>3つの細工</strong>が施されている、それだけです。</p>
+
+    <p><strong>1つめ、namespace（名前空間）で視界を区切る。</strong> Linux のプロセスは、プロセス一覧・ホスト名・マウントの一覧・プロセス間通信の道具といった「見えるもの」を、既定ではシステム全体で共有しています。namespace は、この「見えるもの」の台帳をプロセスごとに別々に持たせる仕組みです。PID 名前空間を新しく作れば、そのプロセスは自分を PID 1 だと思い込みます。UTS 名前空間を作れば、ホスト名を勝手に変えてもホストに影響しません。<strong>隠しているのではなく、参照する台帳そのものが別になっています。</strong></p>
+
+    <p><strong>2つめ、cgroup（control group）で資源を締める。</strong> 視界を区切っただけでは、メモリを 100 GB 確保しにいってホストごと巻き込むことができてしまいます。cgroup は「このプロセス群はメモリを 10 MB までしか使ってはいけない」といった上限を、<strong>カーネルに強制させる</strong>仕組みです。上限を超えると、カーネルがそのプロセスを SIGKILL で殺します。お願いではなく、強制です。</p>
+
+    <p><strong>3つめ、pivot_root で根を挿げ替える。</strong> 視界と資源を区切っても、ファイルシステムはホストのままです。コンテナの中で <code>ls /</code> と打ったときにホストの <code>/etc</code> が見えては、隔離とは言えません。<code>pivot_root</code> は、そのプロセスにとっての「<code>/</code>」を、別のディレクトリに丸ごと差し替えるシステムコールです。差し替えた先に alpine の中身を置けば、そのプロセスから見た世界は alpine そのものになります。</p>
+
+    <div class="ascii">3つの細工
+
+  普通のプロセス                     コンテナ（＝細工されたプロセス）
+  ─────────────                    ────────────────────────────
+  ps でホストの全プロセスが見える  →  namespace   自分しか見えない
+  メモリは取り放題                 →  cgroup      10MB を超えたら殺される
+  / はホストの /                   →  pivot_root  / は alpine の中身
+
+  細工は「起動の瞬間」に、この順で入る。順番を崩すと必ず壊れる。</div>
+
+    <p>この 3 つに、後半で「イメージをレジストリから取ってくる」「レイヤを重ねる」「実行中のコンテナを覚えておく」が加わります。<strong>Docker の本質的な部分は、この 6 つでほぼ説明がつきます。</strong> 残りは利便性のための膨大な作り込みです。この教材は本質的な 6 つを扱います。</p>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>完成品を 5 分だけ動かす（山頂を先に見る）</h2>
+
+    <p>いきなり理屈から始めると、何を作っているのか分からないまま 3 章くらい進んでしまいます。ですので、<strong>先に完成品を見ます</strong>。ここではまだ手を動かさなくて構いません。実際に自分の環境で動かす準備は次の第00章でやります。今は「これがゴールなのか」と眺めるだけで十分です。</p>
+
+    <p>完成した <code>mydocker</code> に、alpine の中で 3 つのコマンドを打たせてみます。<code>ps</code>（プロセス一覧）、<code>hostname</code>（ホスト名）、<code>ls /</code>（ルートディレクトリの中身）です。この 3 つは、先ほどの「3つの細工」がそれぞれ効いているかを見るための、いちばん短い検査になっています。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>1 行目と 2 行目は <code>mydocker</code> 自身が標準エラーに出しているメッセージです。3 行目以降が alpine の中で実行された結果です。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh -c 'ps; echo ---; hostname; echo ---; ls /'
+<span class="out">キャッシュ: mirror.gcr.io/library/alpine:latest（ネットワークにはアクセスしません）
+コンテナ a169666dadfc を起動しました (PID 23900)
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh -c ps; echo ---; hostname; echo ---; ls /
+    7 root      0:00 ps
+---
+mydocker
+---
+bin
+dev
+etc
+home
+lib
+media
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+tmp
+usr
+var</span></code></pre>
+    </div>
+
+    <p>対話シェルとして起動すると、こうなります。プロンプトが <code>/ #</code> に変わり、そこから先はもう alpine の中です。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh
+<span class="ps">/ #</span> ps
+<span class="out">PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    7 root      0:00 ps</span>
+<span class="ps">/ #</span> hostname
+<span class="out">mydocker</span></code></pre>
+    </div>
+
+    <p>もし <code>docker run</code> を使ったことがあれば、この出力に見覚えがあると思います。<strong>見覚えがあるのが正解です。</strong> やっていることが同じだからです。違うのは、この出力を出しているプログラムを、これから自分で書くという点だけです。</p>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>出力を 1 行ずつ読む</h2>
+
+    <p>さらっと流してしまいがちですが、上の出力の 1 行 1 行が「細工が効いた証拠」です。順に見ていきます。</p>
+
+    <h3>① ps に自分しか出ない — namespace が効いている</h3>
+
+    <p>コンテナの中で <code>ps</code> を打つと、出てくるのは <strong>2 行だけ</strong>です。ヘッダと、PID 1 の <code>/bin/sh</code>。あとは <code>ps</code> 自身。同じ瞬間、ホスト側では 85 個のプロセスが動いています。<code>sshd</code> も、systemd 系のデーモンも、あなたのエディタも動いています。それが 1 つも見えません。</p>
+
+    <p>そして注目すべきは <strong>PID が 1 であること</strong>です。Linux で PID 1 は特別なプロセス、システム全体の親（init）です。普通のプログラムが PID 1 になることはありません。それがここでは <code>/bin/sh</code> になっています。<strong>このプロセスは「自分がこのシステムの最初のプロセスだ」と信じ込んでいます。</strong> PID 名前空間が新しく作られ、その中で番号が 1 から振り直されているからです。これは第02章で作ります。</p>
+
+    <h3>② hostname が mydocker — UTS 名前空間が効いている</h3>
+
+    <p>ホスト側でホスト名を確認すると <code>vm</code> です。ところがコンテナの中では <code>mydocker</code> と返ってきます。コンテナの中で <code>hostname</code> を変更しても、ホストのホスト名は変わりません。<strong>ホスト名という「システムに 1 つしかないはずの設定」が、プロセスごとに別々の値を持てるようになっています。</strong> これが UTS 名前空間です。これも第02章です。</p>
+
+    <h3>③ ls / が alpine の中身 — pivot_root が効いている</h3>
+
+    <p><code>bin dev etc home lib media mnt opt proc root run sbin srv sys tmp usr var</code>。これは alpine linux 3.24.1 のルートディレクトリの中身です。ホストのルートには <code>lost+found</code> や <code>boot</code> や <code>lib64</code> があるはずですが、ここには 1 つもありません。<strong>このプロセスにとっての「<code>/</code>」は、もうホストの <code>/</code> ではありません。</strong></p>
+
+    <p>しかもこの alpine の中身は、事前にどこかからコピーしてきたものではありません。<code>mydocker</code> が自分でレジストリに HTTP でアクセスし、トークンを取り、マニフェストを読み、レイヤの tar.gz をダウンロードして展開したものです。第05章と第06章でこれを作ります。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 「見えない」と「隔離されている」は違う</div>
+      <p>この教材で作る <code>mydocker</code> は、<strong>ネットワーク名前空間だけは作っていません</strong>。つまりコンテナの中で <code>ip addr</code> を打つと、ホストの <code>eth0</code> がそのまま見えます。IP アドレスもホストと同一です。</p>
+      <p>できていないことを「できたふり」で書かないために、この教材では第08章を「なぜネットワークの隔離が難しいのか・実装するなら何が必要か」を扱う地図の章にしてあります。作れなかったものを作れたことにするより、そのほうが読者の役に立つと判断しました。</p>
+    </div>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>数字で体感する</h2>
+
+    <p>「軽い」という言葉は主観的です。数字で見ます。ここに挙げるのは、すべて実際にこの環境（Linux 6.18.5 / x86_64）で測った値です。</p>
+
+    <h3>起動時間 — 12 ms 対 3 ms</h3>
+
+    <p>キャッシュ済みの alpine で <code>/bin/true</code> を実行するだけのコンテナを 5 回起動して、かかった時間を測りました。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>コンテナ起動 5 回分の実測値です。</p>
+      <pre class="term"><code><span class="out">15 ms / 13 ms / 12 ms / 12 ms / 12 ms</span></code></pre>
+      <p>対照として、同じ <code>/bin/true</code> をホストで直接実行した場合は <strong>3 ms</strong> でした。</p>
+    </div>
+
+    <p>差は <strong>9〜12 ms</strong>。この差の中で、overlayfs のマウント、namespace の生成、cgroup ディレクトリの作成、<code>pivot_root</code>、<code>/proc</code> の貼り直し、そして後片付けが全部行われています。<strong>「プロセスを 1 つ起動する」ことに対する上乗せが、ミリ秒の桁で収まっている</strong>ということです。</p>
+
+    <p>仮想マシンを 1 台起動すると、一般には数十秒かかり、ディスクイメージも数百 MB から数 GB になります。これは一般的に知られている事実として書いています。今回の環境では仮想マシンの起動時間を測っていないので、実測値としては提示しません。ただ、桁が 3 つも 4 つも違うという感覚は持っておいてください。<strong>そしてその差の理由が「起動する OS が無いから」であることは、もう分かるはずです。</strong></p>
+
+    <h3>イメージサイズ — レイヤ 1 枚、圧縮 3.67 MiB</h3>
+
+    <p>この教材でずっと使う alpine linux のイメージを実際に取得して、中身を数えました。</p>
+
+    <table>
+      <tr><th>項目</th><th>実測値</th></tr>
+      <tr><td>レイヤの枚数</td><td>1 枚</td></tr>
+      <tr><td>レイヤの mediaType</td><td><code>application/vnd.oci.image.layer.v1.tar+gzip</code></td></tr>
+      <tr><td>レイヤの圧縮サイズ</td><td><strong>3.67 MiB</strong></td></tr>
+      <tr><td>展開後のサイズ</td><td><strong>8.7 MB</strong></td></tr>
+      <tr><td>展開後のファイル数</td><td><strong>516 ファイル</strong></td></tr>
+      <tr><td>alpine のバージョン</td><td>3.24.1</td></tr>
+      <tr><td>config の digest / サイズ</td><td><code>sha256:d529dd0c6e55…</code> / 611 バイト</td></tr>
+    </table>
+
+    <p><strong>OS まるごとが 516 ファイル、圧縮して 3.67 MiB です。</strong> これがコンテナイメージの実体で、仮想マシンのディスクイメージとの決定的な違いです。カーネルが入っていないので、入っているのは <code>/bin</code>、<code>/lib</code>、<code>/etc</code> といったユーザ空間のファイルだけです。だからこの大きさで済みます。</p>
+
+    <h3>プロセス数 — ホスト 85 個、コンテナ内 1 個</h3>
+
+    <table>
+      <tr><th>測定対象</th><th>実測値</th></tr>
+      <tr><td>ホストの実行中プロセス数（<code>ps -e</code>）</td><td><strong>85 個</strong>（測定時により 85〜87）</td></tr>
+      <tr><td>コンテナ内のプロセス数</td><td><strong>1 個</strong></td></tr>
+      <tr><td>ホストのマウント数（<code>/proc/mounts</code>）</td><td>22 行</td></tr>
+      <tr><td><code>mydocker</code> バイナリのサイズ</td><td>9.0 MB</td></tr>
+      <tr><td>E2E テストの結果</td><td>56 項目すべて通過</td></tr>
+    </table>
+
+    <p>この <strong>85 対 1</strong> という数字が、namespace が効いていることのいちばん分かりやすい証拠です。同じマシン、同じカーネル、同じ瞬間に、片方からは 85 個見えていて、もう片方からは 1 個しか見えていません。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 「1 個しか見えない」は自動的には手に入らない</div>
+      <p>PID 名前空間を作っただけでは、コンテナの中の <code>ps</code> は<strong>ホストのプロセスを全部表示します</strong>。しかも実測では <strong>87 個</strong>と、ホスト側の 85 個より<em>多く</em>出ました。名前空間は正しく効いているのに、です。</p>
+      <p>犯人は <code>/proc</code> です。<code>ps</code> は <code>/proc</code> を読んでプロセス一覧を作るので、<code>/proc</code> がホストのものを指したままだと、名前空間の中にいてもホストの情報が見えてしまいます。この「効いているのに見えない」問題は第03章の山場です。序章では「そういう罠がある」とだけ覚えておいてください。</p>
+    </div>
+
+    <h2 id="toolbox">道具箱 — これから断りなく使う言葉</h2>
+
+    <p>ここから先、次の言葉は<strong>断りなく使います</strong>。今すべて理解する必要はありません。それぞれ担当の章で 1 つずつ丁寧に扱います。ここは「読んでいて詰まったら戻ってくる場所」として置いておきます。</p>
+
+    <table>
+      <tr><th>用語</th><th>ひとことで言うと</th><th>扱う章</th></tr>
+      <tr><td><strong>namespace</strong><br>（名前空間）</td><td>プロセスから「見えるもの」の台帳を、プロセスごとに別々に持たせるカーネルの仕組み。PID・ホスト名・マウント・IPC など種類ごとに独立している。隠しているのではなく台帳が別。</td><td>第02章</td></tr>
+      <tr><td><strong>cgroup</strong><br>（control group）</td><td>プロセス群に対して CPU・メモリ・プロセス数の上限をカーネルに強制させる仕組み。ディレクトリを作り、そこのファイルに数値を書き、<code>cgroup.procs</code> に PID を書くと効く。<strong>作っただけでは効かない。</strong></td><td>第04章</td></tr>
+      <tr><td><strong>マウント</strong><br><strong>と伝播</strong></td><td>ファイルシステムを「木のどこか」に接ぎ木すること。マウントには伝播（propagation）という性質があり、既定では自分のマウント操作が他へ伝わっていく。切らないとホストを汚す。</td><td>第03章</td></tr>
+      <tr><td><strong>rootfs</strong></td><td>コンテナにとって <code>/</code> になるディレクトリツリー。中身は <code>bin</code> <code>etc</code> <code>lib</code> …。カーネルは含まない。</td><td>第03・06章</td></tr>
+      <tr><td><strong>pivot_root</strong></td><td>プロセスにとっての <code>/</code> を別のディレクトリに丸ごと差し替えるシステムコール。<code>chroot</code> より強い。<code>chroot</code> には<strong>破り方が知られている</strong>。</td><td>第03章</td></tr>
+      <tr><td><strong>レイヤ</strong></td><td>イメージを構成する tar.gz の 1 枚。イメージは複数のレイヤの重ね合わせとして表現される。alpine は 1 枚。</td><td>第05・06章</td></tr>
+      <tr><td><strong>レジストリ</strong></td><td>イメージを配る HTTP サーバ。Docker Registry API v2。<strong>トークン → マニフェスト → レイヤ</strong>の 3 段でしか取れない。</td><td>第05章</td></tr>
+      <tr><td><strong>OverlayFS</strong></td><td>読み取り専用の下層（<code>lowerdir</code>）と書き込み用の上層（<code>upperdir</code>）を重ねて 1 つに見せるファイルシステム。書き込みは上層にだけ溜まる。捨てれば元通り。</td><td>第06章</td></tr>
+      <tr><td><strong>マニフェスト</strong></td><td>イメージの目次にあたる JSON。どのレイヤをどの順で重ねるかが書いてある。⚠ 最初に返ってくるのは<strong>インデックス（マニフェストリスト）</strong>で、<code>layers</code> が入っていないことがある。</td><td>第05章</td></tr>
+      <tr><td><strong>re-exec</strong></td><td>自分自身のバイナリを <code>/proc/self/exe</code> 経由でもう一度起動する手法。名前空間を作りつつ Go のコードで初期化を書くための定石。</td><td>第01章</td></tr>
+      <tr><td><strong>ホワイトアウト</strong></td><td>「上のレイヤでこのファイルを消した」ことを表す印。tar の中では <code>.wh.</code> で始まるファイル名として現れる。overlay 形式へ翻訳が要る。</td><td>第06章</td></tr>
+    </table>
+
+    <p>もう 1 つ、断りなく使う略記があります。<strong>Must / Should / Could</strong> です。この教材では「絶対に作るもの（Must）」「作りたいもの（Should）」「余裕があれば（Could）」を最初に決めてから実装を始めました。namespace と cgroup が Must、イメージ取得と OverlayFS が Should、ネットワークが Could です。第00章では、その Must が本当に成立するかを実際に確かめるところから始めます。</p>
+
+    <h2 id="map">層は下から積まれる — 飛ばせない</h2>
+
+    <p>この教材はレシピ集ではありません。<strong>各章が一つの層で、下の層の上にしか次の層が立ちません。</strong> 「cgroup のところだけ読みたい」という読み方は、残念ながらできません。第04章は第01章で作った親子構造を前提にしているからです。</p>
+
+    <p>もっとはっきり言います。<strong>1 章飛ばすと次章は必ず分かりません。</strong> これは脅しではなく構造上の事実です。第03章は第02章で「PID 名前空間を作ったのに <code>ps</code> がホストのプロセスを出す」という壊れ方を体験していることが前提ですし、第06章は第05章で取ってきたレイヤが手元にあることが前提です。</p>
+
+    <div class="ascii">全11ページの地図（下から積む）
+
+  09  さらに先へ            発展課題と全体の総括
+  08  外とつながる          ネットワーク（未実装・なぜ難しいかの地図）
+  07  道具にする            CLI・状態管理・後片付け／リーク検査
+  06  層を重ねる            OverlayFS・展開・ホワイトアウト
+  05  イメージを取ってくる    Registry API v2 を net/http だけで
+  04  資源に上限をかける      cgroup v2 優先・v1 フォールバック
+  03  根を挿げ替える         pivot_root と /proc の貼り直し
+  02  見える世界を区切る      Cloneflags で namespace を作る
+  01  自分をもう一度起動する   /proc/self/exe による re-exec
+  00  Linux の中に入る       ★開発環境。ここが最大の関門
+  序  はじめに・準備         ← いまここ
+
+  ↑ 上の層は、下の層の上にしか立たない。順に積む。</div>
+
+    <p>各章が何をする章なのかを、1 行ずつ書いておきます。</p>
+
+    <table>
+      <tr><th>章</th><th>建てるもの</th><th>この章が終わると</th></tr>
+      <tr><td>第00章</td><td>開発環境（特権 Linux）</td><td>namespace・cgroup・overlayfs・レジストリが自分の環境で使えることを、実際にコマンドを打って確かめた状態になる</td></tr>
+      <tr><td>第01章</td><td>re-exec（<code>/proc/self/exe</code>）</td><td>親プロセスが自分自身を「別の顔」で起動できるようになる。名前空間を作る場所が手に入る</td></tr>
+      <tr><td>第02章</td><td>namespace（<code>Cloneflags</code>）</td><td>ホスト名を変えてもホストに影響しなくなる。ただし <code>ps</code> はまだ壊れて見える</td></tr>
+      <tr><td>第03章</td><td><code>pivot_root</code> と <code>/proc</code></td><td>コンテナの中で <code>ps</code> を打つと自分だけが並ぶ。<code>ls /</code> が alpine になる</td></tr>
+      <tr><td>第04章</td><td>cgroup</td><td>メモリ上限を超えたコンテナが実際に殺される（exit 137）</td></tr>
+      <tr><td>第05章</td><td>Registry API v2</td><td><code>docker pull</code> を使わずにイメージを取得できる。キャッシュも効く</td></tr>
+      <tr><td>第06章</td><td>OverlayFS と tar 展開</td><td>レイヤを重ねてコンテナの <code>/</code> を作れる。書き込みは上層にだけ溜まる</td></tr>
+      <tr><td>第07章</td><td>CLI と状態管理</td><td><code>ps</code> / <code>exec</code> / <code>rm</code> が揃い、後片付けのリークが無いことを検査できる</td></tr>
+      <tr><td>第08章</td><td>（未実装の地図）</td><td>ネットワークの隔離に何が必要で、どこが難所かが分かる</td></tr>
+      <tr><td>第09章</td><td>総括</td><td>本物の Docker との距離と、次に学ぶべきものが見える</td></tr>
+    </table>
+
+    <p>読了目安は各章の冒頭（このページの上にもある灰色の帯）に書いてあります。合計するとそれなりの時間になりますが、<strong>手を動かしながら読むことを前提にした時間</strong>です。読むだけなら半分以下で終わります。ただ、読むだけでは <code>ps</code> が 87 個出る驚きは手に入りません。</p>
+
+    <h2 id="why-go">なぜ Go で、なぜ依存ライブラリを 1 つも使わないのか</h2>
+
+    <p>言語の選択には理由があります。コンテナランタイムを書くのに向いている言語の条件は 3 つあります。<strong>システムコールを直接呼べること</strong>、<strong>1 つのバイナリに固まって配布できること</strong>、そして<strong>読みやすいこと</strong>です。Go はこの 3 つを同時に満たします。C はシステムコールを呼べますが読みやすさで劣り、Python は読みやすいですがプロセスを <code>fork</code> して名前空間を作る部分で苦労します。実際、本物の Docker（moby / containerd / runc）もすべて Go で書かれています。</p>
+
+    <p>もう 1 つ、この教材には強い縛りがあります。<strong>外部ライブラリを 1 つも使いません。</strong> <code>go.mod</code> の <code>require</code> ブロックは空のままです。使うのは Go の標準ライブラリだけ — <code>syscall</code>、<code>os/exec</code>、<code>net/http</code>、<code>archive/tar</code>、<code>compress/gzip</code>、<code>encoding/json</code>。この 6 つでコンテナランタイムが 1 本書けます。</p>
+
+    <div class="ascii">この教材が使うもの・使わないもの
+
+  使う（Go 標準ライブラリだけ）        使わない
+  ───────────────────────────        ─────────────────────────
+  syscall        名前空間・mount      containerd    コンテナ管理の本体
+  os/exec        子プロセスの起動      runc          OCI ランタイム
+  net/http       レジストリ通信        libcontainer  namespace の実装
+  archive/tar    レイヤの展開          moby          Docker 本体
+  compress/gzip  レイヤの解凍          docker pull   イメージ取得の代行
+  encoding/json  マニフェスト解析
+
+  ↑ 左だけで、右の仕事のうち本質的な部分は自分で書ける。</div>
+
+    <p>なぜここまで縛るのか。<strong>ライブラリを使うと、いちばん学びたい部分がライブラリの中に隠れてしまうから</strong>です。<code>libcontainer</code> を使えばコンテナは 20 行で起動できます。ただ、その 20 行を書いても namespace のことは何も分かりません。分かるのは <code>libcontainer</code> の使い方だけです。この教材の目的は Docker を作ることではなく、Docker が何をしているかを理解することなので、そこは自分で書きます。</p>
+
+    <p>逆に言うと、<strong>この縛りがあるおかげで、この教材のコードは全部読めます。</strong> 行数にして数百行です。依存が無いので、ビルドもネットワーク無しで通ります。第00章で <code>go build ./...</code> を打つと、外部から何もダウンロードせずにバイナリができあがります。それが <code>require</code> が空であることの実感です。</p>
+
+    <h2 id="how">この教材の書き方 — 素朴案が壊れるところから始める</h2>
+
+    <p>各章は、だいたい同じ形をしています。まず<strong>素朴に考えて思いつく方法</strong>を試します。次に<strong>それが壊れるところを実際に見ます</strong>。そのうえで、なぜ本物の実装がそういう形になっているのかを理解します。いきなり正解のコードを出すことはしません。</p>
+
+    <p>たとえば第03章は、こう進みます。「コンテナの <code>/</code> を変えたい。<code>chroot</code> というのがあるらしい」→ 実際に <code>chroot</code> で牢屋を作る → <strong>Python 10 行で牢屋から脱獄してみせる</strong> → だから <code>pivot_root</code> が要る。第02章はこうです。「名前空間を作った。<code>ps</code> を打とう」→ <strong>ホストより多い 87 個が出る</strong> → なぜだ → <code>/proc</code> だ。</p>
+
+    <p>この形にしているのは、<strong>「なぜ」が抜けた知識はすぐ消えるから</strong>です。「<code>pivot_root</code> を使いましょう」とだけ覚えても、半年後には忘れます。「<code>chroot</code> は <code>fchdir</code> で破れるのを自分の目で見た」なら、忘れません。少し遠回りに見えるかもしれませんが、こちらのほうが速いです。</p>
+
+    <p>そして各ステップの最後には<strong>「動かして確認」</strong>という関所を置いています。そこに書いてある出力が自分の画面に出るまでは、次に進まないでください。出ない場合は、その章のどこかに書いてある落とし穴を踏んでいます。落とし穴は<strong>読者が踏む前に</strong>警告する方針で書いていますが、それでも踏むときは踏みます。踏んだら、その章の「つまずき FAQ」を見てください。</p>
+
+    <h2 id="prereq">前提 — 何を知っていれば読めるか</h2>
+
+    <p>必要なものは 2 つだけです。</p>
+
+    <ul>
+      <li><strong>Go の基礎文法</strong> — <code>func</code>、<code>struct</code>、<code>if err != nil</code>、スライス、<code>defer</code>。この程度で足ります。ジェネリクスもチャネルも使いません（<code>os/exec</code> の内部では使われますが、書く側では出てきません）。</li>
+      <li><strong>ターミナルの基本操作</strong> — <code>cd</code>、<code>ls</code>、<code>cat</code>、パイプ、リダイレクト。</li>
+    </ul>
+
+    <p>必要<strong>ない</strong>ものも、はっきり書いておきます。</p>
+
+    <ul>
+      <li><strong>Linux カーネルの知識は要りません。</strong> namespace も cgroup も知らない前提で書いています。</li>
+      <li><strong>Docker の内部知識も要りません。</strong> <code>docker run</code> を使ったことがあれば十分で、無くても読めます。</li>
+      <li><strong>C の知識も要りません。</strong> システムコールは Go の <code>syscall</code> パッケージ越しに呼びます。</li>
+    </ul>
+
+    <p>知らない概念が初めて出てくるところでは、その場で <strong>GO メモ</strong> または <strong>LINUX メモ</strong> という枠を挟んで補足します。形はこうです。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · システムコール</div>
+      <p>プログラムがカーネルに仕事を頼むときの窓口が<strong>システムコール</strong>です。ファイルを開く <code>open</code>、読む <code>read</code>、プロセスを複製する <code>fork</code>、別のプログラムに変身する <code>execve</code> — どれもシステムコールです。ユーザが書いたプログラムは、自分ではディスクにもメモリ管理にも触れません。必ずカーネルに頼みます。</p>
+      <p>この教材で使う <code>unshare</code>、<code>mount</code>、<code>pivot_root</code>、<code>sethostname</code> も、すべてシステムコールです。つまり<strong>コンテナを作るというのは、システムコールを正しい順番で呼ぶこと</strong>に他なりません。</p>
+    </div>
+
+    <div class="gonote"><div class="box-k">GO メモ · syscall パッケージ</div>
+      <p>Go の標準ライブラリには <code>syscall</code> というパッケージがあり、Linux のシステムコールをほぼそのまま呼べます。たとえば <code>syscall.Sethostname([]byte("mydocker"))</code> と書けば、C から <code>sethostname()</code> を呼ぶのと同じことが起きます。</p>
+      <p>「Go で低レベルなことをやるのは大変では?」と思うかもしれませんが、この教材の範囲では<strong>むしろ C より書きやすい</strong>です。エラーが戻り値で返ってくるので <code>errno</code> を気にしなくて済みますし、<code>os/exec</code> が名前空間の指定まで面倒を見てくれます。C の知識は最後まで出てきません。</p>
+    </div>
+
+    <p>コードは常に <code>src/</code> の実装と一字一句一致させています。教材のために簡略化した「説明用のコード」は 1 行もありません。省略するときは <code>// …（後のステップで）</code> と明示します。<strong>読んだコードがそのまま動くコードです。</strong></p>
+
+    <h2 id="os">⚠ Windows / macOS では動きません</h2>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · ここが最初にして最大の関門</div>
+      <p><strong>この教材のコードは、Windows でも macOS でもネイティブには一行も動きません。</strong> namespace / cgroup / overlayfs / <code>pivot_root</code> は Linux カーネルの機能そのものだからです。「Go はクロスプラットフォームだから大丈夫」ではありません。Go は動きますが、呼ぶ相手のカーネルがいません。</p>
+      <p>さらに、Linux であっても<strong>特権</strong>（<code>CAP_SYS_ADMIN</code> など）が要ります。一般ユーザ権限では <code>mount</code> も <code>pivot_root</code> も <code>/sys/fs/cgroup</code> への書き込みも <code>EPERM</code>（Operation not permitted）で落ちます。</p>
+    </div>
+
+    <p>正直に言うと、<strong>この教材でいちばん多くの人がつまずくのは技術ではなく開発環境です。</strong> 第03章の <code>pivot_root</code> より、第00章の「特権 Linux をどう用意するか」のほうが脱落者が多い。だから第00章を独立した 1 章として立て、しかもそこそこの分量を割いています。</p>
+
+    <p>用意する方法は 2 つあります。<strong>案A: 特権付きの Docker コンテナを 1 つ立て、その中で開発する</strong>（推奨）。<strong>案B: WSL2 の Linux をそのまま使う</strong>。案A は「Docker を作るために Docker を使う」という愉快な入れ子になりますが、環境の差が出にくく、後片付けも楽です。詳しくは次の第00章で扱います。</p>
+
+    <p>そして第00章では、環境を用意したあとに<strong>疎通実験</strong>をします。namespace は作れるか。cgroup は書けるか。書けたとして本当に効くか。overlayfs はマウントできるか。レジストリに届くか。<strong>1 行も実装を書く前に、この 5 つを実際にコマンドを打って確かめます。</strong> ここを飛ばすと、第04章まで進んでから「この環境では cgroup が効かない」と気づくことになります。</p>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>Docker がもうあるのに、なぜ自分で作るんですか?</summary>
+      <div class="qa-body">
+        <p>使うためではなく、<strong>理解するため</strong>です。この教材で作る <code>mydocker</code> は、本物の Docker の代わりにはなりません。ネットワークの隔離も無いし、イメージのビルドもできないし、セキュリティの絞り込みもしていません。</p>
+        <p>ただ、<code>docker run</code> が何をしているかを説明できるようになります。コンテナが起動しないとき、ログの前に <code>/proc/&lt;pid&gt;/ns/</code> を見るという発想が出るようになります。「コンテナから抜け出せる脆弱性」というニュースを読んだときに、何が破られたのかが分かるようになります。<strong>ブラックボックスが 1 つ減る</strong>のが目的です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>「コンテナは軽量な VM ではない」と言われても、使う分には同じに見えます。何が変わりますか?</summary>
+      <div class="qa-body">
+        <p>使う分には、たしかにほとんど同じに見えます。問題が起きたときに差が出ます。</p>
+        <p>たとえば、コンテナの中で <code>free -m</code> を打つとホストのメモリ量が返ってくることがあります。VM の比喩で考えていると意味が分かりませんが、「ただのプロセスで、<code>/proc/meminfo</code> はホストのものを見ている」と分かっていれば当然の結果です。コンテナの中の <code>uname -r</code> がホストのカーネルバージョンを返すのも同じ理由です。<strong>比喩で説明できない現象が出たとき、比喩を持っている人は詰みます。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Go を知らないと読めませんか? Python しか書いたことがありません。</summary>
+      <div class="qa-body">
+        <p>読めます。この教材で使う Go は、ほぼ「型のある手続き型言語」の範囲です。<code>func</code> で関数を定義し、<code>if err != nil { return err }</code> でエラーを返し、<code>defer</code> で後片付けを予約する。この 3 つが分かれば 9 割は読めます。</p>
+        <p>むしろ難しいのは Go ではなく Linux 側です。そちらは前提知識ゼロで書いてあるので、Go の文法だけ都度調べれば追いつけます。なお疎通実験の一部と E2E テストは Python で書いてあるので、Python 経験は無駄になりません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>章を飛ばして、興味のある cgroup の章だけ読んではだめですか?</summary>
+      <div class="qa-body">
+        <p>おすすめしません。第04章の cgroup は「第01章で作った親子構造の、子の PID を <code>cgroup.procs</code> に書く」という形で実装されているので、親子構造を知らないとコードの半分が宙に浮きます。</p>
+        <p>どうしても急ぐなら、<strong>第00章 → 第01章 → 第02章 → 第04章</strong>という最短経路はあります。ただし第03章を飛ばすと「<code>ps</code> が 87 個出る」という、この教材でいちばん面白い壊れ方を見逃します。もったいないです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Mac で開発しています。詰みですか?</summary>
+      <div class="qa-body">
+        <p>詰みではありません。Docker Desktop が動いていれば、その中で特権付きの Linux コンテナを立てられます。それが第00章の案Aです。「Docker を作るために Docker を使う」という入れ子になりますが、これは冗談ではなく実務でも普通に使われる手です。</p>
+        <p>ただし、macOS 上の Docker Desktop は内部で Linux VM を動かしているので、その VM のカーネル設定によっては cgroup まわりの挙動が変わることがあります。だからこそ第00章で<strong>「自分の環境で実際に何ができるか」を先に確かめます</strong>。前提にせず、確かめる。これがこの教材の姿勢です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>この教材のコードは、そのまま本番で使えますか?</summary>
+      <div class="qa-body">
+        <p>使えません。使ってはいけません。理由を挙げます。</p>
+        <p>ネットワークが隔離されていないので、コンテナはホストのネットワークをそのまま共有します。user namespace を使っていないので、コンテナ内の root はホストの root です。seccomp も capabilities の絞り込みもしていないので、危険なシステムコールが素通りします。<strong>これらは「作り忘れ」ではなく、学習の焦点を絞るために意図的に外したもの</strong>です。何を外したかは第09章で全部並べます。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>外部ライブラリを使わないと言っていますが、それは意地を張っているだけでは?</summary>
+      <div class="qa-body">
+        <p>実務なら意地です。学習ならそうではありません。<code>libcontainer</code> を <code>import</code> して 20 行でコンテナを起動しても、分かるのは <code>libcontainer</code> の API だけで、namespace のことは何も分かりません。</p>
+        <p>それに、この範囲では標準ライブラリだけで<strong>本当に足ります</strong>。<code>syscall</code> でシステムコールを呼び、<code>os/exec</code> で子プロセスを起こし、<code>net/http</code> でレジストリを叩き、<code>archive/tar</code> と <code>compress/gzip</code> でレイヤを展開する。無理をして避けているのではなく、素直に書いたら要らなかった、というのが実態です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>「動かして確認」の出力が自分の画面と違います。先に進んでいいですか?</summary>
+      <div class="qa-body">
+        <p>進まないでください。この教材の出力は<strong>すべて実測</strong>で、想像で書いた行は 1 つもありません。違うということは、環境か手順のどちらかが違っています。</p>
+        <p>ただし、変わって当然のものもあります。PID の値（<code>7</code> の部分）、コンテナ ID（<code>a169666dadfc</code> のような 12 桁）、起動時刻、ミリ秒の実測値です。これらは毎回変わります。変わってはいけないのは<strong>行数</strong>と<strong>構造</strong>です。<code>ps</code> が 3 行以上出たら、それは何かが効いていません。</p>
+      </div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。答えを見て「知っていた」と思うかどうかではなく、<strong>見る前に言葉にできたか</strong>で判定してください。</p>
+
+    <details class="qa"><summary>Q1. コンテナと仮想マシンの、いちばん本質的な違いは何ですか? 「軽い」以外の言葉で説明してください。</summary>
+      <div class="qa-body">
+        <p><strong>カーネルの枚数です。</strong> 仮想マシンはゲスト OS のカーネルをもう 1 枚積みます。コンテナは積みません。コンテナの中のプロセスはホストのカーネルに直接システムコールを投げています。</p>
+        <p>「軽い」はこの構造から出てくる<em>結果</em>であって、原因ではありません。起動する OS が無いから速く、カーネルを含まないからイメージが小さい。原因のほうを言えるようになってください。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q2. コンテナの中で ps を打つと 2 行しか出ないのはなぜですか? ホスト側のプロセスはどこへ行ったのですか?</summary>
+      <div class="qa-body">
+        <p>どこへも行っていません。<strong>85 個のプロセスは今この瞬間も同じマシンで動いています。</strong> ただ、コンテナのプロセスが参照しているプロセス一覧の台帳（PID 名前空間）が別物なので、そこに載っていないだけです。</p>
+        <p>ここが「隠している」との決定的な違いです。フィルタしているのではなく、そもそも別の台帳を見ています。だからホスト側からは、コンテナの中のプロセスがちゃんと見えます（別の PID 番号で）。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q3. コンテナの中の /bin/sh が PID 1 になっているのはなぜ重要なのですか?</summary>
+      <div class="qa-body">
+        <p>PID 1 は Linux にとって特別な番号で、システム全体の親（init）です。それが <code>/bin/sh</code> になっているということは、<strong>このプロセスにとっての「システム全体」がコンテナの中だけになっている</strong>ことを意味します。</p>
+        <p>実務的にも重要です。PID 1 はシグナルの扱いが特別（既定のシグナルハンドラが無効）なので、コンテナの PID 1 が <code>SIGTERM</code> を無視して <code>docker stop</code> が 10 秒待たされる、という現象がここから説明できます。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q4. alpine のイメージは圧縮 3.67 MiB、展開後 8.7 MB、516 ファイルでした。カーネルはどこにありますか?</summary>
+      <div class="qa-body">
+        <p><strong>入っていません。</strong> ホストのカーネルを使うからです。イメージに入っているのは <code>/bin</code>、<code>/lib</code>、<code>/etc</code>、<code>/usr</code> といったユーザ空間のファイルだけです。</p>
+        <p>これが「コンテナイメージは OS のイメージではない」ということの具体的な意味です。alpine のイメージは「alpine というディストリビューションのユーザ空間一式」であって、alpine のカーネルではありません。だからこの小ささで済みます。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q5. この教材の章を飛ばせないのはなぜですか? 単に著者がそう決めただけではないのですか?</summary>
+      <div class="qa-body">
+        <p>構造上の理由です。各章のコードが前章のコードの上に書かれています。第03章の <code>pivotRoot</code> は、第01章で作った「re-exec された子プロセス側」の中で呼ばれます。第04章の cgroup は、第01章の親側が子の PID を握っていることを前提にしています。</p>
+        <p>加えて、教材としての理由もあります。<strong>各章は「前章の作りかけが壊れている」ところから始まります。</strong> 第02章で名前空間を作った直後に <code>ps</code> が壊れて見え、その驚きが第03章の動機になります。飛ばすと、解決すべき問題を知らないまま解決策だけ読むことになり、記憶に残りません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q6. コンテナの起動が 12 ms、ホストでの直接実行が 3 ms でした。この 9 ms の差では何が起きていますか?</summary>
+      <div class="qa-body">
+        <p>この教材で作るものに即して言うと、overlayfs のマウント、名前空間の生成、cgroup ディレクトリの作成と PID の登録、<code>pivot_root</code>、<code>/proc</code> の貼り直し、そして終了後の後片付けです。</p>
+        <p>大事なのは、<strong>ここにゲスト OS のブートが含まれていない</strong>ことです。含まれていたら ms の桁では終わりません。9 ms は「プロセスを 1 つ起動する」ことへの上乗せであって、「OS を 1 つ起動する」時間ではありません。この差がコンテナの速さの正体です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q7. この教材が「実測にない数値は書かない」という縛りを置いているのはなぜだと思いますか?</summary>
+      <div class="qa-body">
+        <p>技術文書でいちばん危ないのが、それらしい数字の捏造だからです。「起動は約 50 ms」と書いてあっても、測ったのか、どこかで読んだのか、なんとなくそう思っているのかは、読者には区別できません。</p>
+        <p>この教材では、貼ってある出力はすべて実際に取得したものです。だから <code>ps</code> が「87 個」というホストより多い変な値も、そのまま出てきます。都合の悪い値も含めて実測だけを載せる、というのはこの教材の姿勢そのものです。<strong>そして同じ姿勢を、あなたが実装するときにも要求します</strong> — 「上限を設定できた」ではなく「上限が効いた」を確かめる、というのが第00章と第04章の主題です。</p>
+      </div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>次の 3 つを自分の言葉で言えたら、この序章は完了です。</p>
+      <ol>
+        <li>コンテナと仮想マシンの違いを「カーネルの枚数」で説明できる</li>
+        <li>3 つの細工（namespace / cgroup / pivot_root）がそれぞれ何を区切るかを言える</li>
+        <li>この教材が Linux と特権を要求する理由を説明できる</li>
+      </ol>
+      <p>そして、この出力が「何が起きている証拠なのか」を 3 つとも指させたら万全です。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh
+<span class="ps">/ #</span> ps
+<span class="out">PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    7 root      0:00 ps</span>
+<span class="ps">/ #</span> hostname
+<span class="out">mydocker</span></code></pre>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>この序章で、いちばん大きな荷物を下ろしました。<strong>「コンテナは軽量な仮想マシン」という比喩を捨てたこと</strong>です。代わりに手に入れたのは、「namespace で視界を区切り、cgroup で資源を締め、pivot_root で根を挿げ替えた、ただのプロセス」という具体的な像です。ついでに、山頂の景色も先に見ておきました。<code>ps</code> が 2 行、<code>hostname</code> が <code>mydocker</code>、<code>ls /</code> が alpine。この 3 行に向かって、これから 10 章積み上げます。</p>
+
+    <p>ただし、今のままでは 1 行も動かせません。<strong>コードを書く場所がまだ無い</strong>からです。namespace も cgroup も overlayfs も Linux カーネルの機能なので、Linux でなければ動きません。しかも特権が要ります。さらに厄介なことに、Linux ならどこでも同じように動くわけでもありません。cgroup には v1 と v2 があり、環境によってどちらが使えるかが違い、<strong>混ざっている環境すらあります</strong>。実際、この教材を書いた環境がまさにそれでした。</p>
+
+    <p>次の第00章では、この地面をならします。特権 Linux 環境を 2 つの方法（案A・案B）で用意し、そのうえで<strong>実装を 1 行も書く前に疎通実験</strong>をします。namespace は作れるか。cgroup は書けるか。書けたとして本当に効くか（ここが肝心です）。overlayfs はマウントできるか。レジストリに届くか。実際にコマンドを打って確かめ、その結果でこの教材のスコープを確定させます。技術ではなく環境が最大のリスクである、という話から始めます。</p>
+
+    <div class="chap-foot">
+      <a class="pager next" href="00-env.html"><span class="dir">次へ →</span>第00章 · Linux の中に入る</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

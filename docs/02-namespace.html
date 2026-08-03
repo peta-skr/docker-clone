@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第02章 見える世界を区切る — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第02章 / 全10章 · 層: NAMESPACE · 読了目安 3〜4時間</div>
+    <div class="eyebrow"><span>Namespace</span><span class="depth">— 視界に壁を立てる</span></div>
+    <h1>見える世界を区切る</h1>
+    <p class="lede">前章で、私たちは自分自身をもう一度起動できるようになりました。けれど生まれた子プロセスは、まだホストと同じ世界を見ています。この章では、その子に <strong>「あなたの世界はここまで」</strong> という壁を4枚立てます。ホスト名、プロセス番号、マウント、プロセス間通信。壁を立て終えたところで、<strong>1つだけどうしても壁を越えてくるもの</strong>に出会います。そこが次章の入口です。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p><code>internal/container/run.go</code> の <code>Cloneflags</code> に並ぶ4つのフラグが、それぞれ<strong>何を区切っているのか</strong>を自分の言葉で説明できるようになる。<code>Unshareflags</code> がなぜ別に要るのかも言えるようにする。仕上げに、<strong>コンテナの中で <code>hostname</code> を打つとホストと違う名前が返る</strong>ことを確認し、そのうえで <strong><code>ps</code> だけがまだホストのプロセスを見せてしまう</strong>という「謎」を自分の目で見る。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#step-1">UTS から始める — <code>hostname</code> を打つだけで違いが見える</a></li>
+        <li><a href="#step-2">PID 名前空間 — 自分が 1 番になる</a></li>
+        <li><a href="#step-3">MNT 名前空間 — マウントの見え方を区切る</a></li>
+        <li><a href="#step-4">IPC 名前空間 — 地味だが要る 4 枚目の壁</a></li>
+        <li><a href="#step-5">4つを <code>Cloneflags</code> に並べる</a></li>
+        <li><a href="#step-6">謎に出会う — <code>ps</code> だけがホストを見せる</a></li>
+      </ol>
+    </div>
+
+    <h2>名前空間とは、カーネルが持っている「見え方の台帳」</h2>
+
+    <p>まず言葉を1つだけ引き受けてください。<strong>名前空間（namespace）</strong>です。難しそうな名前ですが、やっていることはとても素朴です。</p>
+
+    <p>Linux カーネルの中には、「今このマシンのホスト名は何か」「今動いているプロセスは何番と何番か」「今どこに何がマウントされているか」といった<strong>台帳</strong>がいくつも置かれています。ふつう、この台帳はマシンに1冊ずつしかありません。誰がどこから読んでも同じ内容が返る。だから <code>hostname</code> はどのプロセスから打っても同じ答えを返しますし、<code>ps</code> はどのプロセスから打っても同じ一覧を返します。</p>
+
+    <p>名前空間というのは、<strong>この台帳を複数冊に増やして、「このプロセスはこっちの台帳を読む」と割り当てられるようにした仕組み</strong>です。それだけです。仮想マシンのようにハードウェアを真似しているわけでもなければ、カーネルをもう1つ動かしているわけでもありません。カーネルは1つのまま、<strong>台帳だけが枝分かれ</strong>します。</p>
+
+    <div class="ascii">名前空間がないとき（台帳は1冊）
+
+     プロセス A ──┐
+     プロセス B ──┼──▶ 【ホスト名の台帳】 "vm"
+     プロセス C ──┘
+
+  名前空間があるとき（台帳が2冊になり、C だけ別の冊子を見る）
+
+     プロセス A ──┐
+     プロセス B ──┴──▶ 【ホスト名の台帳 その1】 "vm"
+
+     プロセス C ─────▶ 【ホスト名の台帳 その2】 "mydocker"
+
+  C が "mydocker" と書き換えても、A と B の見る台帳は "vm" のまま。
+  カーネルは1つ。動いている CPU も1つ。増えたのは台帳だけ。</div>
+
+    <p>この「台帳が枝分かれする」という感覚を掴んでしまえば、この章の残りはただの各論です。区切れる台帳が6種類あって、私たちはそのうち4種類を使う、というだけの話になります。</p>
+
+    <p>そして大事なことを1つ。<strong>台帳は種類ごとに独立して枝分かれします。</strong> ホスト名の台帳だけ分けて、プロセス番号の台帳は共有する、ということができる。逆もできる。この「選べる」性質が、後で私たちを助けもし、悩ませもします。</p>
+
+    <h2>6種類の名前空間 — 何を区切るのか、どれを使うのか</h2>
+
+    <p>Linux が用意している名前空間のうち、コンテナを作るときに関係してくるのは次の6種類です。この教材で使うものと使わないものを、最初に正直に並べておきます。</p>
+
+    <table>
+      <tr><th>名前空間</th><th>何を区切るか</th><th>この教材で使うか</th></tr>
+      <tr><td><code>UTS</code></td><td>ホスト名・ドメイン名</td><td>✅ 使う（<code>CLONE_NEWUTS</code>）</td></tr>
+      <tr><td><code>PID</code></td><td>プロセス番号</td><td>✅ 使う（<code>CLONE_NEWPID</code>）</td></tr>
+      <tr><td><code>MNT</code></td><td>マウントの見え方</td><td>✅ 使う（<code>CLONE_NEWNS</code>）</td></tr>
+      <tr><td><code>IPC</code></td><td>プロセス間通信（共有メモリ・セマフォ）</td><td>✅ 使う（<code>CLONE_NEWIPC</code>）</td></tr>
+      <tr><td><code>NET</code></td><td>ネットワーク機器・アドレス・ルーティング</td><td>❌ 使わない（第08章で理由を書く）</td></tr>
+      <tr><td><code>USER</code></td><td>ユーザ ID / グループ ID の対応付け</td><td>❌ 使わない（第09章の発展課題）</td></tr>
+    </table>
+
+    <p>下の2行に <strong>❌</strong> が並んでいるのが見えたと思います。ここでごまかしません。<strong>この教材の <code>mydocker</code> は、ネットワークもユーザ ID も隔離していません。</strong> 4枚の壁は立ちますが、6枚ではありません。</p>
+
+    <p>「使っていないなら書かなければいいのに」と思うかもしれません。逆です。<strong>使っていないことを知らずに使うほうが危ない</strong>からです。とくにネットワークは、隔離できていないことが目に見えにくい。実際に <code>mydocker</code> の中でネットワーク機器の一覧を打ってみると、こうなります。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · 隔離できていないものを見ておく</div>
+      <p>コンテナの中から <code>ip -o addr</code> を打ちます。<code>-o</code> は1機器を1行にまとめる指定です。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'ip -o addr'
+<span class="out">1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+2: eth0    inet 192.0.2.2/24 brd 192.0.2.255 scope global eth0\       valid_lft forever preferred_lft forever</span></code></pre>
+      <p>この <code>eth0</code> の <code>192.0.2.2/24</code> は、<strong>ホストのアドレスそのもの</strong>です。コンテナ専用の仮想的なアドレスではありません。つまりコンテナは、ホストのネットワークをそのまま覗いています。ホスト名は違うのにアドレスは同じ、という中途半端な状態です。</p>
+      <p>これは壊れているのではなく、<strong>私たちが <code>CLONE_NEWNET</code> を渡していないから</strong>そうなっています。なぜ渡さなかったのか、渡すと何を追加で作らなければならなくなるのかは、<a href="08-network.html">第08章</a>でまるごと1章使って扱います。</p>
+    </div>
+
+    <p>USER 名前空間のほうも同じです。使っていません。私たちのコンテナの中の <code>root</code> は、ホストの <code>root</code> と<strong>同じ root</strong> です。ID を付け替えていないのだから当然で、これは「コンテナの中で root を取れたらホストの root も取れる」という、セキュリティ上いちばん大きな穴です。教材としてどこまで踏み込むかの線引きと、実装するとしたら何をするのかは<a href="09-beyond.html">第09章</a>に置きました。</p>
+
+    <blockquote>できていないことを「できたふり」で書かない。教材が読者に対して払える最低限の敬意は、たぶんこれだけです。<cite>この教材の方針</cite></blockquote>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · 名前空間はプロセスの属性である</div>
+      <p>名前空間は「箱」や「入れ物」ではありません。<strong>プロセスに貼られた属性</strong>です。<code>ls -l /proc/&lt;pid&gt;/ns/</code> を見ると、そのプロセスが今どの名前空間に属しているかが<strong>シンボリックリンクとして</strong>並んでいます。<code>uts</code>、<code>pid</code>、<code>mnt</code>、<code>ipc</code>、<code>net</code>、<code>user</code>… といった名前のリンクです。</p>
+      <p>リンクの先は <code>uts:[4026531838]</code> のような、番号の付いた擬似的な名前になっています。この番号が<strong>台帳の識別子</strong>です。2つのプロセスの同じ種類のリンクが同じ番号を指していれば、その2つは同じ台帳を見ている。違う番号なら別の台帳を見ている。判定はそれだけです。</p>
+      <p>この「リンクとして触れる」性質は飾りではありません。<strong>ファイルとして開ける</strong>ということは、開いたまま持ち回れるということです。あとで <code>mydocker exec</code>（実行中のコンテナにもう1つコマンドを送り込む機能）を作るとき、私たちはまさにこのリンクを <code>os.Open</code> で開いて、その fd を <code>setns</code> というシステムコールに渡します。「あの台帳に、私も加えてくれ」という頼み方です。Step 4 で実物のコードを見ます。</p>
+      <p>もう1つ。名前空間には<strong>明示的な破棄がありません</strong>。参照するプロセスが1つもいなくなり、開いたままのリンクも無くなった時点で、カーネルが黙って回収します。だから私たちのコードには「名前空間を閉じる」処理がどこにも出てきません。<code>free</code> の要らないメモリのようなものだと思ってください。</p>
+    </div>
+
+    <h2>どこから手を付けるか — いちばん確かめやすい壁から</h2>
+
+    <p>4枚の壁を立てるにあたって、順番には意味があります。<strong>効いたかどうかが一目で分かるものから</strong>やります。</p>
+
+    <p>この方針は趣味ではありません。カーネルの機能をいじるときの一般的な護身術です。名前空間のような機能は、<strong>効いていないのにエラーも出さない</strong>ことがあります。フラグを1つ書き忘れても、プログラムは何食わぬ顔で走ってしまう。だから「効いた／効いていない」を1コマンドで判定できる足場を、最初に確保しておきます。</p>
+
+    <p>その足場に最適なのが UTS です。<code>hostname</code> と打つだけで答えが返る。ホストで打った答えとコンテナで打った答えが違えば、壁は立っている。それだけです。</p>
+
+    <div class="ascii">この章で立てる壁と、効いたことの確かめ方
+
+  Step 1  UTS  ホスト名          →  hostname が違う答えを返す      ★いちばん明快
+  Step 2  PID  プロセス番号      →  自分の PID が 1 になる
+  Step 3  MNT  マウントの見え方  →  ホスト側のマウント数が増えない
+  Step 4  IPC  共有メモリ等      →  （目には見えにくい。理屈で押さえる）
+  ────────────────────────────────────────────────────────────
+  Step 6  ???  ps の一覧         →  ★ここだけ、壁を立てても直らない</div>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>UTS から始める — <code>hostname</code> を打つだけで違いが見える</h2>
+
+    <p>UTS という名前は <strong>UNIX Time-sharing System</strong> の頭文字です。由来は歴史的なもので、意味を追っても得るものはありません。区切られるのは<strong>ホスト名とドメイン名の2つだけ</strong>だと覚えてしまってください。6種類のなかでいちばん守備範囲が狭く、いちばん理解しやすい名前空間です。</p>
+
+    <p>守備範囲が狭いことは弱点ではなく利点です。<strong>1つの台帳に1つの文字列しか載っていない</strong>ので、枝分かれしたかどうかが文字列の比較で分かる。まずホスト側で名前を確認しておきます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · ホスト側のホスト名</div>
+      <pre class="term"><code><span class="ps">$</span> hostname
+<span class="out">vm</span></code></pre>
+      <p>この環境のホスト名は <code>vm</code> です。あなたの環境では別の文字列が返るはずですが、それで構いません。大事なのは「ホスト側では <strong>これ</strong> が返る」という基準線を持つことです。</p>
+    </div>
+
+    <h3>ホスト名を変えるシステムコール</h3>
+
+    <p>次に、コンテナの中でホスト名を変える側のコードを見ます。<code>internal/container/init.go</code> の <code>Init</code> 関数です。この関数は<strong>新しい名前空間の中で走る</strong>ことに注意してください。前章で作った re-exec の、その「子」の側です。</p>
+
+    <div class="file-tag">internal/container/init.go</div>
+<pre><code><span class="cm">// Init は新しい名前空間の中（＝コンテナの PID 1）で走る処理である。</span>
+<span class="cm">//</span>
+<span class="cm">// ここに来た時点で、親が Cloneflags で作った namespace の中にいる。</span>
+<span class="cm">// あとは「地面を入れ替えて、目的のコマンドに成り代わる」だけ。</span>
+<span class="cm">//</span>
+<span class="cm">//  1. 親の合図を待つ（cgroup に入れてもらうまで動かない）</span>
+<span class="cm">//  2. ホスト名を変える（UTS 名前空間の効果を目に見える形にする）</span>
+<span class="cm">//  3. pivot_root で root を挿げ替える</span>
+<span class="cm">//  4. /proc /sys /dev を貼り直す</span>
+<span class="cm">//  5. syscall.Exec で目的のコマンドに成り代わる（★戻ってこない）</span>
+<span class="kw">func</span> <span class="ty">Init</span>(args <span class="ty">InitArgs</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> err := waitForParent(); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+
+	<span class="kw">if</span> args.Hostname != <span class="st">""</span> {
+		<span class="kw">if</span> err := syscall.<span class="ty">Sethostname</span>([]<span class="kw">byte</span>(args.Hostname)); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"ホスト名を設定できませんでした: %w"</span>, err)
+		}
+	}
+
+	<span class="cm">// …（3〜5 は第03章で読む）</span>
+}</code></pre>
+
+    <p>ホスト名を変えている部分は、たった5行です。逐行で見ます。</p>
+
+    <ul>
+      <li><code>args.Hostname != ""</code> — 空文字なら何もしません。ホスト名を指定せずに起動する道も残しておくためです。</li>
+      <li><code>syscall.Sethostname([]byte(args.Hostname))</code> — これが本体です。<code>sethostname(2)</code> というシステムコールを直接呼んでいます。Go の <code>syscall</code> パッケージは、こういうカーネルの入口をほぼそのままの名前で持っています。引数が <code>string</code> ではなく <code>[]byte</code> なのは、システムコール側がバイト列と長さを受け取る形をしているからです。</li>
+      <li>失敗したらエラーを返して<strong>起動を止めます</strong>。ホスト名が変えられないということは <strong>UTS 名前空間が効いていない</strong>可能性が高く、黙って続けると「壁が立っていないコンテナ」ができあがってしまいます。</li>
+    </ul>
+
+    <p>ここで一度、立ち止まって考えてほしいことがあります。<strong>この <code>Sethostname</code> は、名前空間とは何の関係もない、ただの普通のシステムコールです。</strong> 昔からある、マシンのホスト名を変える呼び出しです。</p>
+
+    <p>ではなぜ、これを呼んでもホスト側のホスト名が変わらないのか。<strong>このプロセスが読み書きする台帳が、すでに枝分かれしているから</strong>です。同じシステムコールが、属している名前空間によって別の台帳を書き換える。<strong>アプリケーション側のコードは何も変わらない</strong>のに、効果の及ぶ範囲だけが変わる。これが名前空間という仕組みのいちばん美しいところだと私は思っています。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · UTS 名前空間なしで Sethostname を呼ぶとどうなるか</div>
+      <p>もし <code>Cloneflags</code> から <code>CLONE_NEWUTS</code> を落としたまま、このコードを動かしたらどうなるでしょうか。</p>
+      <p>答えは <strong>「成功して、ホスト側のホスト名が変わる」</strong> です。エラーは出ません。root で走っているので権限も足ります。カーネルは言われたとおり、<strong>ホストの台帳</strong>を書き換えます。あなたのターミナルのプロンプトが、次にログインしたときから <code>mydocker</code> になっているかもしれません。</p>
+      <p>怖いのは「エラーにならない」ことです。名前空間まわりのバグは、たいていこの形をしています。<strong>失敗ではなく、範囲の取り違えとして現れる。</strong> だからこそ Step 1 で「ホスト側で <code>hostname</code> を打っておく」という基準線を取ったのでした。壁を立てたあとで、ホスト側がまだ <code>vm</code> のままであることを、必ず確かめてください。</p>
+    </div>
+
+    <h3>実際に、違う答えが返る</h3>
+
+    <p>完成した <code>mydocker</code> で確かめます。実装はまだ途中ですが、この章の終わりに何が手に入るのかを先に見ておきましょう。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · コンテナの中のホスト名</div>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh
+<span class="out">/ # </span>hostname
+<span class="out">mydocker</span></code></pre>
+      <p>そしてコンテナを抜けて、ホストで同じコマンドを打ちます。</p>
+      <pre class="term"><code><span class="ps">$</span> hostname
+<span class="out">vm</span></code></pre>
+      <p><strong>台帳が2冊に分かれています。</strong> コンテナの中で書き換えた <code>mydocker</code> は、ホスト側の台帳には1文字も届いていません。壁の1枚目が立ちました。</p>
+    </div>
+
+    <p>たった1行の文字列が違うだけですが、これは決定的な一歩です。<strong>「同じカーネルの上で、プロセスによって世界の見え方が違う」</strong>という現象を、あなたは今、自分の手で起こしました。残りの3枚は、区切る対象が変わるだけで、原理はこれと完全に同じです。</p>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>PID 名前空間 — 自分が 1 番になる</h2>
+
+    <p>2枚目の壁は<strong>プロセス番号</strong>です。ここが名前空間のなかでいちばん面白く、いちばん誤解されやすいところです。</p>
+
+    <p>ふつう、Linux のプロセス番号（PID）はマシン全体で一意です。1 番は起動時に最初に立ち上がるプロセス（<code>init</code> や <code>systemd</code>）で、あとは順に大きな番号が振られていく。同じ番号のプロセスが2つ存在することはありません。</p>
+
+    <p>PID 名前空間は、この<strong>番号の台帳を枝分かれさせます</strong>。枝分かれした先では、番号がまた 1 から振り直されます。つまり<strong>コンテナの中で最初に走るプロセスが、そのコンテナにとっての PID 1 になる</strong>。</p>
+
+    <h3>まず素朴に試して、失敗する</h3>
+
+    <p>いきなりコードを書く前に、<code>unshare</code> というコマンドで手触りを掴みます。これは「新しい名前空間を作って、その中でコマンドを走らせる」ためのコマンドラインツールです。私たちがこれから Go で書こうとしていることを、コマンド1つでやってくれます。</p>
+
+    <p>素朴に考えると、こう打てば PID 1 になれそうです。<code>$$</code> はシェルが自分自身の PID に展開する記法です。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · 素朴な試み</div>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 25171</span></code></pre>
+      <p><strong>1 ではありません。</strong> 25171 という、いかにもホスト側の連番らしい数字が返ってきました。<code>--pid</code> を渡したのに、PID 名前空間が効いていないように見えます。</p>
+    </div>
+
+    <p>ここで「<code>unshare</code> が壊れている」と結論づけないでください。効いています。効いているのに 1 にならない。この食い違いには、はっきりした理由があります。</p>
+
+    <p><strong>PID 名前空間は、それを作ったプロセス自身には適用されません。</strong></p>
+
+    <p>理由を考えると納得できます。すでに走っているプロセスの番号を途中で 1 に付け替えたら、そのプロセスを <code>wait</code> している親や、PID を握っている他のプロセスとの辻褄が合わなくなります。番号は<strong>生まれたときに1回だけ決まる</strong>もので、後から変えられるものではない。だからカーネルは、こう振る舞います。</p>
+
+    <div class="ascii">PID 名前空間が「誰に」効くのか
+
+  unshare --pid sh
+  ────────────────
+   ① unshare が新しい PID 台帳を作る
+        └─ ただし unshare 自身の番号は、古い台帳のまま（25171 など）
+   ② その後 fork で生まれた子から、新しい台帳の番号が付く
+        └─ 最初に生まれた子が PID 1
+
+  つまり「作った本人」ではなく「作ったあとに生まれた子」が 1 番になる。
+  --fork は「もう1段 fork してから実行する」という指定。これで1番が取れる。</div>
+
+    <p><code>unshare</code> には、まさにこのための <code>--fork</code> というオプションがあります。付けてみます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · --fork を足す</div>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 1</span></code></pre>
+      <p><strong>1 になりました。</strong> フラグは何も変えていません。変えたのは「誰が実行するか」だけです。</p>
+    </div>
+
+    <p>この 25171 と 1 の対比は、この章でいちばん覚えて帰ってほしい実験です。<strong>名前空間は「作る」だけでは不十分で、「作ってから生まれる」必要がある。</strong></p>
+
+    <p>そして、これはあなたが前章でさんざん苦労した re-exec パターンが、なぜあの形をしていたかの答えでもあります。<code>run.go</code> のコメントにも同じことが書いてあります。</p>
+
+    <div class="file-tag">internal/container/run.go</div>
+<pre><code><span class="cm">// 素朴に考えると「unshare して、そのあと目的のコマンドを exec すればいい」と思える。ところが:</span>
+<span class="cm">//</span>
+<span class="cm">//   - PID 名前空間は unshare を呼んだプロセス自身には適用されない。</span>
+<span class="cm">//     適用されるのは **その後に作られた子プロセス** から。「自分が PID 1 になる」ことはできない</span>
+<span class="cm">//   - Go のランタイムはマルチスレッドなので、プロセス内でスレッド単位の unshare を素直に扱えない</span>
+<span class="cm">//</span>
+<span class="cm">// そこで /proc/self/exe（＝自分自身の実行ファイル）を "init" という別の顔で起動する。</span>
+<span class="cm">// 新しい名前空間はこの起動と同時に生まれ、子は生まれながらにして PID 1 になる。</span></code></pre>
+
+    <p><strong>「生まれながらにして PID 1」</strong>。これが re-exec の存在理由です。私たちは <code>unshare --fork</code> の <code>--fork</code> の部分を、Go で自前でやっているのです。</p>
+
+    <h3>★同じプロセスが、番号を2つ持つ</h3>
+
+    <p>ここから先が、PID 名前空間でいちばん頭がねじれるところです。ゆっくり行きます。</p>
+
+    <p>コンテナの中のプロセスが PID 1 になったからといって、<strong>ホスト側からそのプロセスが見えなくなるわけではありません。</strong> ホストの台帳にも、ちゃんと載っています。載っているけれど、<strong>別の番号で</strong>載っています。</p>
+
+    <p>実測で見ます。<code>sleep 20</code> を動かすコンテナを起動して、ホスト側の一覧（<code>mydocker ps</code>）と、コンテナの中の一覧（<code>mydocker exec</code> 経由で <code>ps</code>）を並べます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · 外から見た番号と、中から見た番号</div>
+      <p>まずホスト側から。<code>mydocker ps</code> は、実行中のコンテナを<strong>ホスト側の PID</strong> つきで並べます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker ps
+<span class="out">CONTAINER ID   IMAGE                                 COMMAND    PID     STATUS   CREATED
+0c1be9ad663a   mirror.gcr.io/library/alpine:latest   sleep 20   16144   Up       0s
+合計 1 件</span></code></pre>
+      <p>ホストから見ると、この <code>sleep 20</code> は <strong>16144 番</strong>です。次に、同じコンテナの中に入って <code>ps</code> を打ちます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker exec 0c1be9ad663a /bin/sh -c 'hostname; ps'
+<span class="out">mydocker
+PID   USER     TIME  COMMAND
+    1 root      0:00 sleep 20
+    8 root      0:00 /bin/sh -c hostname; ps
+   15 root      0:00 ps</span></code></pre>
+      <p>中から見ると、同じ <code>sleep 20</code> が <strong>1 番</strong>です。</p>
+    </div>
+
+    <p>16144 と 1。これは<strong>2つのプロセスではありません</strong>。1つのプロセスです。メモリ上に <code>task_struct</code> は1つしかなく、CPU 時間も1つ分しか消費していません。ただ、<strong>読む台帳によって振られている番号が違う</strong>だけです。</p>
+
+    <div class="ascii">同じ1つの sleep 20 が、番号を2つ持っている
+
+  【ホストの PID 名前空間】                【コンテナの PID 名前空間】
+   PID 1      systemd                        （この台帳は空から始まった）
+   PID …      （ホストのいろいろ）
+   PID 16144  sleep 20   ←── 同一のプロセス ──→   PID 1   sleep 20
+                                                  PID 8   /bin/sh -c hostname; ps
+                                                  PID 15  ps
+
+  ・ホスト側からは 16144 として見え、kill もできる（親は子を殺せる）
+  ・コンテナの中からは 1 としてしか見えない。16144 という番号は存在すらしない
+  ・逆にコンテナの中からホストの systemd(1) を kill することはできない。
+    そもそも番号が割り振られていないので、指し示す手段がない
+
+  ★入れ子は一方通行。親の台帳は子を見られるが、子の台帳は親を見られない。</div>
+
+    <p>この一方通行の関係が、PID 名前空間の隔離の本質です。<strong>コンテナからホストのプロセスを触れないのは、権限で禁じているからではありません。番号として存在しないから、指し示す言葉がないのです。</strong> 鍵をかけているのではなく、住所が書けない。</p>
+
+    <p>ついでに、上の <code>ps</code> の出力をよく見てください。<code>1</code> の次が <code>8</code> で、その次が <code>15</code> です。1、2、3 と続いていません。コンテナの中でも番号は消費されており、シェルが内部で使った番号などが飛んでいます。<strong>コンテナの中の PID も、ただの連番</strong>だということです。特別なことは何もしていません。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · PID 1 という特別な役目</div>
+      <p>PID 1 は、Linux では特別扱いされます。教材の範囲を越えますが、知っておくと後で困りません。</p>
+      <p>1つめ。<strong>PID 1 が終了すると、その PID 名前空間の中の全プロセスが道連れで終了させられます。</strong> カーネルが <code>SIGKILL</code> を配ります。だから <code>docker run</code> したコンテナは、指定したコマンドが終わると中で何が動いていようと丸ごと終わる。これは実装の都合ではなく、カーネルの規則です。</p>
+      <p>2つめ。<strong>PID 1 は、シグナルのデフォルト動作が効きません。</strong> ふつうのプロセスは <code>SIGTERM</code> を受けると、ハンドラを書いていなくても終了します。PID 1 はハンドラを登録していないシグナルを<strong>無視</strong>します。うっかり <code>init</code> を殺してシステムを止めないための保護です。コンテナで「<code>Ctrl-C</code> が効かない」という現象の多くはこれが原因です。</p>
+      <p>3つめ。<strong>親を失ったプロセス（孤児）は PID 1 に引き取られます。</strong> 引き取ったプロセスは、その子の終了を <code>wait</code> で回収する責任を負います。回収しないとゾンビが溜まる。本物の <code>init</code> はこの仕事を淡々とやりますが、私たちが PID 1 に据えるのは <code>/bin/sh</code> や <code>sleep</code> です。ゾンビの回収まではしてくれません。この教材ではそこまで踏み込みませんが、「<code>docker run --init</code> というオプションが何のためにあるのか」の答えがこれです。</p>
+    </div>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>MNT 名前空間 — マウントの見え方を区切る</h2>
+
+    <p>3枚目は<strong>マウント</strong>です。区切られる台帳は「どこに何がマウントされているか」の一覧、いわゆる<strong>マウント表</strong>です。</p>
+
+    <p>フラグの名前だけ注意してください。他は <code>CLONE_NEWUTS</code>、<code>CLONE_NEWPID</code> と綺麗に揃っているのに、マウントだけ <strong><code>CLONE_NEWNS</code></strong> です。<code>NEWMNT</code> ではありません。<code>NS</code> は namespace の略で、これは<strong>いちばん最初に実装された名前空間</strong>だからです。当時は他に名前空間がなく、「名前空間といえばマウントのこと」だったので、区別のための接尾辞が付きませんでした。歴史的事故です。覚えるしかありません。</p>
+
+    <p>ホスト側のマウント表を見ておきます。<code>/proc/mounts</code> が現在のマウント一覧で、1行が1マウントです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · ホストのマウント数を数えておく</div>
+      <pre class="term"><code><span class="ps">$</span> wc -l &lt; /proc/mounts
+<span class="out">22</span></code></pre>
+      <p>この環境では 22 行でした。これも Step 1 の <code>hostname</code> と同じ、<strong>基準線</strong>です。この章の実験を全部やり終えたあとで、もう一度数えて 22 に戻っていれば「漏れていない」。増えていたら「漏れた」。判定はこれだけです。</p>
+    </div>
+
+    <p>なぜマウントを区切る必要があるのか。理由は次章の予告にもなります。私たちはこれから、コンテナの中で<strong>たくさんマウントします</strong>。イメージを重ねた <code>overlay</code> を根として貼り、<code>/proc</code> を貼り、<code>/sys</code> を貼り、<code>/dev</code> に <code>tmpfs</code> を敷きます。これらが全部ホストのマウント表に載ったら、コンテナを1つ起動するたびにホストのマウント表が数行ずつ伸びていくことになります。</p>
+
+    <div class="ascii">MNT 名前空間なし / あり
+
+  【なし】コンテナが増えるたびにホストのマウント表が伸びる
+    ホストのマウント表: 22 行
+      → コンテナ起動      : 26 行  （overlay, proc, sys, dev が載る）
+      → もう1つ起動       : 30 行
+      → 異常終了で残る    : 30 行のまま  ★誰も片付けない
+      → 数日後            : 数百行  ★df も mount もまともに読めない
+
+  【あり】枝分かれしたマウント表の上で好きなだけマウントする
+    ホストのマウント表 : 22 行 ────────────── 22 行（変わらない）
+                          └─ 枝分かれ ─▶ コンテナのマウント表
+                                          overlay を根に、proc, sys, dev を追加
+                                          プロセスが全部終わると台帳ごと消える</div>
+
+    <p>右側の <strong>「台帳ごと消える」</strong> が効きます。名前空間には明示的な破棄がなく、参照するプロセスが消えれば回収される。つまり<strong>コンテナの中でやったマウントは、コンテナが終わった時点で自動的に片付きます。</strong> 私たちが <code>umount</code> を書いて回る必要がない。これは実装量の削減であると同時に、<strong>異常終了しても散らからない</strong>という信頼性でもあります。</p>
+
+    <h3>フラグを1つ書くだけでは足りない</h3>
+
+    <p>さて、ここで <code>run.go</code> の該当箇所を先に覗きます。<code>Cloneflags</code> の下に、もう1つ見慣れないフィールドがあります。</p>
+
+    <div class="file-tag">internal/container/run.go</div>
+<pre><code>	cmd.SysProcAttr = &amp;syscall.<span class="ty">SysProcAttr</span>{
+		<span class="ty">Cloneflags</span>: syscall.<span class="ty">CLONE_NEWUTS</span> | <span class="cm">// ホスト名</span>
+			syscall.<span class="ty">CLONE_NEWPID</span> | <span class="cm">// プロセス番号</span>
+			syscall.<span class="ty">CLONE_NEWNS</span> | <span class="cm">// マウント</span>
+			syscall.<span class="ty">CLONE_NEWIPC</span>, <span class="cm">// プロセス間通信</span>
+		<span class="cm">// ⚠ これを忘れると、コンテナ内で行ったマウントがホスト側にも伝播する。</span>
+		<span class="cm">//    pivot_root が EINVAL で落ちる原因にもなる。「なぜか動かない」の筆頭。</span>
+		<span class="ty">Unshareflags</span>: syscall.<span class="ty">CLONE_NEWNS</span>,
+	}</code></pre>
+
+    <p><code>CLONE_NEWNS</code> が <strong>2回</strong>書かれています。<code>Cloneflags</code> にも、<code>Unshareflags</code> にも。重複でも書き間違いでもありません。この2つは<strong>別の意味</strong>を持っています。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · syscall.SysProcAttr の Cloneflags と Unshareflags の違い</div>
+      <p><code>syscall.SysProcAttr</code> は、Go の <code>os/exec</code> で子プロセスを起動するときに「OS 固有の細かい注文」を書くための構造体です。Linux 版にはたくさんフィールドがありますが、この教材で使うのは2つだけです。</p>
+      <p><strong><code>Cloneflags</code></strong> は、<strong><code>clone(2)</code> システムコールに渡すフラグ</strong>です。<code>clone</code> は「プロセスを作る」システムコールで、<code>fork</code> の細かい版だと思ってください。ここにフラグを並べると、<strong>子プロセスが生まれるまさにその瞬間に、新しい名前空間が一緒に作られます</strong>。「生まれながらにして」を実現しているのはこのフィールドです。</p>
+      <p><strong><code>Unshareflags</code></strong> は違います。こちらは Go のランタイムが、<strong>子プロセス側で、目的のプログラムを exec する直前に <code>unshare(2)</code> を呼んでくれる</strong>という指定です。<code>clone</code> と同時ではなく、<strong>生まれたあと</strong>にもう1回名前空間を分ける。</p>
+      <p>では、なぜ <code>CLONE_NEWNS</code> だけ両方に要るのか。<code>Cloneflags</code> だけでも、マウント名前空間そのものは確かに新しく作られます。ところが、<strong>新しく作られたマウント名前空間は、親のマウント表を「複製」した状態で始まり、しかも複製元との間に「伝播」の関係が残っている</strong>のです。伝播が残っていると、子でマウントしたものが親にも伝わってしまう。<code>Unshareflags</code> でもう一度 <code>unshare</code> することで、この伝播の関係を確実に断ち切ります。</p>
+      <p>「なぜ2回やる必要があるのか、1回で済まないのか」と思うのは正しい感覚です。厳密に言えば、伝播を切る方法は他にもあります（次の LINUX メモを読んでください）。ただ <code>Unshareflags</code> を書いておくのが、Go から扱ううえでいちばん確実で、いちばん短い。runc をはじめ実運用のコンテナランタイムも、形は違えど同じ「2段構え」をしています。</p>
+    </div>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · Unshareflags を忘れると、ホストのマウントが増えていく</div>
+      <p><code>Unshareflags: syscall.CLONE_NEWNS</code> の1行を落としても、<strong>プログラムはエラーを出しません</strong>。コンテナは起動し、コマンドは走り、終了します。何も起きていないように見えます。</p>
+      <p>起きているのはホスト側です。コンテナの中で貼った <code>overlay</code> や <code>/proc</code> が、伝播の関係を通って<strong>ホストのマウント表にも載ります</strong>。そしてコンテナが終わっても、ホスト側に載ったぶんは<strong>消えません</strong>。コンテナを起動するたびに、ホストのマウント表が伸び続けます。</p>
+      <p>症状は忘れた頃に出ます。<code>mount</code> や <code>df</code> の出力が数百行になって読めなくなる。<code>overlay</code> の <code>lowerdir</code>（＝イメージの実体）が掴まれたままになって消せなくなる。さらに悪いことに、伝播が残ったままだと <strong><code>pivot_root</code> が <code>EINVAL</code> で落ちます</strong>。第03章でいちばん最初にぶつかるエラーがこれです。</p>
+      <p>だから <code>run.go</code> のコメントには「<strong>『なぜか動かない』の筆頭</strong>」と書いてあります。この1行は、書き忘れても叱ってくれない種類の1行です。</p>
+      <p>確かめ方は簡単です。実験の前後で <code>wc -l &lt; /proc/mounts</code> を打ち、数が戻っていることを見る。この教材の E2E テストにも同じ項目が入っています。<strong>「テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）」</strong>という検査です。</p>
+    </div>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · マウントの伝播（shared subtree）</div>
+      <p>いま「伝播」と言ったものの正体を、もう少しだけ開けておきます。第03章でこれを自分で切ることになるので、名前だけでも通しておくと楽です。</p>
+      <p>Linux のマウントには、<strong>伝播タイプ</strong>という属性が付いています。「このマウントポイントの下で起きたマウント／アンマウントを、他のマウント名前空間にも伝えるかどうか」を決める設定です。主なものは4つ。</p>
+      <ul>
+        <li><strong>shared</strong> — 双方向に伝わる。こちらでマウントすると向こうにも現れ、向こうでマウントするとこちらにも現れる</li>
+        <li><strong>slave</strong> — 一方向。親から子へは伝わるが、子から親へは伝わらない</li>
+        <li><strong>private</strong> — どちらにも伝わらない。完全に独立</li>
+        <li><strong>unbindable</strong> — private に加えて、bind mount の元にすることも禁止される</li>
+      </ul>
+      <p>問題は、<strong>現代の Linux ディストリビューションの多くが、<code>/</code> を shared にして起動する</strong>ことです（<code>systemd</code> がそうします）。shared は便利だからです。たとえば USB メモリを挿したとき、その自動マウントが全部の名前空間に伝わってほしい、という要求は自然です。</p>
+      <p>ところが私たちにとっては、これが<strong>そのまま漏れ口</strong>になります。<code>CLONE_NEWNS</code> で新しいマウント名前空間を作っても、複製されたマウント表の各エントリは shared の関係を引き継いでいます。子でマウントすると、shared の線を伝って親にも現れる。名前空間は分かれているのに、内容が同期してしまう。</p>
+      <p>切り方は2つあります。1つは <code>Unshareflags</code>（この Step で見たもの）。もう1つは、子プロセスの中から明示的に <code>/</code> を private に付け替えることです。私たちのコードは<strong>両方やっています</strong>。<code>init.go</code> の <code>pivotRoot</code> の1行目が後者で、<code>syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, "")</code> という呼び出しです。<code>MS_REC</code> は「配下のマウント全部に再帰的に」という指定。第03章で逐行に読みます。</p>
+      <p>「両方やるのは冗長では」と思うかもしれません。冗長です。そして<strong>冗長にしておくべき箇所</strong>です。ここが破れたときの症状（ホストのマウント表がじわじわ伸びる）は、発見が遅れるほど回復が面倒になる種類のものだからです。</p>
+    </div>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>IPC 名前空間 — 地味だが要る 4 枚目の壁</h2>
+
+    <p>4枚目は <strong>IPC</strong>、プロセス間通信です。正直に言って、この章でいちばん地味です。動かして「おおっ」となる瞬間がありません。それでも入れる理由を書きます。</p>
+
+    <p>IPC 名前空間が区切るのは、<strong>System V IPC</strong> と呼ばれる古い仕組みの3点セットと、<strong>POSIX メッセージキュー</strong>です。</p>
+
+    <table>
+      <tr><th>仕組み</th><th>何をするもの</th></tr>
+      <tr><td>共有メモリ（shared memory）</td><td>複数プロセスが同じメモリ領域を直接読み書きする。いちばん速いプロセス間通信</td></tr>
+      <tr><td>セマフォ（semaphore）</td><td>「今この資源を使っているのは誰か」を数で管理する。排他制御の道具</td></tr>
+      <tr><td>メッセージキュー（message queue）</td><td>プロセス間で構造化されたメッセージを送り合う待ち行列</td></tr>
+    </table>
+
+    <p>この3つには共通の特徴があります。<strong>ファイルシステムの外に住んでいる</strong>ということです。共有メモリの領域は <code>/tmp/xxx</code> のようなパスを持ちません。カーネルの中の、パスとは別の名前空間（この文脈では「識別子の一覧」くらいの意味）に、<strong>キー</strong>と <strong>ID</strong> だけで登録されています。</p>
+
+    <div class="ascii">なぜ IPC だけ別の壁が要るのか
+
+  ファイルを介した通信                     System V IPC
+  ─────────────────────                   ─────────────────
+   プロセス A ──▶ /tmp/sock ◀── B          プロセス A ──▶ key 0x1234 ◀── B
+                    ↑                                        ↑
+        パスがある → MNT の壁で隠せる        パスがない → MNT の壁は無力
+                                                     ↓
+                                             IPC 名前空間が要る
+
+  ★MNT / PID / UTS の壁を3枚立てても、この経路だけは素通しのまま残る。</div>
+
+    <p>つまり、こういうことです。<strong>MNT 名前空間でファイルシステムをどれだけ隔離しても、共有メモリの経路は塞がりません。</strong> パスを持たないものは、パスの見え方を変えても隠れないからです。</p>
+
+    <p>具体的に何が困るか。3つ挙げます。</p>
+
+    <ul>
+      <li><strong>意図しない通信路が残る。</strong> コンテナの中のプロセスと、ホストのプロセスが、共有メモリ越しに繋がってしまう可能性があります。ファイルは1つも共有していないのに、です。「隔離したつもり」がいちばん危ない状態です。</li>
+      <li><strong>キーの衝突が起きる。</strong> System V IPC のキーは、アプリケーションが決め打ちの数値を使うことが珍しくありません。同じイメージから2つコンテナを起動したら、両方が同じキーを取りに行って、片方が「すでに存在します」で起動に失敗する。コンテナが増えると再現する、たちの悪いバグです。</li>
+      <li><strong>片付かない。</strong> System V IPC のオブジェクトは、作ったプロセスが死んでも<strong>残ります</strong>。明示的に消すまでカーネルに居座る。名前空間で囲っておけば、名前空間ごと消えるときに一緒に回収されます。ファイルの後始末と同じ話が、ここでも効いてきます。</li>
+    </ul>
+
+    <p>3つめの理由は、Step 3 の「台帳ごと消える」とまったく同じ形をしています。<strong>名前空間で囲うと、後始末が自動になる。</strong> 隔離のためだけでなく、掃除のために壁を立てる、という見方をしておくと、この先の章でも見通しが良くなります。</p>
+
+    <p>フラグは <code>CLONE_NEWIPC</code>。<code>Cloneflags</code> に <code>|</code> で足すだけです。追加のコードは1行も要りません。<strong>コストがほぼゼロで、塞げる穴が1つ増える。</strong> 入れない理由がありません。</p>
+
+    <h3>名前空間を「開いて、参加する」— setns</h3>
+
+    <p>UTS・PID・IPC が揃ったところで、これらを実際に<strong>ファイルとして開いて使っている</strong>コードを見ておきます。<code>mydocker exec</code>、つまり実行中のコンテナにもう1つコマンドを送り込む機能の中身です。</p>
+
+    <p>この機能は、新しい名前空間を<strong>作る</strong>のではなく、既存の名前空間に<strong>参加します</strong>。「LINUX メモ · 名前空間はプロセスの属性である」で予告した <code>/proc/&lt;pid&gt;/ns/</code> のリンクが、ここで実物として登場します。</p>
+
+    <div class="file-tag">internal/container/run.go</div>
+<pre><code>	<span class="cm">// pid 名前空間への setns は「呼び出し元自身」ではなく「これから作る子」に効く。</span>
+	<span class="cm">// つまりこの後の cmd.Start() で生まれる子が、コンテナの PID 名前空間に入る。</span>
+	<span class="kw">for</span> _, ns := <span class="kw">range</span> []<span class="kw">struct</span> {
+		name <span class="kw">string</span>
+		flag <span class="kw">int</span>
+	}{
+		{<span class="st">"uts"</span>, syscall.<span class="ty">CLONE_NEWUTS</span>},
+		{<span class="st">"ipc"</span>, syscall.<span class="ty">CLONE_NEWIPC</span>},
+		{<span class="st">"pid"</span>, syscall.<span class="ty">CLONE_NEWPID</span>},
+	} {
+		path := filepath.<span class="ty">Join</span>(<span class="st">"/proc"</span>, fmt.<span class="ty">Sprint</span>(st.PID), <span class="st">"ns"</span>, ns.name)
+		f, err := os.<span class="ty">Open</span>(path)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="st">1</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"%s を開けませんでした: %w"</span>, path, err)
+		}
+		_, _, errno := syscall.<span class="ty">Syscall</span>(sysSetns, f.<span class="ty">Fd</span>(), <span class="kw">uintptr</span>(ns.flag), <span class="st">0</span>)
+		f.<span class="ty">Close</span>()
+		<span class="kw">if</span> errno != <span class="st">0</span> {
+			<span class="kw">return</span> <span class="st">1</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"%s 名前空間に参加できませんでした: %v"</span>, ns.name, errno)
+		}
+	}</code></pre>
+
+    <p>読みどころは3つです。</p>
+
+    <ul>
+      <li><code>filepath.Join("/proc", fmt.Sprint(st.PID), "ns", ns.name)</code> — 組み立てているのは <code>/proc/16144/ns/uts</code> のようなパスです。<code>st.PID</code> は、状態ファイルに記録しておいた<strong>ホスト側の</strong> PID。中から見た 1 ではなく、外から見た 16144 のほうを使っています。ホスト側で走っているコードなので当然です。</li>
+      <li><code>os.Open(path)</code> — <strong>名前空間をファイルとして開いています。</strong> ここが気持ちのいいところです。カーネルの中の抽象的な「台帳」に、ファイルディスクリプタという普通のハンドルで手が届く。Linux の「すべてはファイル」という思想が、こんなところにも通っています。</li>
+      <li><code>syscall.Syscall(sysSetns, f.Fd(), uintptr(ns.flag), 0)</code> — <code>setns(2)</code> を直接呼び出しています。「この fd が指す名前空間に参加させてくれ」という頼み方です。第2引数のフラグは「参加させようとしているのが確かに UTS 名前空間であること」をカーネルに検算させるための安全装置で、種類が違えばエラーになります。</li>
+    </ul>
+
+    <p>そして、リストに <strong><code>mnt</code> が入っていない</strong>ことに気づいたでしょうか。UTS・IPC・PID の3つだけです。これには理由があり、しかも<strong>妥協</strong>です。<code>run.go</code> の <code>Exec</code> のコメントが、その妥協をそのまま書いています。<strong>マウント名前空間への <code>setns</code> は呼び出し元がシングルスレッドでないと通らず、Go のランタイムは常にマルチスレッドなので満たせない</strong>——だから <code>exec</code> ではマウント名前空間だけは新しく作り、同じ <code>merged</code> ディレクトリを根にすることで見えるファイルを一致させています。第07章で改めて扱います。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · 参加できていることの証拠</div>
+      <p>先ほどの <code>mydocker exec</code> の出力を、もう一度この目で見てください。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker exec 0c1be9ad663a /bin/sh -c 'hostname; ps'
+<span class="out">mydocker
+PID   USER     TIME  COMMAND
+    1 root      0:00 sleep 20
+    8 root      0:00 /bin/sh -c hostname; ps
+   15 root      0:00 ps</span></code></pre>
+      <p><code>hostname</code> が <code>mydocker</code> を返しているのは <strong>UTS 名前空間に参加できた</strong>証拠です。<code>ps</code> の一覧に元から動いていた <code>sleep 20</code> が <code>1</code> 番として見えているのは、<strong>PID 名前空間に参加できた</strong>証拠です。もし参加に失敗していれば、ここには <code>vm</code> とホストのプロセス一覧が出ます。</p>
+    </div>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span>4つを <code>Cloneflags</code> に並べる</h2>
+
+    <p>ここまでで4種類の名前空間を1つずつ見ました。まとめて発注します。<code>run.go</code> の該当箇所を、周りの行ごと一字一句そのまま載せます。</p>
+
+    <div class="file-tag">internal/container/run.go</div>
+<pre><code>	<span class="cm">// --- 4. 自分自身を "init" という別の顔で起動する ---</span>
+	args := <span class="kw">append</span>([]<span class="kw">string</span>{<span class="st">"init"</span>, mnt.Merged, cfg.Hostname, orSlash(cfg.Workdir)}, cfg.Argv...)
+	cmd := exec.<span class="ty">Command</span>(<span class="st">"/proc/self/exe"</span>, args...)
+	cmd.SysProcAttr = &amp;syscall.<span class="ty">SysProcAttr</span>{
+		<span class="ty">Cloneflags</span>: syscall.<span class="ty">CLONE_NEWUTS</span> | <span class="cm">// ホスト名</span>
+			syscall.<span class="ty">CLONE_NEWPID</span> | <span class="cm">// プロセス番号</span>
+			syscall.<span class="ty">CLONE_NEWNS</span> | <span class="cm">// マウント</span>
+			syscall.<span class="ty">CLONE_NEWIPC</span>, <span class="cm">// プロセス間通信</span>
+		<span class="cm">// ⚠ これを忘れると、コンテナ内で行ったマウントがホスト側にも伝播する。</span>
+		<span class="cm">//    pivot_root が EINVAL で落ちる原因にもなる。「なぜか動かない」の筆頭。</span>
+		<span class="ty">Unshareflags</span>: syscall.<span class="ty">CLONE_NEWNS</span>,
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	cmd.Env = cfg.Env
+	cmd.ExtraFiles = []*os.File{syncR} <span class="cm">// 子から見て fd 3</span></code></pre>
+
+    <p>この章の成果物は、実質この<strong>6行</strong>です。<code>Cloneflags</code> の4行と、コメントを挟んだ <code>Unshareflags</code> の1行、そしてそれを載せている <code>cmd.SysProcAttr</code> の1行。</p>
+
+    <p>「たったこれだけ?」と感じたなら、その感覚を大事にしてください。<strong>それがこの章の眺めの良さです。</strong> ホスト名・プロセス番号・マウント表・プロセス間通信という4つの世界の見え方を、私たちは<strong>フラグを4つ <code>|</code> で繋ぐこと</strong>で切り替えました。ライブラリも、デーモンも、設定ファイルも要りません。カーネルが元から持っている機能に、正しい名前で頼んだだけです。</p>
+
+    <p>周りの行も少し補足しておきます。前章の復習です。</p>
+
+    <ul>
+      <li><code>exec.Command("/proc/self/exe", args...)</code> — <code>/proc/self/exe</code> は「今走っている自分自身の実行ファイル」を指す特別なパスです。自分をもう一度、<code>init</code> という別の顔で起動する。これが re-exec でした。</li>
+      <li><code>args</code> の先頭が <code>"init"</code> — 起動された側は、この第1引数を見て「あ、自分は <code>init</code> として呼ばれたのだな」と判断し、Step 1 で読んだ <code>Init</code> 関数へ進みます。</li>
+      <li><code>cmd.ExtraFiles = []*os.File{syncR}</code> — 親が「準備できた」と合図を送るためのパイプです。子は fd 3 でこれを受け取り、合図が来るまで走り出しません。第04章の cgroup が効く前に子がメモリを掴んでしまわないための同期です。</li>
+    </ul>
+
+    <p>そして<strong>この <code>cmd.Start()</code> が呼ばれた瞬間</strong>に、4つの名前空間が同時に生まれ、子はその中で生まれます。生まれながらにして PID 1、生まれながらにして別のホスト名の台帳、生まれながらにして自前のマウント表。順番に設定していくのではなく、<strong>誕生と同時に全部決まる</strong>。ここが名前空間の作りのきれいなところです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · 4枚の壁が立っている状態</div>
+      <p>ここまでの成果を、<code>mydocker</code> で一気に確かめます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh -c 'ps; echo ---; hostname; echo ---; ls /'
+<span class="out">キャッシュ: mirror.gcr.io/library/alpine:latest（ネットワークにはアクセスしません）
+コンテナ a169666dadfc を起動しました (PID 23900)
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh -c ps; echo ---; hostname; echo ---; ls /
+    7 root      0:00 ps
+---
+mydocker
+---
+bin
+dev
+etc
+home
+lib
+media
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+tmp
+usr
+var</span></code></pre>
+      <p>3つとも壁の向こう側になっています。<code>ps</code> は自分たち2つだけ。<code>hostname</code> は <code>mydocker</code>。<code>ls /</code> はホストの <code>/</code> ではなく alpine イメージの中身。ホスト側の PID が <strong>23900</strong> であることも表示されていて、コンテナの中の <strong>1</strong> と対応しています。</p>
+      <p><strong>ただし。</strong> 上の <code>ls /</code> がイメージの中身になっているのは、この章の4フラグだけの成果ではありません。根を挿げ替える処理（第03章）と、イメージを重ねる処理（第05〜06章）が入って初めてこうなります。この章の時点で保証できているのは <code>hostname</code> の行までです。</p>
+    </div>
+
+    <p>——と、ここまでは順調でした。<code>ps</code> も期待どおりに見えています。ところが、この <code>ps</code> の行が「期待どおり」になるまでには、まだ1つ山が残っています。次のステップで、その山にぶつかります。</p>
+
+    <h2 class="step" id="step-6"><span class="step-no">Step 6</span>謎に出会う — <code>ps</code> だけがホストを見せる</h2>
+
+    <p>ここからがこの章のクライマックスです。<strong>いちばん大事な実験</strong>なので、腰を据えて手を動かしてください。</p>
+
+    <p>Step 2 で私たちは、<code>unshare --pid --fork</code> によって「自分が PID 1 になる」ことを確認しました。PID 名前空間は確かに効いていました。</p>
+
+    <p>では、<strong>その中で <code>ps</code> を打ったら何が見えるはずでしょうか。</strong></p>
+
+    <p>予想を立ててから先へ進んでください。PID 名前空間が枝分かれしていて、自分が 1 番なのだから、見えるプロセスは自分と、自分が起動したものだけ。数えたら 2 か 3 行。そのはずです。</p>
+
+    <p>数えます。<code>ps -e</code> は全プロセスの一覧、<code>--no-headers</code> は見出し行を落とす指定、<code>wc -l</code> は行数を数えるコマンドです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · ★この章でいちばん大事な実験</div>
+      <p>PID 名前空間の中でプロセス数を数えます。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork sh -c 'ps -e --no-headers | wc -l'
+<span class="out">87</span></code></pre>
+      <p>比較のため、ホスト側でも同じことをします。</p>
+      <pre class="term"><code><span class="ps">$</span> ps -e --no-headers | wc -l          # ホスト側
+<span class="out">85</span></code></pre>
+    </div>
+
+    <p><strong>87。</strong></p>
+
+    <p>2 でも 3 でもありません。それどころか、<strong>ホスト側の 85 より多い</strong>。</p>
+
+    <p>この数字を初めて見たとき、私は素直に「名前空間が効いていない」と思いました。フラグの綴りを疑い、カーネルのバージョンを疑い、<code>unshare</code> のマニュアルを読み直しました。全部空振りでした。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 「ps がホストを見せる = 名前空間が壊れている」という誤診</div>
+      <p>この症状を見て「PID 名前空間が効いていない」と診断するのは、<strong>間違いです</strong>。効いています。私たちはそれをすでに証明しました。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 1</span></code></pre>
+      <p>まったく同じ <code>unshare --pid --fork</code> の中で、シェルは<strong>自分が 1 番だと答えています</strong>。カーネルが返すこの答えに嘘はありません。PID 名前空間は間違いなく枝分かれしています。</p>
+      <p>にもかかわらず <code>ps</code> はホストのプロセスを並べる。つまり、<strong><code>ps</code> が見ているものと、カーネルが <code>$$</code> に返す番号とは、出どころが別</strong>だということになります。</p>
+      <p>ここを取り違えると、直っているものを直そうとして何時間も溶かします。<strong>症状から原因へ飛ばないでください。</strong> 「PID 名前空間が効いていない」ではなく「<code>ps</code> の情報源が壁の外にある」と読むのが正しい診断です。</p>
+    </div>
+
+    <p>87 という数字そのものにも意味があります。ホストが 85 なのに、なぜ<strong>増える</strong>のか。</p>
+
+    <p>答えは「この実験自体がプロセスを増やしているから」です。<code>unshare</code> があり、<code>--fork</code> で分かれた <code>sh</code> があり、<code>ps</code> があり、<code>wc</code> があります。それらがホストの一覧に上乗せされて 87 になっています。裏を返せば、<strong>コンテナの中の <code>ps</code> がホストの全プロセスを数え上げたうえで、自分たちのぶんまで足している</strong>ということです。隔離が効いていないどころではなく、完全に素通しです。</p>
+
+    <p>なお、ホスト側の 85 という数字は測るたびに少し揺れます（この環境では 85〜87 の範囲でした）。1 や 2 の差に意味はありません。<strong>意味があるのは桁です。数十なのか、数個なのか。</strong> ここだけ見てください。</p>
+
+    <h3>1つのオプションで、答えが変わる</h3>
+
+    <p><code>unshare</code> のマニュアルを眺めていると、意味ありげなオプションが1つ見つかります。<code>--mount-proc</code> です。名前からして、何かをマウントするらしい。足してみます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認 · ★オプションを1つ足す</div>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork --mount-proc sh -c 'ps -e --no-headers | wc -l'
+<span class="out">3</span></code></pre>
+      <p><strong>87 が 3 になりました。</strong></p>
+      <p>中身も見ておきます。<code>ps aux</code> で1行ずつ表示させます。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork --mount-proc ps aux
+<span class="out">USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.0   7900  3932 ?        R    22:14   0:00 ps aux</span></code></pre>
+      <p>1行だけ。<strong><code>ps</code> 自身が PID 1 として立っています。</strong> これが、私たちが最初から欲しかった景色です。</p>
+    </div>
+
+    <p>ここで整理します。<strong>2回の実行で、PID 名前空間まわりのフラグは1文字も変わっていません。</strong> <code>--pid</code> も <code>--fork</code> もそのままです。変えたのは <code>--mount-proc</code> の有無だけ。それだけで、<code>ps</code> の答えが 87 から 3 に変わりました。</p>
+
+    <div class="ascii">同じ PID 名前空間、違う答え
+
+  unshare --pid --fork                sh -c 'ps -e | wc -l'  →  87  ← ホストが見える
+  unshare --pid --fork --mount-proc   sh -c 'ps -e | wc -l'  →   3  ← 自分だけ見える
+                        ^^^^^^^^^^^^
+                        この差だけ
+
+  PID 名前空間の設定は両方とも同じ。壁は最初から立っていた。
+  変わったのは「ps が何を読みに行くか」。</div>
+
+    <p>つまり <code>ps</code> は、<strong>カーネルに「今のプロセス一覧をください」と直接聞いてはいない</strong>のです。もし直接聞いていたなら、カーネルは名前空間を踏まえた正しい答えを返したはずで、<code>--mount-proc</code> の有無で結果が変わるはずがありません。</p>
+
+    <p><code>ps</code> はどこか別の場所を読んでいます。そして、その「別の場所」は——マウントに関係する何かで、<strong>名前に <code>proc</code> という文字が入っています</strong>。</p>
+
+    <div class="ascii">ps は「プロセスの一覧」をどこから取ってくるのか?
+
+     ps  ──読む──▶  【 ？？？ 】  ──▶  87 行 だったり 3 行 だったり
+
+  ・カーネルに直接聞いているのではない（聞いていれば答えは1つに定まる）
+  ・読んでいる「どこか」は、マウントすると内容が変わる
+  ・PID 名前空間の壁は立っているのに、その「どこか」だけが壁の外に残っている
+
+  ★4枚の壁を立てても、この1点だけは塞がらなかった。
+  ★塞ぐには、壁ではなく「地面」を入れ替える必要がある。</div>
+
+    <p>私たちのコンテナも、まったく同じ状態にあります。UTS の壁は立ちました。PID の壁も立ちました。MNT も IPC も立ちました。<strong>それでも <code>ps</code> だけが、ホストの景色を見せ続けています。</strong></p>
+
+    <p>足りないのは5枚目の壁ではありません。<strong>私たちのコンテナが立っている地面が、まだホストのものだから</strong>です。地面ごと入れ替えなければ、この1点は塞がりません。</p>
+
+    <p>その入れ替え方——<code>pivot_root</code> という、根そのものを挿げ替える操作——を、次の章でやります。<strong>なぜ <code>--mount-proc</code> で答えが変わったのか</strong>、その正体も、次章の最初のページで開きます。</p>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>名前空間って、要するに軽い仮想マシンということですか?</summary>
+      <div class="qa-body">
+        <p>いいえ、根本的に別物です。ここを混同すると、この先ずっと足を取られます。</p>
+        <p>仮想マシンは<strong>ハードウェアを真似します</strong>。CPU も、メモリも、ディスクも、ネットワークカードも、偽物を用意して、その上でゲスト OS のカーネルをもう1つ起動します。だからカーネルが2つ動きます。Linux の上で Windows を動かせるのは、この方式だからです。</p>
+        <p>名前空間は<strong>ハードウェアを何も真似しません</strong>。カーネルは1つのままです。増えるのは、この章で言い続けた「台帳」だけ。コンテナの中のプロセスは、ホストのプロセスとまったく同じカーネルの上で、まったく同じように実行されています。だから起動が速い（この教材の実測で 12〜15 ms、ホストで直接 <code>/bin/true</code> を実行した 3 ms と比べても、桁が同じです)。</p>
+        <p>そして同じ理由で、<strong>コンテナの中で別の OS のカーネル機能は使えません</strong>。「Linux の上で Windows のコンテナ」は原理的に無理です。ここが仮想マシンとの決定的な差で、コンテナの速さと制約は、同じ1つの事実の裏表です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>unshare --pid</code> だけだと PID が 1 にならないのに、<code>--fork</code> を足すと 1 になるのはなぜですか?</summary>
+      <div class="qa-body">
+        <p>PID 名前空間が<strong>「作った本人」には適用されない</strong>からです。適用されるのは、作ったあとに生まれた子プロセスからです。</p>
+        <p>すでに走っているプロセスの番号を途中で 1 に変えてしまうと、そのプロセスを <code>wait</code> している親や、PID を握って通信している他のプロセスとの辻褄が合わなくなります。番号は<strong>生まれたときに1回だけ決まる</strong>もので、後から変えられるものではない。だからカーネルは「次の世代から」という設計にしました。</p>
+        <p><code>--fork</code> は、<code>unshare</code> に「名前空間を作ったあと、もう1段 <code>fork</code> してから目的のコマンドを実行しろ」と指示するオプションです。その1段の <code>fork</code> で生まれた子が、新しい台帳の最初の住人になり、1 番を取ります。</p>
+        <p>私たちの <code>mydocker</code> は、この <code>--fork</code> に当たる部分を re-exec（<code>/proc/self/exe</code> を <code>init</code> として起動する）で自前でやっています。前章でやったことと、この章の話は、同じ1つの制約から出ています。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>Cloneflags</code> に <code>CLONE_NEWNET</code> も足せば、ネットワークも隔離できるんじゃないですか?</summary>
+      <div class="qa-body">
+        <p>足すこと自体はできます。1行足せば、コンテナは確かに独立したネットワーク名前空間を持ちます。</p>
+        <p>問題はその後です。<strong>新しく作られたネットワーク名前空間は、完全に空っぽ</strong>です。入っているのは、上がってすらいないループバックデバイスだけ。<code>eth0</code> はありません。IP アドレスもありません。ルーティングテーブルも空です。つまり、<strong>コンテナから外に一切出られなくなります</strong>。<code>ping</code> も <code>curl</code> も <code>apk add</code> も、全部沈黙します。</p>
+        <p>使える状態にするには、追加で全部自分で作らなければなりません。仮想イーサネットのペアを作り、片方をコンテナ側の名前空間に押し込み、ホスト側にブリッジを立て、そこに繋ぎ、IP を振り、ルートを足し、外に出るための NAT 規則を <code>iptables</code> に入れる。<strong>1行のフラグに対して、数百行の付き添いが要ります。</strong></p>
+        <p>この教材はそこを実装していません。中途半端に <code>CLONE_NEWNET</code> だけ足して「ネットワークも隔離しました」と書くほうが、よほど不誠実だと考えました。<a href="08-network.html">第08章</a>を、この判断の説明と、実装するなら何をどの順で作るかの地図に使っています。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>Unshareflags</code> を書かなくても、手元では普通に動いてしまいました。何が問題なんですか?</summary>
+      <div class="qa-body">
+        <p>「普通に動く」のが、この落とし穴のいちばん厄介なところです。エラーは出ません。コンテナは起動し、コマンドは走り、終了します。</p>
+        <p>壊れているのはホスト側です。コンテナの中で貼ったマウントが、伝播の関係を通ってホストのマウント表にも載り、<strong>コンテナが終わっても消えません</strong>。1回では気づきません。100 回起動して初めて、<code>mount</code> の出力が数百行になっていることに気づきます。</p>
+        <p>確かめ方はあります。実験の前後で <code>wc -l &lt; /proc/mounts</code> を打って、数が戻っているかを見てください。この環境では 22 でした。1回コンテナを起動して、終了後に 22 に戻っていれば漏れていません。増えていたら漏れています。</p>
+        <p>もう1つ、もっと早く症状が出る経路もあります。伝播が残ったままだと、次章の <code>pivot_root</code> が <code>EINVAL</code> で落ちます。「第03章でいきなりエラーになった」という人は、まずこの1行を疑ってください。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>IPC 名前空間って、無くても動きますよね? 本当に要りますか?</summary>
+      <div class="qa-body">
+        <p>動きます。落としても、この教材の範囲でエラーになる場面はたぶん出てきません。それでも入れています。理由は3つです。</p>
+        <p>1つめ。<strong>塞がない限り、通信路として残ります。</strong> 共有メモリやセマフォはパスを持たないので、MNT 名前空間でファイルシステムをどれだけ隔離しても隠れません。「ファイルは1つも共有していないのに繋がっている」という状態は、隔離としては失格です。</p>
+        <p>2つめ。<strong>キーの衝突が起きます。</strong> System V IPC のキーは決め打ちの数値であることが多く、同じイメージから2つコンテナを起動すると、両方が同じキーを取りに行って片方が起動に失敗します。コンテナが増えたときにだけ再現する、原因の分かりにくいバグです。</p>
+        <p>3つめ。<strong>後始末が自動になります。</strong> System V IPC のオブジェクトは、作ったプロセスが死んでも残ります。名前空間で囲っておけば、名前空間ごと回収されるときに一緒に消えます。</p>
+        <p>そのうえで、コストは <code>| syscall.CLONE_NEWIPC</code> という<strong>1行</strong>です。追加のコードも設定も要りません。入れない理由が見つかりませんでした。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>コンテナの中で <code>hostname mynew</code> と打ったら、ホストのホスト名も変わってしまいますか?</summary>
+      <div class="qa-body">
+        <p>変わりません。それがまさに、この章で <code>CLONE_NEWUTS</code> を渡した理由です。</p>
+        <p>コンテナの中の <code>hostname</code> コマンドも、私たちの <code>syscall.Sethostname</code> も、呼んでいるシステムコールは同じ <code>sethostname(2)</code> です。違うのは<strong>そのプロセスがどの台帳に属しているか</strong>だけ。コンテナの中のプロセスは枝分かれした台帳を見ているので、書き込みもそちらに行きます。ホスト側の台帳は <code>vm</code> のまま無傷です。</p>
+        <p>逆に言うと、<strong><code>CLONE_NEWUTS</code> を渡し忘れていた場合は、本当にホストのホスト名が変わります</strong>。エラーも警告も出ずに、成功して変わります。Step 1 の落とし穴ボックスに書いたとおりです。この章で最初に <code>hostname</code> を打って基準線を取ったのは、この事故に後から気づけるようにするためでした。</p>
+      </div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。答え合わせより、<strong>先に自分で言葉にすること</strong>のほうが大事です。</p>
+
+    <details class="qa"><summary>Q1. UTS 名前空間を作らずに <code>syscall.Sethostname</code> を呼ぶと、何が起きますか?</summary>
+      <div class="qa-body">
+        <p><strong>成功して、ホスト側のホスト名が変わります。</strong> エラーにはなりません。</p>
+        <p><code>Sethostname</code> は名前空間とは無関係の、昔からある普通のシステムコールです。カーネルは、呼んだプロセスが属している UTS 名前空間の台帳を書き換えます。枝分かれさせていなければ、その台帳はホストのものです。</p>
+        <p>ここから引き出すべき一般則: <strong>名前空間まわりの間違いは、多くの場合エラーではなく「効果の及ぶ範囲の取り違え」として現れる</strong>。だからテストは「成功したか」ではなく「<strong>ホスト側が変わっていないか</strong>」を見なければなりません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q2. <code>unshare --pid sh -c 'echo $$'</code> が 1 を返さない理由を説明してください。</summary>
+      <div class="qa-body">
+        <p>PID 名前空間は<strong>作ったプロセス自身には適用されず、その後に生まれる子プロセスから適用される</strong>からです。<code>unshare</code> 自身も、<code>--fork</code> なしで直接実行される <code>sh</code> も、古い台帳の番号（実測では 25171）を持ったままです。</p>
+        <p>設計としてこうなっている理由は、すでに走っているプロセスの番号を途中で変えると、そのプロセスを <code>wait</code> している親や、PID を握って通信している他のプロセスとの辻褄が合わなくなるからです。番号は生まれたときに1回だけ決まります。</p>
+        <p><code>--fork</code> を足すと、<code>unshare</code> がもう1段 <code>fork</code> してからコマンドを実行するため、その子が新しい台帳の 1 番になります（実測で 1）。私たちの <code>mydocker</code> は、この1段を re-exec で自前でやっています。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q3. <code>Cloneflags</code> と <code>Unshareflags</code> の違いは何ですか? なぜ <code>CLONE_NEWNS</code> だけ両方に書いてあるのですか?</summary>
+      <div class="qa-body">
+        <p><code>Cloneflags</code> は <strong><code>clone(2)</code> に渡すフラグ</strong>です。子プロセスが生まれる<strong>まさにその瞬間</strong>に、新しい名前空間が一緒に作られます。「生まれながらにして PID 1」を実現しているのはこちらです。</p>
+        <p><code>Unshareflags</code> は、Go のランタイムが<strong>子プロセスの中で、目的のプログラムを exec する直前に <code>unshare(2)</code> を呼ぶ</strong>という指定です。生まれた<strong>あと</strong>に、もう一度分けます。</p>
+        <p><code>CLONE_NEWNS</code> が両方にあるのは、<code>Cloneflags</code> だけでは<strong>マウントの伝播（shared subtree）の関係が残ってしまう</strong>からです。新しいマウント名前空間は親のマウント表を複製した状態で始まり、多くのディストリビューションでは <code>/</code> が shared なので、子でマウントしたものが親にも伝わります。<code>Unshareflags</code> でもう一度分けることで、この線を確実に断ちます。</p>
+        <p>なお私たちのコードは、これに加えて <code>init.go</code> の <code>pivotRoot</code> の1行目で <code>MS_PRIVATE|MS_REC</code> による付け替えもしています。冗長ですが、ここは冗長にしておくべき箇所です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q4. コンテナの中の PID 1 は、ホストから見ると何番ですか? 番号は1つですか、2つですか?</summary>
+      <div class="qa-body">
+        <p><strong>番号は2つあります。同じ1つのプロセスに、名前空間ごとの番号が付いています。</strong></p>
+        <p>実測で言えば、<code>sleep 20</code> を動かしたコンテナは、ホストの <code>mydocker ps</code> からは <strong>16144</strong> 番として見え、コンテナの中の <code>ps</code> からは <strong>1</strong> 番として見えました。プロセスは1つです。メモリ上の実体も1つ、消費する CPU 時間も1つ分です。</p>
+        <p>関係は<strong>一方通行</strong>です。ホスト側からはコンテナの中のプロセスが見え、<code>kill</code> もできます。逆に、コンテナの中からホストのプロセスを触ることはできません。権限で禁じられているからではなく、<strong>コンテナ側の台帳にその番号が存在しないから、指し示す手段がない</strong>のです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q5. <code>unshare --pid --fork</code> の中で <code>ps -e</code> がホストより多い 87 を返しました。名前空間は壊れていますか? そう判断する根拠は?</summary>
+      <div class="qa-body">
+        <p><strong>壊れていません。</strong> 根拠は、まったく同じ <code>unshare --pid --fork</code> の中で <code>echo $$</code> が <strong>1</strong> を返すことです。カーネルがそのプロセスに 1 番を割り当てているのだから、PID 名前空間は間違いなく枝分かれしています。</p>
+        <p>したがって、<strong><code>ps</code> が読んでいる情報源が、カーネルが <code>$$</code> に返す番号とは別のところにある</strong>と読むのが正しい診断です。実際、<code>--mount-proc</code> というオプションを1つ足すだけで、PID まわりのフラグを一切変えずに答えが 87 から <strong>3</strong> に変わります。</p>
+        <p>87 がホストの 85 より多いのは、実験そのものが増やしたプロセス（<code>unshare</code>、<code>sh</code>、<code>ps</code>、<code>wc</code>）が上乗せされているからです。なお 85 という数字自体は測るたびに 85〜87 の範囲で揺れます。見るべきは 1 や 2 の差ではなく、<strong>数十なのか数個なのかという桁</strong>です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q6. NET 名前空間を使っていないと、コンテナの中で <code>ip -o addr</code> を打つと何が見えますか?</summary>
+      <div class="qa-body">
+        <p><strong>ホストのネットワーク機器とアドレスが、そのまま見えます。</strong> 実測ではこうでした。</p>
+        <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'ip -o addr'
+<span class="out">1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+2: eth0    inet 192.0.2.2/24 brd 192.0.2.255 scope global eth0\       valid_lft forever preferred_lft forever</span></code></pre>
+        <p><code>eth0</code> の <code>192.0.2.2/24</code> は、コンテナ用に作られた仮想的なアドレスではなく<strong>ホストのアドレスそのもの</strong>です。コンテナはホストのネットワーク名前空間をそのまま共有しています。</p>
+        <p>これは <code>CLONE_NEWNET</code> を渡していないことの直接の帰結です。壊れているのではなく、<strong>実装していない</strong>。この状態が何を意味するのか、実装するとしたら何を作らなければならないのかは <a href="08-network.html">第08章</a>で扱います。</p>
+      </div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>この章は、次の2つが自分の手で再現できたら完了です。</p>
+      <p><strong>1つめ</strong>。コンテナの中の <code>hostname</code> がホストと違う名前を返し、かつホスト側は元のままであること。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh
+<span class="out">/ # </span>hostname
+<span class="out">mydocker</span></code></pre>
+      <pre class="term"><code><span class="ps">$</span> hostname
+<span class="out">vm</span></code></pre>
+      <p><strong>2つめ</strong>。PID 名前空間が効いているのに <code>ps</code> がホストを見せる、という現象を自分の目で見て、<strong>それを「壊れている」と誤診しないこと</strong>。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 1</span>
+<span class="ps">$</span> unshare --pid --fork sh -c 'ps -e --no-headers | wc -l'
+<span class="out">87</span>
+<span class="ps">$</span> unshare --pid --fork --mount-proc sh -c 'ps -e --no-headers | wc -l'
+<span class="out">3</span></code></pre>
+      <p>この3行が並んだ状態を見て、「壁は立っている。壁の外に情報源が残っているだけだ」と言えれば、次章の準備は万端です。</p>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>この章で、私たちは4枚の壁を立てました。<strong>UTS</strong> でホスト名の台帳を、<strong>PID</strong> でプロセス番号の台帳を、<strong>MNT</strong> でマウント表を、<strong>IPC</strong> で共有メモリとセマフォの一覧を、それぞれホストから枝分かれさせました。書いたコードは <code>Cloneflags</code> の4行と <code>Unshareflags</code> の1行だけです。仮想マシンも、デーモンも、設定ファイルも要りませんでした。カーネルが元から持っている機能に、正しい名前で頼んだだけです。同時に、<strong>使っていない壁が2枚ある</strong>ことも正直に確認しました。ネットワーク（<code>NET</code>）は隔離しておらず、コンテナの中から <code>ip -o addr</code> を打てばホストの <code>eth0</code> が <code>192.0.2.2/24</code> のまま見えます。ユーザ ID（<code>USER</code>）も隔離していないので、中の <code>root</code> は外の <code>root</code> と同じ root です。この2つは、それぞれ第08章と第09章で正面から扱います。</p>
+
+    <p>それでも、まだ <code>ps</code> がホストのプロセスを見せます。PID 名前空間は確かに効いていて、<code>echo $$</code> は <strong>1</strong> と答えるのに、<code>ps -e</code> は <strong>87</strong> 行を並べる。ホストの 85 より多い。壁を1枚足せば直る問題ではありませんでした。<code>--mount-proc</code> というオプションを1つ足すだけで答えが <strong>3</strong> に変わったことが、犯人の居場所を教えています。<strong><code>ps</code> はカーネルに直接聞いているのではなく、どこか別の場所を読んでいる。そしてその場所は、私たちがまだホストのものを踏んだままの「地面」の上にある。</strong> 視界を区切っただけでは足りなかったのです。立っている足元そのものが、まだホストのものだからです。</p>
+
+    <p>次章では、その地面を入れ替えます。<code>pivot_root</code> という、根そのものを挿げ替えるシステムコールを使って、コンテナの <code>/</code> をイメージの中身に取り替えます。素朴に思いつく <code>chroot</code> がなぜ足りないのかを、実際に牢屋を破って見せるところから始めます。そして <code>--mount-proc</code> が何をしていたのか——なぜ <code>/proc</code> を貼り直すと <code>ps</code> の答えが変わるのか——その正体を、次章の最初のページで開けます。<strong>謎はもう目の前に置いてあります。あとは蓋を取るだけです。</strong></p>
+
+    <div class="chap-foot">
+      <a class="pager" href="01-reexec.html"><span class="dir">← 前へ</span>第01章 · 自分をもう一度起動する</a>
+      <a class="pager next" href="03-pivotroot.html"><span class="dir">次へ →</span>第03章 · 根を挿げ替える</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
