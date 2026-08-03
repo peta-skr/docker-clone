@@ -1,0 +1,1195 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第05章 イメージを取ってくる — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第05章 / 全10章 · 層: REGISTRY · 読了目安 3〜4時間</div>
+    <div class="eyebrow"><span>Registry</span><span class="depth">— docker pull の中身を開ける</span></div>
+    <h1>イメージを取ってくる</h1>
+    <p class="lede">ここまでの章で、コンテナを閉じ込める箱はほぼ出来ました。ただ、その箱に入れる<strong>中身</strong>を、私たちはまだ手で用意していません。<code>docker pull</code> と打つと何かが降ってくる、あの「何か」の正体をこの章で開けます。<code>docker</code> は一切呼びません。使うのは <code>net/http</code> だけです。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p><code>internal/image/registry.go</code> をほぼ全文読み切り、<strong>Docker Registry HTTP API v2 の3回のやりとり</strong>（トークン → マニフェスト → レイヤ）を自分の言葉で説明できるようになる。途中で必ず踏む4つの罠（<code>Accept</code> 忘れ・マニフェストリスト・attestation・取得回数制限）を、踏む前に見分けられるようになる。仕上げに、<strong><code>mydocker pull</code> で alpine を自力で取ってきて、2回目がネットワークに触らない</strong>ことを確認する。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#step-1">まず curl で手で叩く — 匿名なのにトークンが要る</a></li>
+        <li><a href="#step-2">マニフェストを取る — Accept ヘッダを忘れない</a></li>
+        <li><a href="#step-3">layers が無い! — 返ってきたのはリストだった</a></li>
+        <li><a href="#step-4">さらに罠 — 「最初の項目」を取ると確実に壊れる</a></li>
+        <li><a href="#step-5">設定 JSON を取る — Env と Cmd はここにある</a></li>
+        <li><a href="#step-6">レイヤを落とす — 落としながらハッシュを取る</a></li>
+        <li><a href="#step-7">キャッシュ — digest をディレクトリ名にする</a></li>
+        <li><a href="#step-8">イメージ参照の分解 — alpine とは何の略か</a></li>
+        <li><a href="#step-9">他のレジストリ — 401 が道を教えてくれる</a></li>
+      </ol>
+    </div>
+
+    <h2>docker pull は、実は HTTP を3回叩いているだけ</h2>
+
+    <p>最初に身も蓋もない結論を置いておきます。この章を読み終わったあなたが持ち帰るのは、次の一文です。</p>
+
+    <blockquote>イメージとは、tar.gz の列と JSON である。<cite>internal/image/registry.go の冒頭コメント</cite></blockquote>
+
+    <p>それ以上でも以下でもありません。<code>docker pull alpine</code> と打ったとき、Docker が裏でやっているのは <strong>HTTP GET を3回</strong>（正確にはもう少し多いですが、種類としては3つ）です。魔法の独自プロトコルもバイナリの秘密の握手もありません。ブラウザで URL を開くのと同じ HTTP です。</p>
+
+    <div class="ascii">docker pull alpine の中身 — HTTP を3種類叩くだけ
+
+  ① トークン                  ② マニフェスト               ③ レイヤ（blob）
+  auth.docker.io             registry-1.docker.io         registry-1.docker.io
+  /token?scope=repository:   /v2/library/alpine           /v2/library/alpine
+        library/alpine:pull    /manifests/latest            /blobs/sha256:55af…
+        │                            │                            │
+        │  JWT が返る                 │  JSON の目録が返る            │  tar.gz が返る
+        └──────► Authorization: Bearer eyJhbGci… ─────────────────►┘
+
+  ①で得た鍵を、②と③の全部のリクエストに付ける。それだけ。</div>
+
+    <p>ここで「なんだ、簡単じゃないか」と思ったなら、それは半分正しくて半分は罠です。3回の GET のあいだに、<strong>初見では必ず引っかかる段差が4つ</strong>あります。この章はその4つを順番に踏み抜いていく章でもあります。先に名前だけ出しておきます。<code>Accept</code> ヘッダ、マニフェストリスト、attestation、取得回数制限。どれも「なぜか動かない」という形でやってきます。</p>
+
+    <h2>イメージの中身は、二段の目録になっている</h2>
+
+    <p><code>docker images</code> で見える「alpine:latest」という1個のものは、実際には<strong>目録の目録</strong>から始まります。<code>latest</code> というタグを引くと、まず「どの CPU アーキテクチャ向けの版がありますか」という一覧が返ってきて、その中から自分に合う1件を選んで、<em>もう一度</em>取りに行く。この二段構造が、初見で最も戸惑うところです。</p>
+
+    <div class="ascii">マニフェストは二段になっている
+
+  GET /v2/library/alpine/manifests/latest
+   └─ マニフェストリスト（OCI インデックス）… layers が無い!
+       ├─ platform linux/amd64        digest 79ff19e9084a…   ← これを選ぶ
+       ├─ platform unknown/unknown    attestation-manifest   ← 署名の付随物。罠
+       └─ …（他のアーキテクチャ向けの版が並ぶ）
+
+                    │ 選んだ digest で、もう一度 GET
+                    ▼
+
+  GET /v2/library/alpine/manifests/sha256:79ff19e9084a…
+   └─ マニフェスト本体
+       ├─ config   digest d529dd0c6e55…   611 バイト   → Env / Cmd / Entrypoint
+       └─ layers[0] digest 55afa1ecc21d…  3.67 MiB    → tar.gz の実体（1枚だけ）</div>
+
+    <p>alpine の場合、下の段まで降りてようやく <code>layers</code> が見えます。そして中身は<strong>たった1枚</strong>の tar.gz です。圧縮 3.67 MiB、展開すると 8.7 MB・516 ファイル。これが「Linux ディストリビューション1個ぶん」です。</p>
+
+    <h2>取ってきたものを、どこに置くか</h2>
+
+    <p>降ってきた tar.gz を毎回どこかに散らかすわけにはいきません。置き場を先に決めます。<code>/var/lib/mydocker</code> の下に3つのディレクトリを掘ります。ここには後で効いてくる仕掛けが1つ埋まっているので、図をよく見てください。</p>
+
+    <div class="ascii">ローカルの置き場 /var/lib/mydocker
+
+  /var/lib/mydocker/
+  ├─ manifests/
+  │   └─ mirror.gcr.io_library_alpine_latest.json      ← 参照名 → 目録
+  ├─ configs/
+  │   └─ sha256_d529dd0c6e55….json                     ← Env / Cmd / Entrypoint
+  └─ layers/
+      ├─ sha256_55afa1ecc21d…/                         ← 展開済みの中身（516 ファイル）
+      └─ sha256_55afa1ecc21d….complete                 ← 「最後まで終わった」印
+
+  ★ layers/ の名前は digest（＝中身の SHA-256）そのもの。
+    名前が同じなら中身も同じ。だから存在確認だけでキャッシュとして成立する。</div>
+
+    <p>ディレクトリ名がハッシュ値になっているのが仕掛けです。ふつうファイル名は人間が付けますが、ここでは<strong>中身がファイル名を決めます</strong>。この性質を content-addressable（内容アドレス指定）と呼びます。後の Step 7 でじっくり効いてきます。</p>
+
+    <h2>この章で使う言葉</h2>
+
+    <p>レジストリまわりは似た言葉が多く、ここで混ざると最後まで混ざったままになります。先に固定しておきます。</p>
+
+    <table>
+      <tr><th>言葉</th><th>意味</th></tr>
+      <tr><td>レジストリ</td><td>イメージを配っている HTTP サーバ。<code>registry-1.docker.io</code> や <code>ghcr.io</code> など</td></tr>
+      <tr><td>リポジトリ</td><td>そのサーバ内でのイメージ名。<code>library/alpine</code> のように名前空間つき</td></tr>
+      <tr><td>タグ</td><td><code>latest</code> や <code>3.20</code> のような可変の別名。中身は差し替わりうる</td></tr>
+      <tr><td>digest</td><td><code>sha256:55afa1ecc21d…</code>。中身のハッシュ。<strong>絶対に差し替わらない</strong>名前</td></tr>
+      <tr><td>マニフェスト</td><td>「どの config とどのレイヤで出来ているか」の目録。中身は JSON</td></tr>
+      <tr><td>マニフェストリスト<br>（OCI インデックス）</td><td>アーキテクチャごとのマニフェストへの入り口。目録の目録</td></tr>
+      <tr><td>blob</td><td>レジストリが配る中身の塊。config の JSON もレイヤの tar.gz も、どちらも blob</td></tr>
+      <tr><td>レイヤ</td><td>ファイルシステムの差分1枚。実体は tar.gz。この章では展開までやる</td></tr>
+    </table>
+
+    <p>では、この章のソースの冒頭を先に見ておきます。パッケージのドキュメントコメントに、ここまでの話がそのまま書いてあります。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// Package image は Docker Registry HTTP API v2 を直接叩いてイメージを取得し、展開する。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ docker pull は呼ばない。containerd も使わない。net/http だけで取りに行く。</span>
+<span class="cm">//</span>
+<span class="cm">// イメージ取得は3段構えである。</span>
+<span class="cm">//</span>
+<span class="cm">//	① トークンを取る   … Docker Hub は匿名でもトークンが要る</span>
+<span class="cm">//	② マニフェストを取る … 「どのレイヤで出来ているか」の目録</span>
+<span class="cm">//	③ レイヤを落とす    … 実体は tar.gz の列。それだけ</span>
+<span class="cm">//</span>
+<span class="cm">// 「イメージとは tar.gz の列と JSON である」——身も蓋もないが、本当にこれだけである。</span>
+<span class="kw">package</span> image
+
+<span class="kw">import</span> (
+	<span class="st">"crypto/sha256"</span>
+	<span class="st">"encoding/hex"</span>
+	<span class="st">"encoding/json"</span>
+	<span class="st">"fmt"</span>
+	<span class="st">"io"</span>
+	<span class="st">"net/http"</span>
+	<span class="st">"os"</span>
+	<span class="st">"path/filepath"</span>
+	<span class="st">"runtime"</span>
+	<span class="st">"strings"</span>
+	<span class="st">"time"</span>
+)</code></pre>
+
+    <p>import を眺めてください。<strong>外部ライブラリが1つもありません</strong>。<code>net/http</code>、<code>encoding/json</code>、<code>crypto/sha256</code>、<code>archive/tar</code>（これは隣のファイル）。全部 Go の標準ライブラリです。Docker のイメージ取得は、標準ライブラリだけで本当に書けます。</p>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>まず curl で手で叩く — 匿名なのにトークンが要る</h2>
+
+    <p>コードを書く前に、手で叩きます。相手が何を返してくるか分からないまま Go を書き始めると、必ず「どこで間違えたか分からない」状態になります。まず curl です。</p>
+
+    <p>素朴に考えれば、公開イメージなのだから <code>https://registry-1.docker.io/v2/library/alpine/manifests/latest</code> をそのまま GET すれば取れそうです。ところが取れません。<strong>401 Unauthorized</strong> が返ります。ログインしていないどころか、アカウントすら要らない公開イメージなのに、です。</p>
+
+    <p>Docker Hub の作法はこうです。<strong>匿名にも匿名用のトークンを発行する</strong>。認証サーバに「このリポジトリを pull したい」と申告すると、その用途に限った鍵をくれます。ユーザ名もパスワードも要りません。ただ「くださいと言う」手続きだけが要ります。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>認証サーバに、alpine を pull する権限だけを申告してみます。<code>head -c 200</code> で先頭 200 バイトだけ見ます（全体は 2658 文字あります）。</p>
+      <pre class="term"><code><span class="ps">$</span> curl -s "https://auth.docker.io/token?service=registry.docker.io&amp;scope=repository:library/alpine:pull" | head -c 200
+<span class="out">{"token":"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsIng1YyI6WyJNSUlFRmpDQ0F2NmdBd0lCQWdJVU9yTFd5UVpxMmFuZXd6WnhYN1JLbHQ3bDVUTXdEUVlKS29aSWh2Y05BUUVMQlFBd2dZWXhDekFKQmdOVkJBWVRBbFZUTVJNd0VRWURWUVFJRXdwRFlXeH</span></code></pre>
+    </div>
+
+    <p>返ってきた文字列を見てください。<code>eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCI…</code> で始まっています。この <code>eyJ</code> という始まりは JWT（JSON Web Token）の目印です。JWT は「JSON を Base64 で符号化して署名を付けたもの」なので、頭を Base64 で戻すと <code>{"alg":"RS256","typ":"JWT",…</code> という JSON が出てきます。中身が読めるのがポイントで、<strong>暗号化されているのではなく署名されているだけ</strong>です。書き換えると署名が合わなくなるので偽造はできませんが、覗くことはできます。</p>
+
+    <p>URL のクエリを分解しておきます。</p>
+
+    <ul>
+      <li><code>service=registry.docker.io</code> — 「どのサービス向けの鍵か」。この鍵は Docker Hub のレジストリでしか通りません</li>
+      <li><code>scope=repository:library/alpine:pull</code> — 「<strong>library/alpine というリポジトリを pull する権限だけ</strong>ください」。書式は <code>repository:&lt;リポジトリ名&gt;:&lt;動作&gt;</code></li>
+    </ul>
+
+    <p>つまりこのトークンは、alpine を読むことしかできません。他のイメージを取ろうとすれば拒否されますし、push もできません。<strong>用途を申告した本人が、自分の権限を最小に絞っている</strong>形です。この形式は Docker 独自ではなく、OCI Distribution Specification として標準化されていて、GitHub の <code>ghcr.io</code> でも Google の <code>mirror.gcr.io</code> でも同じ考え方が通じます（取りに行く URL だけが違い、それは Step 9 で解決します）。</p>
+
+    <p>ここまでを Go にします。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="kw">const</span> (
+	defaultRegistry = <span class="st">"registry-1.docker.io"</span>
+	dockerAuthURL   = <span class="st">"https://auth.docker.io/token"</span>
+	dockerService   = <span class="st">"registry.docker.io"</span>
+)</code></pre>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// fetchToken は pull 用のトークンを取る。</span>
+<span class="cm">//</span>
+<span class="cm">// Docker Hub は決まった URL で取れる。それ以外のレジストリは、まず /v2/ を叩いて</span>
+<span class="cm">// 401 と一緒に返ってくる WWW-Authenticate ヘッダ（＝どこへ取りに行けばよいかの案内）を読む。</span>
+<span class="kw">func</span> (s *<span class="ty">Store</span>) fetchToken(client *http.<span class="ty">Client</span>, ref <span class="ty">Ref</span>) (<span class="kw">string</span>, <span class="kw">error</span>) {
+	authURL := <span class="st">""</span>
+	<span class="kw">if</span> ref.Registry == defaultRegistry {
+		authURL = fmt.<span class="ty">Sprintf</span>(<span class="st">"%s?service=%s&amp;scope=repository:%s:pull"</span>, dockerAuthURL, dockerService, ref.Repository)
+	} <span class="kw">else</span> {
+		realm, service, err := discoverAuth(client, ref)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="st">""</span>, err
+		}
+		<span class="kw">if</span> realm == <span class="st">""</span> {
+			<span class="kw">return</span> <span class="st">""</span>, <span class="kw">nil</span> <span class="cm">// 認証不要のレジストリ</span>
+		}
+		authURL = fmt.<span class="ty">Sprintf</span>(<span class="st">"%s?scope=repository:%s:pull"</span>, realm, ref.Repository)
+		<span class="kw">if</span> service != <span class="st">""</span> {
+			authURL += <span class="st">"&amp;service="</span> + service
+		}
+	}
+
+	resp, err := client.<span class="ty">Get</span>(authURL)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">""</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"トークンの取得に失敗しました: %w"</span>, err)
+	}
+	<span class="kw">defer</span> resp.Body.<span class="ty">Close</span>()
+	<span class="kw">if</span> resp.StatusCode != http.<span class="ty">StatusOK</span> {
+		body, _ := io.<span class="ty">ReadAll</span>(io.<span class="ty">LimitReader</span>(resp.Body, <span class="st">512</span>))
+		<span class="kw">return</span> <span class="st">""</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"トークンの取得に失敗しました (HTTP %d): %s"</span>, resp.StatusCode, strings.<span class="ty">TrimSpace</span>(<span class="kw">string</span>(body)))
+	}
+	<span class="kw">var</span> tok <span class="kw">struct</span> {
+		Token       <span class="kw">string</span> <span class="st">`json:"token"`</span>
+		AccessToken <span class="kw">string</span> <span class="st">`json:"access_token"`</span>
+	}
+	<span class="kw">if</span> err := json.<span class="ty">NewDecoder</span>(resp.Body).<span class="ty">Decode</span>(&amp;tok); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">""</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"トークンの JSON を読めませんでした: %w"</span>, err)
+	}
+	<span class="kw">if</span> tok.Token != <span class="st">""</span> {
+		<span class="kw">return</span> tok.Token, <span class="kw">nil</span>
+	}
+	<span class="kw">return</span> tok.AccessToken, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>上から追います。Docker Hub なら URL は決め打ちで組み立てます。さっき curl で叩いたのと一字一句同じ URL です。<code>else</code> の側は他のレジストリ向けで、これは Step 9 まで置いておきます（<code>discoverAuth</code> が「どこへ取りに行けばよいか」を調べてくれます）。</p>
+
+    <p>面白いのは最後の6行です。<strong>トークンの入っているフィールド名がレジストリによって違います</strong>。Docker Hub は <code>token</code>、他所は <code>access_token</code> を使うことがあります。どちらも受けられるように構造体に両方書いておいて、<code>token</code> が空なら <code>access_token</code> を返す。仕様の揺れをここで吸収しています。</p>
+
+    <p><code>io.LimitReader(resp.Body, 512)</code> も地味ですが大事です。エラー時に相手が何を返してくるか分かりません。HTML のエラーページが数百 KB 返ってくることもあります。それを全部エラーメッセージに載せると端末が埋まるので、<strong>先頭 512 バイトで打ち切る</strong>。エラー処理でこそ、相手を信用しないコードを書きます。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · net/http のヘッダと 401 の扱い</div>
+      <p>Go の <code>net/http</code> は、<strong>HTTP のステータスコードをエラーとして扱いません</strong>。404 でも 401 でも 500 でも、通信そのものが成立していれば <code>err</code> は <code>nil</code> です。ここが最初にハマるところで、<code>client.Get()</code> のエラーだけ見ていると「取れた気になって空の JSON をパースする」ことになります。だから必ず <code>resp.StatusCode</code> を自分で見ます。<code>err != nil</code> は「相手に届かなかった」、<code>StatusCode != 200</code> は「届いたが断られた」。この2つは別の事故です。</p>
+      <p>ヘッダは <code>req.Header.Set("Authorization", "Bearer "+token)</code> のように付けます。<code>Set</code> は同名ヘッダを置き換え、<code>Add</code> は追加します。認証は必ず <code>Set</code> です。なお <code>client.Get()</code> はヘッダを付けられない簡易版なので、ヘッダが要るときは <code>http.NewRequest</code> でリクエストを組み立ててから <code>client.Do(req)</code> を呼びます。この章のコードで両方が出てくるのはそのためです。</p>
+      <p><code>defer resp.Body.Close()</code> は必ず書きます。忘れると接続が返却されず、繰り返すうちにファイルディスクリプタを食い潰します。<code>&amp;tok</code> の <code>&amp;</code> はアドレス演算子で、<code>Decode</code> に「ここへ書き込んでくれ」と渡しています。</p>
+    </div>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>マニフェストを取る — Accept ヘッダを忘れない</h2>
+
+    <p>鍵は手に入りました。次は目録です。URL の形は素直で、<code>https://&lt;レジストリ&gt;/v2/&lt;リポジトリ&gt;/manifests/&lt;タグまたは digest&gt;</code> です。alpine なら <code>https://registry-1.docker.io/v2/library/alpine/manifests/latest</code>。ここに <code>Authorization: Bearer …</code> を付けて GET します。</p>
+
+    <p>ここで最初の大きな段差が来ます。<strong><code>Accept</code> ヘッダを付けないと、古い形式が返ってきます。</strong></p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · Accept を付けないと schema 1 が返ってくる</div>
+      <p>レジストリは「相手が読める形式」を <code>Accept</code> ヘッダで判断します。付けないと、いちばん古くて誰でも読める形式——<strong>manifest schema 1</strong>——を返してきます。schema 1 には <code>layers</code> 配列が<strong>存在しません</strong>（代わりに <code>fsLayers</code> という別物が入っています）。</p>
+      <p>すると何が起きるか。JSON のパースは<strong>成功します</strong>。Go の <code>encoding/json</code> は知らないフィールドを黙って捨て、無いフィールドはゼロ値のままにするからです。エラーは出ません。ただ <code>len(man.Layers) == 0</code> になる。「200 が返ってきて、JSON も読めて、なぜかレイヤだけが0枚」という、いちばん原因の見えない詰まり方をします。</p>
+    </div>
+
+    <p>だから <code>Accept</code> を明示します。しかも1つではなく、<strong>4つ並べます</strong>。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// acceptManifest は Accept ヘッダに並べるメディアタイプ。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ これを付けないと、レジストリは古い形式（schema 1）を返してくる。</span>
+<span class="cm">// schema 1 には layers 配列が無いので「取れた JSON に layers が無い」と悩むことになる。</span>
+<span class="kw">var</span> acceptManifest = strings.<span class="ty">Join</span>([]<span class="kw">string</span>{
+	<span class="st">"application/vnd.docker.distribution.manifest.v2+json"</span>,
+	<span class="st">"application/vnd.docker.distribution.manifest.list.v2+json"</span>,
+	<span class="st">"application/vnd.oci.image.manifest.v1+json"</span>,
+	<span class="st">"application/vnd.oci.image.index.v1+json"</span>,
+}, <span class="st">","</span>)</code></pre>
+
+    <p>4つある理由は、2×2 だからです。</p>
+
+    <table>
+      <tr><th></th><th>単体（マニフェスト本体）</th><th>リスト（インデックス）</th></tr>
+      <tr><td><strong>Docker 形式</strong></td><td><code>…docker.distribution.manifest.v2+json</code></td><td><code>…docker.distribution.manifest.list.v2+json</code></td></tr>
+      <tr><td><strong>OCI 形式</strong></td><td><code>…oci.image.manifest.v1+json</code></td><td><code>…oci.image.index.v1+json</code></td></tr>
+    </table>
+
+    <p>縦軸が<strong>方言</strong>です。Docker が先に作った形式（<code>vnd.docker.…</code>）と、それを業界標準として整理し直した OCI 形式（<code>vnd.oci.…</code>）。中身の構造はほぼ同じで、名前だけが違います。イメージがいつビルドされたかで、どちらが返るかが変わります。実際、この章で扱う alpine は <strong>OCI 形式</strong>で返ってきます。</p>
+
+    <p>横軸が<strong>段</strong>です。単体のマニフェスト本体なのか、アーキテクチャ別の入り口であるリストなのか。タグを引くと、たいていリストが返ってきます。</p>
+
+    <p>この4つを全部「読めます」と申告しておけば、相手がどれを持っていても最新の形式で返してくれます。<code>strings.Join</code> でカンマ区切りにしているのは、HTTP の <code>Accept</code> ヘッダがカンマ区切りだからです。</p>
+
+    <p>取得の本体はこうです。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="kw">func</span> (s *<span class="ty">Store</span>) fetchManifest(client *http.<span class="ty">Client</span>, ref <span class="ty">Ref</span>, token, reference <span class="kw">string</span>) (*manifest, <span class="kw">error</span>) {
+	url := fmt.<span class="ty">Sprintf</span>(<span class="st">"https://%s/v2/%s/manifests/%s"</span>, ref.Registry, ref.Repository, reference)
+	body, err := s.<span class="ty">get</span>(client, url, token, acceptManifest)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+	<span class="kw">var</span> man manifest
+	<span class="kw">if</span> err := json.<span class="ty">Unmarshal</span>(body, &amp;man); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"マニフェストの JSON を読めませんでした: %w"</span>, err)
+	}
+	<span class="kw">return</span> &amp;man, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>引数の <code>reference</code> に注目してください。<strong>タグでも digest でも同じ関数で取れます</strong>。URL の最後に入るのが <code>latest</code> なのか <code>sha256:79ff19e9084a…</code> なのかの違いだけで、レジストリはどちらも受け付けます。この設計のおかげで、Step 3 で「リストだったのでもう一度取り直す」処理が同じ関数の呼び直しで済みます。</p>
+
+    <p>実際の HTTP は <code>s.get</code> という共通の小道具に任せています。ここに、この章で踏む最後の罠の対策も入っています。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="kw">func</span> (s *<span class="ty">Store</span>) get(client *http.<span class="ty">Client</span>, url, token, accept <span class="kw">string</span>) ([]<span class="kw">byte</span>, <span class="kw">error</span>) {
+	req, _ := http.<span class="ty">NewRequest</span>(http.<span class="ty">MethodGet</span>, url, <span class="kw">nil</span>)
+	<span class="kw">if</span> token != <span class="st">""</span> {
+		req.Header.<span class="ty">Set</span>(<span class="st">"Authorization"</span>, <span class="st">"Bearer "</span>+token)
+	}
+	req.Header.<span class="ty">Set</span>(<span class="st">"Accept"</span>, accept)
+	resp, err := client.<span class="ty">Do</span>(req)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"%s の取得に失敗しました: %w"</span>, url, err)
+	}
+	<span class="kw">defer</span> resp.Body.<span class="ty">Close</span>()
+	<span class="kw">if</span> resp.StatusCode == http.<span class="ty">StatusNotFound</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"見つかりませんでした (HTTP 404): %s"</span>, url)
+	}
+	<span class="kw">if</span> resp.StatusCode == http.<span class="ty">StatusTooManyRequests</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"取得回数の上限に達しました (HTTP 429)。しばらく待つか、キャッシュ済みのイメージを使ってください"</span>)
+	}
+	<span class="kw">if</span> resp.StatusCode != http.<span class="ty">StatusOK</span> {
+		body, _ := io.<span class="ty">ReadAll</span>(io.<span class="ty">LimitReader</span>(resp.Body, <span class="st">512</span>))
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"取得に失敗しました (HTTP %d): %s"</span>, resp.StatusCode, strings.<span class="ty">TrimSpace</span>(<span class="kw">string</span>(body)))
+	}
+	<span class="kw">return</span> io.<span class="ty">ReadAll</span>(resp.Body)
+}</code></pre>
+
+    <p>ステータスコードを3段階で見ています。404 は「そんなイメージは無い」、429 は「引きすぎ」（Step 7 で詳しく）、その他の非 200 は本文を 512 バイトだけ添えて返す。<strong>エラーメッセージを読んだだけで次に何をすればいいか分かる</strong>ことを狙っています。「取得に失敗しました」だけのメッセージは、あとで自分を苦しめます。</p>
+
+    <p><code>token != ""</code> のときだけ <code>Authorization</code> を付けているのも意図があります。認証を要求しないレジストリでは <code>fetchToken</code> が空文字列を返します。そのとき空の Bearer ヘッダを付けると、逆に断られるレジストリがあります。<strong>付けないほうが通る</strong>ケースがあるのです。</p>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>layers が無い! — 返ってきたのはリストだった</h2>
+
+    <p>さて、<code>Accept</code> も付けた、トークンも付けた、200 も返ってきた。JSON も読めた。それなのに <code>layers</code> が空です。ここが二番目の段差です。</p>
+
+    <p>実際に返ってきたものを見てください。これは実測した応答の先頭です（長いので途中で切れています）。</p>
+
+    <pre class="term"><code><span class="out">{"manifests":[{"annotations":{"com.docker.official-images.bashbrew.arch":"amd64","org.opencontainers.image.base.name":"scratch","org.opencontainers.image.created":"2026-06-16T00:01:04Z","org.opencontainers.image.revision":"398ff0c866d27e9f46f53e48184fe36c674b8897","org.opencontainers.image.source":"https://github.com/alpinelinux/docker-alpine.git#398ff0c866d27e9f46f53e48184fe36c674b8897:x86_64","org.opencontainers.image.url":"https://hub.docker.com/_/alpine","org.opencontainers.image.version":"3.24.1"},"digest":"sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f","mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"architecture":"amd64","os":"linux"},"size":1022},{"annotations":{"vnd.docker.reference.digest":"sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f","vnd.docker.reference.type":"attestation-manifest"},"digest":"sha256:f21951a6120df0f5f9329311202f7869e7b70120f4748632d58753cff662b126","mediaType":"application/vnd.oci.image.manifest.v1+json","platform":{"architecture":"unknown","os":"unknown"},"size":838}, ...</span></code></pre>
+
+    <p>いちばん外側のキーが <code>manifests</code> です。<code>layers</code> でも <code>config</code> でもありません。<strong>これはマニフェスト本体ではなく、マニフェストのリスト</strong>です。OCI ではインデックスと呼びます。</p>
+
+    <p>1件目を読んでみます。<code>"platform":{"architecture":"amd64","os":"linux"}</code> とあり、<code>"digest":"sha256:79ff19e9084a…"</code>、<code>"size":1022</code>。つまり「<strong>linux/amd64 向けの本物のマニフェストは、この digest のところにあります。大きさは 1022 バイトです</strong>」という案内です。案内板であって、目的地ではありません。</p>
+
+    <p>なぜこんな二段構えなのか。理由は<strong>CPU アーキテクチャ</strong>です。<code>alpine:latest</code> という1つのタグが、x86_64（amd64）でも ARM（arm64）でも動いてほしい。しかし中身のバイナリはアーキテクチャごとに完全に別物です。そこで「タグ → アーキテクチャ別マニフェストの一覧」という段を1つ挟み、<strong>取りに来た側が自分に合う版を選ぶ</strong>ことにした。あなたのラップトップが Apple Silicon でも、サーバが Intel でも、同じ <code>docker pull alpine</code> で正しいものが降ってくるのは、この段のおかげです。</p>
+
+    <p>この二種類の JSON を、Go でどう受けるか。ここに面白い工夫があります。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// descriptor はマニフェスト中の1項目（レイヤや設定への参照）。</span>
+<span class="kw">type</span> descriptor <span class="kw">struct</span> {
+	MediaType <span class="kw">string</span> <span class="st">`json:"mediaType"`</span>
+	Digest    <span class="kw">string</span> <span class="st">`json:"digest"`</span>
+	Size      <span class="kw">int64</span>  <span class="st">`json:"size"`</span>
+	Platform  *<span class="kw">struct</span> {
+		Architecture <span class="kw">string</span> <span class="st">`json:"architecture"`</span>
+		OS           <span class="kw">string</span> <span class="st">`json:"os"`</span>
+	} <span class="st">`json:"platform,omitempty"`</span>
+}
+
+<span class="cm">// manifest は「マニフェスト」と「マニフェストリスト（インデックス）」の両方を受けられる形。</span>
+<span class="cm">// manifests が非 nil ならリスト、layers が非 nil なら本体である。</span>
+<span class="kw">type</span> manifest <span class="kw">struct</span> {
+	SchemaVersion <span class="kw">int</span>          <span class="st">`json:"schemaVersion"`</span>
+	MediaType     <span class="kw">string</span>       <span class="st">`json:"mediaType"`</span>
+	Manifests     []descriptor <span class="st">`json:"manifests"`</span> <span class="cm">// インデックスのとき</span>
+	Config        descriptor   <span class="st">`json:"config"`</span>    <span class="cm">// 本体のとき</span>
+	Layers        []descriptor <span class="st">`json:"layers"`</span>    <span class="cm">// 本体のとき</span>
+}</code></pre>
+
+    <p>1つの構造体に、リスト用のフィールドと本体用のフィールドを<strong>両方</strong>持たせています。どちらが来ても同じ型で受けて、あとから中身を見て判断する。JSON にそのキーが無ければ、対応するスライスは <code>nil</code>（長さ0）のまま残ります。だから <code>len(man.Manifests) &gt; 0</code> ならリスト、<code>len(man.Layers) &gt; 0</code> なら本体、と判定できます。</p>
+
+    <p><code>descriptor</code> が「レイヤ」でも「config」でも「別のマニフェストへの案内」でも使い回せるのも、この形式のうまさです。どれも「メディアタイプ・digest・サイズ」の3点で表せる。だから <code>layers</code> の中身も <code>config</code> も <code>manifests</code> の中身も、全部同じ <code>descriptor</code> 型です。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · encoding/json で「どちらの形かわからない JSON」を受ける</div>
+      <p>Go の <code>encoding/json</code> は、<strong>構造体に無いキーを黙って捨て、JSON に無いキーはゼロ値のままにします</strong>。この寛容さが、ここでは武器になります。リストが来れば <code>Manifests</code> だけが埋まり <code>Layers</code> は <code>nil</code>、本体が来れば逆になる。どちらもエラーになりません。</p>
+      <p>判定は <strong>スライスが <code>nil</code> かどうか</strong>で行います。<code>MediaType</code> フィールドを見て分岐する手もありますが、これは当てになりません。実際にこの alpine の応答には、いちばん外側に <code>mediaType</code> が入っていないことがあります（上の実測 JSON を見てください、<code>manifests</code> がいきなり来ています）。<strong>「あると書いてあるフィールド」より「実際に埋まったフィールド」を信じる</strong>ほうが頑丈です。</p>
+      <p><code>Platform</code> がポインタ（<code>*struct{…}</code>）になっているのも意図的です。値型にすると「<code>platform</code> キーが無い」と「<code>platform</code> が空だった」を区別できません。ポインタなら、キーが無いときは <code>nil</code> のままです。Step 4 の <code>pickPlatform</code> は、この <code>nil</code> チェックから始まります。</p>
+      <p>もう1つ。もし「キーの有無を後で調べたい」ならば <code>map[string]json.RawMessage</code> で受けて生のバイト列を保持しておく手もあります。ただ今回は必要なフィールドが分かっているので、素直な構造体で足ります。</p>
+    </div>
+
+    <p>そして、リストだったら取り直す。<code>Pull</code> の中のこの部分です。</p>
+
+    <div class="file-tag">internal/image/registry.go — Pull の一部（全文は Step 7 で）</div>
+<pre><code>	<span class="cm">// ⚠ 返ってきたのがマニフェストリスト（インデックス）のことがある。</span>
+	<span class="cm">//    複数 CPU アーキテクチャの入り口なので、amd64/linux の項目を選んで digest で取り直す。</span>
+	<span class="kw">if</span> <span class="kw">len</span>(man.Layers) == <span class="st">0</span> &amp;&amp; <span class="kw">len</span>(man.Manifests) &gt; <span class="st">0</span> {
+		target, err := pickPlatform(man.Manifests)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+		s.<span class="ty">logf</span>(<span class="st">"マニフェストリストでした。%s/%s の %s を取り直します"</span>, runtime.<span class="ty">GOOS</span>, runtime.<span class="ty">GOARCH</span>, shortDigest(target.Digest))
+		man, err = s.<span class="ty">fetchManifest</span>(client, ref, token, target.Digest)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+	}
+	<span class="kw">if</span> <span class="kw">len</span>(man.Layers) == <span class="st">0</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"%s: マニフェストに layers がありません（schema 1 が返っている可能性があります）"</span>, ref)
+	}</code></pre>
+
+    <p>最後の <code>if</code> を見てください。取り直したのに、それでも <code>layers</code> が空だったときの受け皿です。そしてエラーメッセージが<strong>原因の候補を名指ししています</strong>——「schema 1 が返っている可能性があります」。半年後の自分がこのメッセージを見たとき、<code>Accept</code> ヘッダを疑うところから始められます。これは Step 2 の落とし穴に対する、コードからの手紙です。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · マニフェストは一段深いところにある</div>
+      <p>タグを引いて返ってきた JSON に <code>layers</code> が無いのは、<strong>異常ではなく通常</strong>です。公式イメージはほぼ確実にマニフェストリストを返します。「layers が無い＝エラー」と決めつけて例外を投げる実装は、いちばん普通のケースで落ちます。</p>
+      <p>正しい対応は「リストなら1件選んで、その digest でもう一度取る」。取り直しは <strong>同じ <code>fetchManifest</code> に digest を渡すだけ</strong>で、新しい関数は要りません。</p>
+    </div>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>さらに罠 — 「最初の項目」を取ると確実に壊れる</h2>
+
+    <p>リストから1件選べばいい。ではどう選ぶか。素朴に考えれば「1件目でいいのでは」となります。実測 JSON の1件目はちょうど <code>linux/amd64</code> ですし、動いてしまいそうです。</p>
+
+    <p>これは<strong>確実に壊れます</strong>。2件目を見てください。</p>
+
+    <div class="ascii">リストの2件目（実測 JSON の抜粋を読み下したもの）
+
+  digest      : sha256:f21951a6120df0f5…
+  mediaType   : application/vnd.oci.image.manifest.v1+json
+  platform    : { "architecture": "unknown", "os": "unknown" }   ★
+  annotations : { "vnd.docker.reference.type": "attestation-manifest",  ★
+                  "vnd.docker.reference.digest": "sha256:79ff19e9084a…" }
+  size        : 838
+
+  ★ これはイメージではない。1件目のイメージに対する「署名の付随物」。
+    掴むと、layers の無いマニフェストを引く。</div>
+
+    <p>これは <strong>attestation（証明）</strong> です。「このイメージは誰が・どういう手順でビルドしたか」を記録した付属文書で、サプライチェーンの検証に使われます。イメージそのものではありません。だから <code>platform.architecture</code> が <code>"unknown"</code> になっています。「どの CPU 向けでもない」という意味です。</p>
+
+    <p>並び順は保証されていません。attestation が先に来ることもあれば、arm64 が先のこともあります。<strong>順番に依存した実装は、いつか静かに壊れます</strong>。しかも壊れ方が意地悪です。attestation の digest を引くと HTTP 200 で正しい JSON が返り、ただ <code>layers</code> だけが無い。Step 3 で見たのと同じ「原因の見えない詰まり方」に戻ってしまいます。</p>
+
+    <p>だから、選び方を明示します。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// pickPlatform はマニフェストリストから、この環境で動く1件を選ぶ。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ 「最初の項目を取る」実装は確実に壊れる。</span>
+<span class="cm">// リストには architecture が "unknown" の attestation（署名の付随物）が混ざっており、</span>
+<span class="cm">// それを掴むと layers の無いマニフェストを引いてしまう。</span>
+<span class="kw">func</span> pickPlatform(list []descriptor) (descriptor, <span class="kw">error</span>) {
+	<span class="kw">for</span> _, d := <span class="kw">range</span> list {
+		<span class="kw">if</span> d.Platform == <span class="kw">nil</span> {
+			<span class="kw">continue</span>
+		}
+		<span class="kw">if</span> d.Platform.OS == runtime.<span class="ty">GOOS</span> &amp;&amp; d.Platform.Architecture == runtime.<span class="ty">GOARCH</span> {
+			<span class="kw">return</span> d, <span class="kw">nil</span>
+		}
+	}
+	<span class="kw">var</span> have []<span class="kw">string</span>
+	<span class="kw">for</span> _, d := <span class="kw">range</span> list {
+		<span class="kw">if</span> d.Platform != <span class="kw">nil</span> {
+			have = <span class="kw">append</span>(have, d.Platform.OS+<span class="st">"/"</span>+d.Platform.Architecture)
+		}
+	}
+	<span class="kw">return</span> descriptor{}, fmt.<span class="ty">Errorf</span>(<span class="st">"このイメージに %s/%s 向けの版がありません（あるのは: %s）"</span>,
+		runtime.<span class="ty">GOOS</span>, runtime.<span class="ty">GOARCH</span>, strings.<span class="ty">Join</span>(have, <span class="st">", "</span>))
+}</code></pre>
+
+    <p>前半のループが本体です。<code>runtime.GOOS</code> と <code>runtime.GOARCH</code> は、<strong>この Go プログラムがビルドされたときの OS と CPU アーキテクチャ</strong>を表す定数です。この環境では <code>linux</code> と <code>amd64</code>（<code>go version go1.24.7 linux/amd64</code> でしたね）。文字列として <code>"linux"</code> と <code>"amd64"</code> が入っているので、JSON の値とそのまま比較できます。OCI の仕様が Go の慣習に合わせて作られたので、この2つはきれいに一致します。</p>
+
+    <p><code>d.Platform == nil</code> の <code>continue</code> は、<code>platform</code> キーそのものが無い項目を飛ばすためです。attestation は <code>"unknown"</code> という値を持っているのでここでは弾かれず、次の行の <code>== runtime.GOARCH</code> の比較で落ちます。二重の網です。</p>
+
+    <p>後半の <code>have</code> を集めるループが、この関数のもう一つの主張です。<strong>見つからなかったときに、あるものの一覧を添えてエラーにする。</strong> たとえば ARM の Mac で amd64 専用イメージを引いてしまったとき、</p>
+
+    <ul>
+      <li>悪い例: <code>マニフェストが見つかりません</code> — 何を調べればいいか分からない</li>
+      <li>この実装: <code>このイメージに linux/arm64 向けの版がありません（あるのは: linux/amd64, unknown/unknown）</code> — <strong>その場で理解できて、次の一手が決まる</strong></li>
+    </ul>
+
+    <p>エラーメッセージは、失敗したときにしか読まれません。だからこそ、失敗した人がいちばん知りたい情報を載せます。「無い」だけでなく「代わりに何があったか」を。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · attestation を掴むと、200 なのに layers が無い</div>
+      <p>マニフェストリストの中には、イメージではない項目が混ざっています。<code>vnd.docker.reference.type: attestation-manifest</code> という注釈が付き、<code>platform</code> は <code>unknown/unknown</code>。<strong>これを掴んでも HTTP は 200 で成功します。</strong>ただ <code>layers</code> が無いだけです。</p>
+      <p>「最初の項目を取る」「<code>platform</code> を見ずに <code>mediaType</code> だけで選ぶ」実装は、いずれこれを引きます。<strong>必ず <code>platform.os</code> と <code>platform.architecture</code> の両方を、自分の <code>runtime.GOOS</code> / <code>runtime.GOARCH</code> と突き合わせて選んでください。</strong></p>
+    </div>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span>設定 JSON を取る — Env と Cmd はここにある</h2>
+
+    <p>取り直したマニフェスト本体には、<code>layers</code> のほかに <code>config</code> という項目が1つあります。これも digest で指された blob です。中身は JSON で、<strong>コンテナをどう起動すべきかが書いてあります</strong>。</p>
+
+    <p>ここは意外と見落とされる部分です。<code>docker run alpine</code> と打ったとき、何もコマンドを指定していないのに <code>/bin/sh</code> が動きます。<code>echo $PATH</code> を打つとちゃんと <code>/usr/local/sbin:/usr/local/bin:…</code> が入っています。あの既定値は、カーネルでもランタイムでもなく、<strong>この config JSON から来ています</strong>。</p>
+
+    <p>私たちが要るのは4つだけです。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// imageConfig はイメージの設定 JSON のうち、コンテナ起動に要る部分だけ。</span>
+<span class="kw">type</span> imageConfig <span class="kw">struct</span> {
+	Config <span class="kw">struct</span> {
+		Env        []<span class="kw">string</span> <span class="st">`json:"Env"`</span>
+		Cmd        []<span class="kw">string</span> <span class="st">`json:"Cmd"`</span>
+		Entrypoint []<span class="kw">string</span> <span class="st">`json:"Entrypoint"`</span>
+		WorkingDir <span class="kw">string</span>   <span class="st">`json:"WorkingDir"`</span>
+	} <span class="st">`json:"config"`</span>
+}</code></pre>
+
+    <p>JSON タグの大文字に注意してください。<code>"Env"</code>、<code>"Cmd"</code>、<code>"Entrypoint"</code> と、<strong>頭が大文字</strong>です。マニフェストのほうは <code>"mediaType"</code>、<code>"digest"</code> と小文字始まりでした。同じイメージ仕様の中で命名規則が食い違っています。config JSON は Docker が昔から使ってきた形式がそのまま残っているためで、歴史的経緯としか言いようがありません。<strong>タグを小文字で書くと黙って空になります</strong>ので、ここは仕様書どおりに写します。</p>
+
+    <p>外側に <code>config</code> というキーがもう一段あるのも見落としやすい点です。JSON は <code>{"config":{"Env":[…],"Cmd":[…]}}</code> という入れ子で、だから Go 側も匿名の構造体を1段ネストさせています。</p>
+
+    <p>取得の関数はこうです。ここで初めて<strong>キャッシュ</strong>が顔を出します。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="kw">func</span> (s *<span class="ty">Store</span>) fetchConfig(client *http.<span class="ty">Client</span>, ref <span class="ty">Ref</span>, token <span class="kw">string</span>, d descriptor) (*imageConfig, <span class="kw">error</span>) {
+	<span class="kw">var</span> cfg imageConfig
+	path := s.<span class="ty">configPath</span>(d.Digest)
+	<span class="kw">if</span> err := loadJSON(path, &amp;cfg); err == <span class="kw">nil</span> {
+		<span class="kw">return</span> &amp;cfg, <span class="kw">nil</span>
+	}
+	url := fmt.<span class="ty">Sprintf</span>(<span class="st">"https://%s/v2/%s/blobs/%s"</span>, ref.Registry, ref.Repository, d.Digest)
+	body, err := s.<span class="ty">get</span>(client, url, token, <span class="st">"*/*"</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+	<span class="kw">if</span> err := json.<span class="ty">Unmarshal</span>(body, &amp;cfg); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"イメージ設定の JSON を読めませんでした: %w"</span>, err)
+	}
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(filepath.<span class="ty">Dir</span>(path), <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+	<span class="kw">if</span> err := os.<span class="ty">WriteFile</span>(path, body, <span class="st">0o644</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+	<span class="kw">return</span> &amp;cfg, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>最初の3行が「もうローカルにあるなら、それを読んで即座に返す」です。ファイル名は digest から作るので（<code>configPath</code>）、<strong>同じ digest なら中身は同じ</strong>。読めたら通信しません。読めなければ（ファイルが無ければ）落としに行き、成功したら次回のために書いておきます。</p>
+
+    <p>URL の形が <code>/manifests/</code> ではなく <code>/blobs/</code> になっていることに注意してください。マニフェストは「目録」、blob は「中身」です。config JSON もレイヤの tar.gz も、レジストリから見ればどちらも同じ blob で、同じエンドポイントで配られます。</p>
+
+    <p><code>Accept</code> に <code>"*/*"</code> を渡しているのは、blob は形式の交渉が要らないからです。digest で名指しした時点で中身は一意に決まっています。ここで <code>acceptManifest</code> を渡してしまうと、逆に「その形式では配れない」と断られることがあります。</p>
+
+    <p>ちなみに alpine の config は <strong>611 バイト</strong>しかありません。展開後 8.7 MB のファイルシステム全体に対して、起動の作法を記述した部分はたったこれだけです。</p>
+
+    <h2 class="step" id="step-6"><span class="step-no">Step 6</span>レイヤを落とす — 落としながらハッシュを取る</h2>
+
+    <p>ようやく実体です。<code>layers</code> の各項目の digest を <code>/blobs/</code> に投げれば、tar.gz がそのまま降ってきます。alpine の場合、レイヤは<strong>1枚だけ</strong>、mediaType は <code>application/vnd.oci.image.layer.v1.tar+gzip</code>、圧縮 3.67 MiB です。</p>
+
+    <p>素朴に書くなら「全部ダウンロードして一時ファイルに保存 → ハッシュを検算 → 展開」でしょう。3段階です。しかしこれは、3.67 MiB を<strong>2回読む</strong>ことになります（検算で1回、展開で1回）。しかも一時ファイルの置き場所も要ります。</p>
+
+    <p>もっといい方法があります。<strong>流しながら、同時に両方やる</strong>のです。</p>
+
+    <div class="ascii">io.TeeReader — 読みながら、同じバイト列を別の場所にも流す
+
+                      ┌──────────────────────────────► ExtractLayer
+                      │   （tar.gz を解いて展開）        layers/sha256_55af….tmp/
+  resp.Body ──► TeeReader
+                      │
+                      └──────────────────────────────► sha256 ハッシュ計算器
+                          （1バイトも余分に読まずに）    最後に digest と照合
+
+  読み取りは1回だけ。ネットワークから来たバイトが、展開器とハッシュ計算器の
+  両方を同時に通り抜ける。一時ファイルは要らない。</div>
+
+    <p>実装を見てください。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// fetchLayer はレイヤ1枚を落として dir に展開する。</span>
+<span class="cm">//</span>
+<span class="cm">// 途中で失敗したディレクトリを「取得済み」と誤認しないよう、</span>
+<span class="cm">// 展開が最後まで終わったときにだけ .complete という印を置く。</span>
+<span class="kw">func</span> (s *<span class="ty">Store</span>) fetchLayer(client *http.<span class="ty">Client</span>, ref <span class="ty">Ref</span>, token <span class="kw">string</span>, d descriptor, dir <span class="kw">string</span>) <span class="kw">error</span> {
+	url := fmt.<span class="ty">Sprintf</span>(<span class="st">"https://%s/v2/%s/blobs/%s"</span>, ref.Registry, ref.Repository, d.Digest)
+	req, _ := http.<span class="ty">NewRequest</span>(http.<span class="ty">MethodGet</span>, url, <span class="kw">nil</span>)
+	<span class="kw">if</span> token != <span class="st">""</span> {
+		req.Header.<span class="ty">Set</span>(<span class="st">"Authorization"</span>, <span class="st">"Bearer "</span>+token)
+	}
+	resp, err := client.<span class="ty">Do</span>(req)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"レイヤの取得に失敗しました: %w"</span>, err)
+	}
+	<span class="kw">defer</span> resp.Body.<span class="ty">Close</span>()
+	<span class="kw">if</span> resp.StatusCode != http.<span class="ty">StatusOK</span> {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"レイヤの取得に失敗しました (HTTP %d): %s"</span>, resp.StatusCode, shortDigest(d.Digest))
+	}
+
+	<span class="cm">// 落としながら同時にハッシュを計算する。digest は中身のハッシュなので、</span>
+	<span class="cm">// 一致しなければ「途中で壊れた」か「別物を掴んだ」ことになる。</span>
+	hasher := sha256.<span class="ty">New</span>()
+	body := io.<span class="ty">TeeReader</span>(resp.Body, hasher)
+
+	tmp := dir + <span class="st">".tmp"</span>
+	_ = os.<span class="ty">RemoveAll</span>(tmp)
+	<span class="kw">if</span> _, err := <span class="ty">ExtractLayer</span>(body, tmp); err != <span class="kw">nil</span> {
+		_ = os.<span class="ty">RemoveAll</span>(tmp)
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"レイヤ %s の展開に失敗しました: %w"</span>, shortDigest(d.Digest), err)
+	}
+	<span class="cm">// 本体を読み切ってからでないとハッシュが完成しない</span>
+	<span class="kw">if</span> _, err := io.<span class="ty">Copy</span>(io.<span class="ty">Discard</span>, body); err != <span class="kw">nil</span> {
+		_ = os.<span class="ty">RemoveAll</span>(tmp)
+		<span class="kw">return</span> err
+	}
+	got := <span class="st">"sha256:"</span> + hex.<span class="ty">EncodeToString</span>(hasher.<span class="ty">Sum</span>(<span class="kw">nil</span>))
+	<span class="kw">if</span> !strings.<span class="ty">EqualFold</span>(got, d.Digest) {
+		_ = os.<span class="ty">RemoveAll</span>(tmp)
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"レイヤの digest が一致しません: 期待 %s / 実際 %s"</span>, d.Digest, got)
+	}
+
+	_ = os.<span class="ty">RemoveAll</span>(dir)
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(filepath.<span class="ty">Dir</span>(dir), <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">if</span> err := os.<span class="ty">Rename</span>(tmp, dir); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">return</span> os.<span class="ty">WriteFile</span>(dir+<span class="st">".complete"</span>, []<span class="kw">byte</span>(d.Digest), <span class="st">0o644</span>)
+}</code></pre>
+
+    <p>中心は2行です。</p>
+
+    <p><code>hasher := sha256.New()</code> でハッシュ計算器を作り、<code>body := io.TeeReader(resp.Body, hasher)</code> で「<code>body</code> から読むと、読まれたぶんが自動的に <code>hasher</code> にも流れる」読み取り口を作ります。あとは <code>body</code> を <code>ExtractLayer</code> に渡すだけ。展開器はハッシュのことを何も知りませんし、知る必要もありません。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · io.TeeReader</div>
+      <p><code>io.TeeReader(r, w)</code> は「<code>r</code> から読んだバイトを、そのまま <code>w</code> にも書きながら返す <code>io.Reader</code>」を作ります。名前は UNIX の <code>tee</code> コマンド（標準出力に流しつつファイルにも保存するあれ）から来ています。</p>
+      <p>ありがたいのは<strong>メモリを食わない</strong>ことです。3.67 MiB のレイヤでも 3 GB のレイヤでも、使うメモリは内部バッファのぶんだけ。全体をメモリに載せる必要も、一時ファイルに落とす必要もありません。ネットワークから来たバイトが、通り過ぎざまにハッシュを更新していきます。</p>
+      <p>ここで押さえておくべき性質が1つ。<strong><code>hasher</code> が正しい値になるのは、<code>body</code> を最後の1バイトまで読み切ったときだけ</strong>です。読まれなかったバイトはハッシュにも入りません。だから <code>io.Copy(io.Discard, body)</code> が要ります。<code>ExtractLayer</code> は gzip ストリームを解きますが、tar の終端に達した時点で読むのをやめるので、末尾に数バイト残ることがあるのです。<code>io.Discard</code> は「書き込まれたものを捨てる <code>io.Writer</code>」で、この <code>io.Copy</code> は「残りを読み捨てて <code>hasher</code> を完成させる」ためだけに存在します。<strong>捨てるために読む</strong>という一見無駄な行に、ちゃんと役目があります。</p>
+    </div>
+
+    <p>ハッシュの照合が終わったら、<code>.tmp</code> を本番の名前に <code>os.Rename</code> します。<strong>ここが原子的（アトミック）</strong>であることが肝です。同じファイルシステム内の <code>rename</code> はカーネルが一瞬で行うので、「半分だけ名前が変わった状態」は存在しません。展開中の中途半端なディレクトリが本番の名前を名乗る瞬間が無い、ということです。</p>
+
+    <p>そして最後の1行、<code>.complete</code> の印。これは Step 7 の主題なので、そこで扱います。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · digest（content-addressable）</div>
+      <p><code>sha256:55afa1ecc21d…</code> という名前は、<strong>そのデータ自体を SHA-256 に通した結果</strong>です。ファイル名を人間が決めるのではなく、中身が自分の名前を決めています。これを content-addressable（内容アドレス指定）と言います。</p>
+      <p>この一点から、いくつもの性質が自動的に付いてきます。<strong>同じ名前なら中身は必ず同じ</strong>（SHA-256 が衝突しない限り）。だから「もう持っているか」の判定が名前の比較だけで済み、キャッシュが自然に成立します。逆に<strong>中身が1バイトでも違えば名前も違う</strong>ので、上書きや世代管理という概念そのものが要りません。新しい中身は新しい名前で置かれるだけです。</p>
+      <p>そして検証もタダで付いてきます。落としたものを SHA-256 に通して名前と一致すれば、途中で壊れていないことも、別物を掴んでいないことも同時に確かめられます。<code>fetchLayer</code> の照合はまさにこれです。HTTPS で守られているのは「通信路」であって「中身」ではありません。レジストリの中で壊れていたり、キャッシュサーバが古いものを返したりする可能性は HTTPS では消えません。digest の照合は、<strong>相手が誰であっても中身が正しいことを自分で確かめる</strong>手段です。</p>
+      <p>Git のコミットハッシュ、IPFS の CID、Nix のストアパス。みな同じ考え方の上に建っています。<code>/var/lib/mydocker/layers/sha256_55afa…</code> という長い名前は、その一員です。</p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>実際に落としてみます。1枚しかないレイヤの、圧縮サイズが表示されます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker pull mirror.gcr.io/library/alpine
+<span class="out">マニフェストリストでした。linux/amd64 の 79ff19e9084a を取り直します
+レイヤ 1/1 55afa1ecc21d: 取得中 (3.7 MiB)
+mirror.gcr.io/library/alpine:latest: レイヤ 1 枚
+  1: /var/lib/mydocker/layers/sha256_55afa1ecc21d2bb5e5045f32dafee56272ffd89860bac26f6c32123439af26a4</span></code></pre>
+      <p>1行目が Step 3・4 の処理です。「リストだったので、<code>linux/amd64</code> の版を digest で取り直しました」と言っています。2行目が Step 6。3.7 MiB を落として、ハッシュを照合して、展開まで終えています。最後の行が置き場所で、ディレクトリ名がそのまま digest になっているのが見えます。</p>
+    </div>
+
+    <p>展開後の中身は <strong>8.7 MB・516 ファイル</strong>です。<code>/etc/alpine-release</code> を読めば <code>3.24.1</code> と書いてあります。3.67 MiB の tar.gz 1枚が、Linux ディストリビューション1つぶんのファイルシステムでした。</p>
+
+    <h2 class="step" id="step-7"><span class="step-no">Step 7</span>キャッシュ — digest をディレクトリ名にする</h2>
+
+    <p>ここまでで機能としては動きます。しかし開発中にこのまま進めると、遠くない未来に必ず止まります。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · Docker Hub には匿名アクセスの取得回数制限がある</div>
+      <p>Docker Hub は、匿名（未ログイン）でのイメージ取得に<strong>回数の上限</strong>を設けています。上限に達すると <strong>HTTP 429 Too Many Requests</strong> が返り、しばらく何も取れなくなります。</p>
+      <p>これは本番運用の話ではありません。<strong>開発中がいちばん危ない</strong>のです。「動くかな」と <code>go run</code> を10回、テストで20回、うっかりループで数十回。イメージの中身は1バイトも変わっていないのに、同じものを何度も引きに行く。ある回から突然エラーになり、しかもコードは何も変えていないので原因が分かりません。</p>
+      <p>この実装では <code>s.get</code> が 429 を専用に検知して <code>取得回数の上限に達しました (HTTP 429)。しばらく待つか、キャッシュ済みのイメージを使ってください</code> と返します。だがそもそも、<strong>2回目を引かない</strong>のが正解です。</p>
+    </div>
+
+    <p>では、どうやって「もう持っている」を判定するか。ここで Step 6 の digest が効いてきます。<strong>ディレクトリ名を digest にしておけば、名前の存在確認がそのままキャッシュの判定になります。</strong>「同じ名前＝同じ中身」が保証されているからです。中身を比べる必要も、更新日時を見る必要も、バージョンを管理する必要もありません。</p>
+
+    <p>置き場を決める部分を見ます。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// Store はイメージのローカル置き場。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ Docker Hub には匿名アクセスの取得回数制限がある。開発中に何度も引くと止まる。</span>
+<span class="cm">// レイヤは digest をディレクトリ名にして保存する。digest は中身のハッシュなので、</span>
+<span class="cm">// 「同じ名前 ＝ 同じ中身」が保証される。これで自然にキャッシュになる。</span>
+<span class="kw">type</span> <span class="ty">Store</span> <span class="kw">struct</span> {
+	Root <span class="kw">string</span> <span class="cm">// 例: /var/lib/mydocker</span>
+	<span class="cm">// Log は進捗の出力先。nil なら何も出さない。</span>
+	Log io.<span class="ty">Writer</span>
+}
+
+<span class="kw">func</span> (s *<span class="ty">Store</span>) layerDir(digest <span class="kw">string</span>) <span class="kw">string</span> {
+	<span class="kw">return</span> filepath.<span class="ty">Join</span>(s.Root, <span class="st">"layers"</span>, safeDigest(digest))
+}
+<span class="kw">func</span> (s *<span class="ty">Store</span>) manifestPath(ref <span class="ty">Ref</span>) <span class="kw">string</span> {
+	<span class="kw">return</span> filepath.<span class="ty">Join</span>(s.Root, <span class="st">"manifests"</span>, ref.<span class="ty">cacheKey</span>()+<span class="st">".json"</span>)
+}
+<span class="kw">func</span> (s *<span class="ty">Store</span>) configPath(digest <span class="kw">string</span>) <span class="kw">string</span> {
+	<span class="kw">return</span> filepath.<span class="ty">Join</span>(s.Root, <span class="st">"configs"</span>, safeDigest(digest)+<span class="st">".json"</span>)
+}
+
+<span class="kw">func</span> (s *<span class="ty">Store</span>) logf(format <span class="kw">string</span>, args ...<span class="kw">any</span>) {
+	<span class="kw">if</span> s.Log != <span class="kw">nil</span> {
+		fmt.<span class="ty">Fprintf</span>(s.Log, format+<span class="st">"\n"</span>, args...)
+	}
+}</code></pre>
+
+    <p><code>safeDigest</code> は <code>sha256:55afa…</code> の <code>:</code> を <code>_</code> に置き換えるだけの関数です（Step 8 でまとめて見ます）。コロンはファイル名に使えない環境があるので、機械的に潰しています。</p>
+
+    <p><code>Log io.Writer</code> という設計も見ておいてください。進捗を <code>fmt.Println</code> で直に出さず、書き込み先を外から渡せるようにしてあります。<code>nil</code> なら何も出さない。これで <code>mydocker run --quiet</code> のときに黙らせることができますし、テストでは出力を捕まえて検証できます。<strong>ライブラリが標準出力を勝手に汚さない</strong>ための小さな作法です。</p>
+
+    <p>次に、「取得済み」の判定です。ここに、初見では思いつきにくい工夫が入っています。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="kw">func</span> isComplete(dir <span class="kw">string</span>) <span class="kw">bool</span> {
+	<span class="kw">if</span> _, err := os.<span class="ty">Stat</span>(dir + <span class="st">".complete"</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	fi, err := os.<span class="ty">Stat</span>(dir)
+	<span class="kw">return</span> err == <span class="kw">nil</span> &amp;&amp; fi.<span class="ty">IsDir</span>()
+}</code></pre>
+
+    <p>なぜ「ディレクトリが存在するか」だけで判定しないのか。<strong>途中で失敗したディレクトリを「取得済み」と誤認しないため</strong>です。</p>
+
+    <p>考えてみてください。3.67 MiB を展開している途中で、ネットワークが切れた、電源が落ちた、Ctrl-C を押した。すると <code>layers/sha256_55afa…</code> には<strong>中途半端に展開されたファイル群</strong>が残ります。ディレクトリは存在します。でも中身は半分です。次に起動したとき「ディレクトリがあるから取得済み」と判断すると、<strong>ファイルが欠けたイメージでコンテナを起動してしまいます</strong>。しかも一度そうなると、以後ずっとそのままです。</p>
+
+    <p>そこで、印を分けます。展開が最後まで終わり、ハッシュの照合も通り、<code>rename</code> も済んだ——<strong>その全部が終わった後にだけ</strong>、<code>.complete</code> という別のファイルを置く。判定はこの印を見ます。途中で死んだら印は置かれないので、次回はきちんと取り直します。</p>
+
+    <div class="ascii">「取得済み」の印を、中身とは別のファイルにする理由
+
+  途中で失敗したとき                    最後まで成功したとき
+  ─────────────────                    ─────────────────
+  layers/sha256_55af….tmp/  ← 中途半端   layers/sha256_55af…/         ← 完全な中身
+  （.complete は無い）                   layers/sha256_55af….complete ← 印
+
+  isComplete() は .complete だけを見る。
+  → 中途半端なディレクトリを「持っている」と誤認しない。
+  → 展開 → ハッシュ照合 → rename → 印、の順序が守られている証明にもなる。</div>
+
+    <p>この「本体を書き終えてから印を置く」という順序は、あらゆる場所で使える型です。データベースのコミットログも、ビルドシステムのスタンプファイルも、考え方は同じです。<strong>作業の完了は、作業とは別に記録する。</strong></p>
+
+    <p>さらにもう一段。マニフェストも保存してしまえば、<strong>2回目は HTTP を1回も叩かずに済みます</strong>。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// fromCache は保存済みのマニフェストとレイヤだけでイメージを組み立てられるか試す。</span>
+<span class="kw">func</span> (s *<span class="ty">Store</span>) fromCache(ref <span class="ty">Ref</span>) (*<span class="ty">Image</span>, <span class="kw">bool</span>) {
+	<span class="kw">var</span> man manifest
+	<span class="kw">if</span> err := loadJSON(s.<span class="ty">manifestPath</span>(ref), &amp;man); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">false</span>
+	}
+	<span class="kw">if</span> <span class="kw">len</span>(man.Layers) == <span class="st">0</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">false</span>
+	}
+	<span class="kw">var</span> dirs []<span class="kw">string</span>
+	<span class="kw">for</span> _, l := <span class="kw">range</span> man.Layers {
+		dir := s.<span class="ty">layerDir</span>(l.Digest)
+		<span class="kw">if</span> !isComplete(dir) {
+			<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">false</span>
+		}
+		dirs = <span class="kw">append</span>(dirs, dir)
+	}
+	<span class="kw">var</span> cfg imageConfig
+	<span class="kw">if</span> err := loadJSON(s.<span class="ty">configPath</span>(man.Config.Digest), &amp;cfg); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">false</span>
+	}
+	<span class="kw">return</span> &amp;<span class="ty">Image</span>{
+		Ref: ref, LayerDirs: dirs,
+		Env: cfg.Config.Env, Cmd: cfg.Config.Cmd,
+		Entrypoint: cfg.Config.Entrypoint, WorkingDir: cfg.Config.WorkingDir,
+	}, <span class="kw">true</span>
+}</code></pre>
+
+    <p>この関数の構造をよく見てください。<strong>「揃っていなければ、いつでも <code>false</code> を返して諦める」</strong>という一本道です。マニフェストが読めない、レイヤが0枚、どれか1枚でも <code>.complete</code> が無い、config が読めない——どこで転んでも <code>(nil, false)</code>。そして呼び出し側は、<code>false</code> なら普通に通信して取りに行くだけです。</p>
+
+    <p>キャッシュのコードで怖いのは「壊れたキャッシュを使ってしまう」ことです。それを防ぐには、<strong>疑わしきは使わない</strong>を徹底するのがいちばん簡単です。この関数はエラーを一切上に投げません。エラーは全部「キャッシュは使えなかった」という意味に変換されます。最悪でも通信が1回増えるだけで、間違った中身でコンテナが起動することはありません。</p>
+
+    <p>ここまでの部品が全部揃ったので、<code>Pull</code> の全文を見ます。この章のすべてが、この1つの関数に順番に並んでいます。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// Pull はイメージを取得して展開し、使える状態にして返す。</span>
+<span class="cm">// すべてキャッシュに揃っていればネットワークには一切アクセスしない。</span>
+<span class="kw">func</span> (s *<span class="ty">Store</span>) <span class="ty">Pull</span>(refStr <span class="kw">string</span>) (*<span class="ty">Image</span>, <span class="kw">error</span>) {
+	ref, err := <span class="ty">ParseRef</span>(refStr)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+
+	<span class="cm">// --- キャッシュだけで済むなら、そもそも通信しない ---</span>
+	<span class="kw">if</span> img, ok := s.<span class="ty">fromCache</span>(ref); ok {
+		s.<span class="ty">logf</span>(<span class="st">"キャッシュ: %s（ネットワークにはアクセスしません）"</span>, ref)
+		<span class="kw">return</span> img, <span class="kw">nil</span>
+	}
+
+	client := &amp;http.<span class="ty">Client</span>{Timeout: <span class="st">120</span> * time.<span class="ty">Second</span>}
+
+	<span class="cm">// ① トークン</span>
+	token, err := s.<span class="ty">fetchToken</span>(client, ref)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+
+	<span class="cm">// ② マニフェスト</span>
+	man, err := s.<span class="ty">fetchManifest</span>(client, ref, token, ref.Tag)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+
+	<span class="cm">// ⚠ 返ってきたのがマニフェストリスト（インデックス）のことがある。</span>
+	<span class="cm">//    複数 CPU アーキテクチャの入り口なので、amd64/linux の項目を選んで digest で取り直す。</span>
+	<span class="kw">if</span> <span class="kw">len</span>(man.Layers) == <span class="st">0</span> &amp;&amp; <span class="kw">len</span>(man.Manifests) &gt; <span class="st">0</span> {
+		target, err := pickPlatform(man.Manifests)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+		s.<span class="ty">logf</span>(<span class="st">"マニフェストリストでした。%s/%s の %s を取り直します"</span>, runtime.<span class="ty">GOOS</span>, runtime.<span class="ty">GOARCH</span>, shortDigest(target.Digest))
+		man, err = s.<span class="ty">fetchManifest</span>(client, ref, token, target.Digest)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+	}
+	<span class="kw">if</span> <span class="kw">len</span>(man.Layers) == <span class="st">0</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"%s: マニフェストに layers がありません（schema 1 が返っている可能性があります）"</span>, ref)
+	}
+
+	<span class="cm">// 設定 JSON（Env / Cmd を拾う）</span>
+	cfg, err := s.<span class="ty">fetchConfig</span>(client, ref, token, man.Config)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+
+	<span class="cm">// ③ レイヤ</span>
+	<span class="kw">var</span> dirs []<span class="kw">string</span>
+	<span class="kw">for</span> i, layer := <span class="kw">range</span> man.Layers {
+		dir := s.<span class="ty">layerDir</span>(layer.Digest)
+		<span class="kw">if</span> isComplete(dir) {
+			s.<span class="ty">logf</span>(<span class="st">"レイヤ %d/%d %s: キャッシュ済み"</span>, i+<span class="st">1</span>, <span class="kw">len</span>(man.Layers), shortDigest(layer.Digest))
+		} <span class="kw">else</span> {
+			s.<span class="ty">logf</span>(<span class="st">"レイヤ %d/%d %s: 取得中 (%.1f MiB)"</span>, i+<span class="st">1</span>, <span class="kw">len</span>(man.Layers), shortDigest(layer.Digest), <span class="kw">float64</span>(layer.Size)/(<span class="st">1</span>&lt;&lt;<span class="st">20</span>))
+			<span class="kw">if</span> err := s.<span class="ty">fetchLayer</span>(client, ref, token, layer, dir); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> <span class="kw">nil</span>, err
+			}
+		}
+		dirs = <span class="kw">append</span>(dirs, dir)
+	}
+
+	<span class="cm">// マニフェストを保存しておけば、次回は通信そのものが要らなくなる</span>
+	<span class="kw">if</span> err := saveJSON(s.<span class="ty">manifestPath</span>(ref), man); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+
+	<span class="kw">return</span> &amp;<span class="ty">Image</span>{
+		Ref:        ref,
+		LayerDirs:  dirs,
+		Env:        cfg.Config.Env,
+		Cmd:        cfg.Config.Cmd,
+		Entrypoint: cfg.Config.Entrypoint,
+		WorkingDir: cfg.Config.WorkingDir,
+	}, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>キャッシュの判定が<strong>いちばん先頭</strong>にあることに注目してください。<code>http.Client</code> を作るより前です。揃っていればトークンすら取りに行きません。Docker Hub の 429 は「イメージの取得」だけでなく認証にも効くので、<strong>1回も HTTP を出さない</strong>ことが本当に効きます。</p>
+
+    <p>返す <code>Image</code> 構造体はこれです。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// Image は取得・展開が済んだイメージ。</span>
+<span class="kw">type</span> <span class="ty">Image</span> <span class="kw">struct</span> {
+	Ref        <span class="ty">Ref</span>
+	LayerDirs  []<span class="kw">string</span> <span class="cm">// 展開済みレイヤのディレクトリ。★下から上の順（先頭が最下層）</span>
+	Env        []<span class="kw">string</span>
+	Cmd        []<span class="kw">string</span>
+	Entrypoint []<span class="kw">string</span>
+	WorkingDir <span class="kw">string</span>
+}</code></pre>
+
+    <p><code>LayerDirs</code> のコメントに <strong>★下から上の順（先頭が最下層）</strong>とあります。この順序が次章の生命線です。今は「順番に意味がある」とだけ覚えておいてください。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>同じコマンドを2回打ちます。1回目と2回目で、出力が変わることを見てください。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker pull mirror.gcr.io/library/alpine
+<span class="out">マニフェストリストでした。linux/amd64 の 79ff19e9084a を取り直します
+レイヤ 1/1 55afa1ecc21d: 取得中 (3.7 MiB)
+mirror.gcr.io/library/alpine:latest: レイヤ 1 枚
+  1: /var/lib/mydocker/layers/sha256_55afa1ecc21d2bb5e5045f32dafee56272ffd89860bac26f6c32123439af26a4</span>
+<span class="ps">$</span> mydocker pull mirror.gcr.io/library/alpine
+<span class="out">キャッシュ: mirror.gcr.io/library/alpine:latest（ネットワークにはアクセスしません）
+mirror.gcr.io/library/alpine:latest: レイヤ 1 枚
+  1: /var/lib/mydocker/layers/sha256_55afa1ecc21d2bb5e5045f32dafee56272ffd89860bac26f6c32123439af26a4</span></code></pre>
+      <p>2回目は「マニフェストリストでした」も「取得中」も出ていません。<code>fromCache</code> が先頭で成功して、そのまま返っているからです。<strong>ネットワークケーブルを抜いても、この2回目は通ります。</strong></p>
+    </div>
+
+    <h2 class="step" id="step-8"><span class="step-no">Step 8</span>イメージ参照の分解 — alpine とは何の略か</h2>
+
+    <p>ここまで <code>ref.Registry</code> や <code>ref.Repository</code> を当たり前のように使ってきましたが、利用者が実際に打つのは <code>alpine</code> の6文字だけです。これを組み立て直す必要があります。</p>
+
+    <p><code>docker pull alpine</code> が実際に取りに行っているのは <code>registry-1.docker.io/library/alpine:latest</code> です。省略されているものが3つあります。<strong>レジストリ名・名前空間（<code>library/</code>）・タグ（<code>:latest</code>）</strong>。この省略の展開規則を実装するのがこの Step です。</p>
+
+    <p>受け皿の型から。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// Ref は "alpine" や "ghcr.io/foo/bar:1.2" のようなイメージ参照を分解したもの。</span>
+<span class="kw">type</span> <span class="ty">Ref</span> <span class="kw">struct</span> {
+	Registry   <span class="kw">string</span> <span class="cm">// 例: registry-1.docker.io</span>
+	Repository <span class="kw">string</span> <span class="cm">// 例: library/alpine</span>
+	Tag        <span class="kw">string</span> <span class="cm">// 例: latest</span>
+}
+
+<span class="kw">func</span> (r <span class="ty">Ref</span>) <span class="ty">String</span>() <span class="kw">string</span> { <span class="kw">return</span> r.Registry + <span class="st">"/"</span> + r.Repository + <span class="st">":"</span> + r.Tag }
+
+<span class="cm">// cacheKey はキャッシュのファイル名に使える形にした参照。</span>
+<span class="kw">func</span> (r <span class="ty">Ref</span>) cacheKey() <span class="kw">string</span> {
+	s := r.Registry + <span class="st">"_"</span> + r.Repository + <span class="st">"_"</span> + r.Tag
+	<span class="kw">return</span> strings.<span class="ty">NewReplacer</span>(<span class="st">"/"</span>, <span class="st">"_"</span>, <span class="st">":"</span>, <span class="st">"_"</span>).<span class="ty">Replace</span>(s)
+}</code></pre>
+
+    <p><code>String()</code> を定義してあるので、<code>fmt.Errorf("%s: …", ref)</code> と書くだけで <code>mirror.gcr.io/library/alpine:latest</code> という完全な形で出ます。エラーメッセージが親切になるのは、こういう地味な定義のおかげです。</p>
+
+    <p>本体です。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// ParseRef は利用者が打った文字列を Ref に分解する。</span>
+<span class="cm">//</span>
+<span class="cm">//	alpine              → registry-1.docker.io / library/alpine : latest</span>
+<span class="cm">//	alpine:3.20         → registry-1.docker.io / library/alpine : 3.20</span>
+<span class="cm">//	library/alpine      → registry-1.docker.io / library/alpine : latest</span>
+<span class="cm">//	ghcr.io/foo/bar:1.2 → ghcr.io             / foo/bar        : 1.2</span>
+<span class="kw">func</span> <span class="ty">ParseRef</span>(s <span class="kw">string</span>) (<span class="ty">Ref</span>, <span class="kw">error</span>) {
+	s = strings.<span class="ty">TrimSpace</span>(s)
+	<span class="kw">if</span> s == <span class="st">""</span> {
+		<span class="kw">return</span> <span class="ty">Ref</span>{}, fmt.<span class="ty">Errorf</span>(<span class="st">"イメージ名が空です"</span>)
+	}
+	ref := <span class="ty">Ref</span>{Registry: defaultRegistry, Tag: <span class="st">"latest"</span>}
+
+	name := s
+	<span class="cm">// 先頭の要素にドットかコロンがあれば、それはレジストリのホスト名である。</span>
+	<span class="cm">// （"alpine" と "ghcr.io/x" を見分けるための、レジストリ界隈の慣習）</span>
+	<span class="kw">if</span> i := strings.<span class="ty">Index</span>(name, <span class="st">"/"</span>); i &gt;= <span class="st">0</span> {
+		head := name[:i]
+		<span class="kw">if</span> strings.<span class="ty">ContainsAny</span>(head, <span class="st">".:"</span>) || head == <span class="st">"localhost"</span> {
+			ref.Registry = head
+			name = name[i+<span class="st">1</span>:]
+		}
+	}
+	<span class="cm">// タグの切り出し。ポート番号入りホスト名と混同しないよう、最後の "/" より後ろだけを見る。</span>
+	<span class="kw">if</span> i := strings.<span class="ty">LastIndex</span>(name, <span class="st">":"</span>); i &gt;= <span class="st">0</span> &amp;&amp; !strings.<span class="ty">Contains</span>(name[i:], <span class="st">"/"</span>) {
+		ref.Tag = name[i+<span class="st">1</span>:]
+		name = name[:i]
+	}
+	<span class="kw">if</span> name == <span class="st">""</span> {
+		<span class="kw">return</span> <span class="ty">Ref</span>{}, fmt.<span class="ty">Errorf</span>(<span class="st">"イメージ名が空です: %q"</span>, s)
+	}
+	<span class="cm">// Docker Hub の公式イメージは library/ 名前空間に居る</span>
+	<span class="kw">if</span> ref.Registry == defaultRegistry &amp;&amp; !strings.<span class="ty">Contains</span>(name, <span class="st">"/"</span>) {
+		name = <span class="st">"library/"</span> + name
+	}
+	ref.Repository = name
+	<span class="kw">return</span> ref, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>4段階です。順番に踏みます。</p>
+
+    <p><strong>1. レジストリ名の判定。</strong> ここが一番の勘所です。<code>ghcr.io/foo/bar</code> の <code>ghcr.io</code> はホスト名ですが、<code>library/alpine</code> の <code>library</code> は名前空間です。形の上では区別が付きません。どちらも「<code>/</code> の前の文字列」です。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · レジストリ名かどうかは「ドットかコロンがあるか」で決めている</div>
+      <p>この判定に厳密な定義はありません。<strong>「先頭の要素にドット <code>.</code> かコロン <code>:</code> が含まれていればホスト名とみなす」</strong>という、レジストリ界隈の<strong>慣習</strong>です。<code>ghcr.io</code> にはドットがある、<code>localhost:5000</code> にはコロンがある、<code>library</code> にはどちらも無い。それだけの理由で振り分けています。</p>
+      <p>だから例外を1つ手で足す必要があります。<code>localhost</code> です。ドットもコロンも無いのにホスト名。だからコードに <code>|| head == "localhost"</code> という特例が書いてあります。この1行は、慣習で決めた規則にはこういうほころびが出る、という証拠です。Docker 本家の実装にも同じ特例が入っています。</p>
+    </div>
+
+    <p><strong>2. タグの切り出し。</strong> ここにもう1つの罠があります。素朴に「<code>:</code> で分割する」と書くと、<code>localhost:5000/myimage</code> で壊れます。<code>5000/myimage</code> がタグになってしまうからです。</p>
+
+    <div class="ascii">タグの切り出しで、ポート番号と混同しない工夫
+
+  入力: localhost:5000/myimage
+                  ↑ここのコロンはポート番号
+
+  ① 先にレジストリを剥がす → name = "myimage"（コロンはもう無い）
+
+  ② それでも残るケースに備え、LastIndex で「最後のコロン」を見る
+     さらに !strings.Contains(name[i:], "/") で
+     「そのコロンより後ろに / が無い」ことを確認する
+
+  例: foo/bar:1.2   → 最後の ":" の後ろは "1.2"。/ が無い → タグである ✔
+      host:5000/bar → 最後の ":" の後ろは "5000/bar"。/ がある → タグではない ✘</div>
+
+    <p><code>LastIndex</code>（最後の <code>:</code>）と「その後ろに <code>/</code> が無いこと」の二段構えです。タグはイメージ参照のいちばん末尾に来るので、<strong>タグを表すコロンの後ろにスラッシュが現れることはありえない</strong>。この性質を使って区別しています。</p>
+
+    <p><strong>3. 空チェック。</strong> <code>alpine:</code> のような入力（コロンの後ろが空）を弾きます。エラーメッセージの <code>%q</code> は、Go の書式指定で「引用符付きで出す」の意味です。<code>イメージ名が空です: " "</code> のように、<strong>空白文字が見える形</strong>で出るので原因が分かります。</p>
+
+    <p><strong>4. <code>library/</code> の補完。</strong> Docker Hub の公式イメージは <code>library</code> という名前空間の下にいます。<code>alpine</code> の正体は <code>library/alpine</code> です。ただしこの補完をするのは <strong>Docker Hub のときだけ</strong>。<code>ghcr.io/alpine</code> に <code>library/</code> を足したら、存在しないパスになってしまいます。条件に <code>ref.Registry == defaultRegistry</code> が入っているのはそのためです。</p>
+
+    <p>digest の名前を整える小道具もここで見ておきます。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="kw">func</span> safeDigest(d <span class="kw">string</span>) <span class="kw">string</span> {
+	<span class="kw">return</span> strings.<span class="ty">NewReplacer</span>(<span class="st">":"</span>, <span class="st">"_"</span>, <span class="st">"/"</span>, <span class="st">"_"</span>).<span class="ty">Replace</span>(d)
+}
+
+<span class="kw">func</span> shortDigest(d <span class="kw">string</span>) <span class="kw">string</span> {
+	<span class="kw">if</span> i := strings.<span class="ty">Index</span>(d, <span class="st">":"</span>); i &gt;= <span class="st">0</span> &amp;&amp; <span class="kw">len</span>(d) &gt; i+<span class="st">13</span> {
+		<span class="kw">return</span> d[i+<span class="st">1</span> : i+<span class="st">13</span>]
+	}
+	<span class="kw">return</span> d
+}
+
+<span class="kw">func</span> saveJSON(path <span class="kw">string</span>, v <span class="kw">any</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(filepath.<span class="ty">Dir</span>(path), <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	b, err := json.<span class="ty">MarshalIndent</span>(v, <span class="st">""</span>, <span class="st">"  "</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">return</span> os.<span class="ty">WriteFile</span>(path, b, <span class="st">0o644</span>)
+}
+
+<span class="kw">func</span> loadJSON(path <span class="kw">string</span>, v <span class="kw">any</span>) <span class="kw">error</span> {
+	b, err := os.<span class="ty">ReadFile</span>(path)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">return</span> json.<span class="ty">Unmarshal</span>(b, v)
+}</code></pre>
+
+    <p><code>shortDigest</code> は <code>sha256:55afa1ecc21d2bb5e…</code> から <code>55afa1ecc21d</code>（12文字）だけを切り出します。ログに 64 文字のハッシュを全部出すと読めたものではないので、人間向けの短縮形です。<code>len(d) &gt; i+13</code> の境界チェックがあるので、短すぎる文字列を渡してもパニックせず、そのまま返します。<strong>ログ用の関数が例外を投げて本体を落とす</strong>のは最悪なので、ここは臆病に書きます。</p>
+
+    <p><code>saveJSON</code> の <code>json.MarshalIndent(v, "", "  ")</code> は、整形して（インデント2スペース）保存するという意味です。1バイトも節約になりませんが、<code>/var/lib/mydocker/manifests/*.json</code> を <code>cat</code> したときに人間が読めます。<strong>デバッグしている自分に対する親切</strong>です。</p>
+
+    <h2 class="step" id="step-9"><span class="step-no">Step 9</span>他のレジストリ — 401 が道を教えてくれる</h2>
+
+    <p>最後の部品です。Docker Hub 以外のレジストリでは、トークンの取得先 URL が違います。<code>ghcr.io</code> なら <code>https://ghcr.io/token</code>、<code>mirror.gcr.io</code> ならまた別。これを全部ハードコードして回るのは無理です。</p>
+
+    <p>幸い、HTTP がちゃんと考えられています。<strong>401 を返すとき、サーバは「どこへ鍵を取りに行けばいいか」を一緒に教えてくれます。</strong> <code>WWW-Authenticate</code> というヘッダです。だから、まず何も付けずに <code>/v2/</code> を叩いて、断られ方を読めばいい。</p>
+
+    <div class="ascii">401 が道を教えてくれる
+
+  ① GET https://ghcr.io/v2/      （鍵は付けない。わざと断られに行く）
+        ↓
+     HTTP/1.1 401 Unauthorized
+     WWW-Authenticate: Bearer realm="https://ghcr.io/token",service="ghcr.io"
+                              └─ 取りに行く先 ─┘  └─ 名乗る相手 ─┘
+        ↓
+  ② realm + "?scope=repository:foo/bar:pull" + "&service=" + service を GET
+        ↓
+     トークンが返る → あとは Docker Hub と同じ手順
+
+  ★ 401 が返らなかった（＝いきなり 200 だった）なら、認証不要のレジストリ。
+    その場合はトークン無しで進む。</div>
+
+    <p>実装です。</p>
+
+    <div class="file-tag">internal/image/registry.go</div>
+<pre><code><span class="cm">// discoverAuth は /v2/ の 401 応答から認証サーバの場所を読み取る。</span>
+<span class="kw">func</span> discoverAuth(client *http.<span class="ty">Client</span>, ref <span class="ty">Ref</span>) (realm, service <span class="kw">string</span>, err <span class="kw">error</span>) {
+	resp, err := client.<span class="ty">Get</span>(<span class="st">"https://"</span> + ref.Registry + <span class="st">"/v2/"</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">""</span>, <span class="st">""</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"レジストリ %s に接続できませんでした: %w"</span>, ref.Registry, err)
+	}
+	<span class="kw">defer</span> resp.Body.<span class="ty">Close</span>()
+	<span class="kw">if</span> resp.StatusCode != http.<span class="ty">StatusUnauthorized</span> {
+		<span class="kw">return</span> <span class="st">""</span>, <span class="st">""</span>, <span class="kw">nil</span>
+	}
+	h := resp.Header.<span class="ty">Get</span>(<span class="st">"WWW-Authenticate"</span>)
+	<span class="kw">if</span> !strings.<span class="ty">HasPrefix</span>(h, <span class="st">"Bearer "</span>) {
+		<span class="kw">return</span> <span class="st">""</span>, <span class="st">""</span>, <span class="kw">nil</span>
+	}
+	<span class="kw">for</span> _, part := <span class="kw">range</span> strings.<span class="ty">Split</span>(strings.<span class="ty">TrimPrefix</span>(h, <span class="st">"Bearer "</span>), <span class="st">","</span>) {
+		kv := strings.<span class="ty">SplitN</span>(strings.<span class="ty">TrimSpace</span>(part), <span class="st">"="</span>, <span class="st">2</span>)
+		<span class="kw">if</span> <span class="kw">len</span>(kv) != <span class="st">2</span> {
+			<span class="kw">continue</span>
+		}
+		v := strings.<span class="ty">Trim</span>(kv[<span class="st">1</span>], <span class="st">`"`</span>)
+		<span class="kw">switch</span> kv[<span class="st">0</span>] {
+		<span class="kw">case</span> <span class="st">"realm"</span>:
+			realm = v
+		<span class="kw">case</span> <span class="st">"service"</span>:
+			service = v
+		}
+	}
+	<span class="kw">return</span> realm, service, <span class="kw">nil</span>
+}</code></pre>
+
+    <p><code>/v2/</code> という何も指定しないパスを叩くのが定石です。OCI Distribution Spec で「API のバージョン確認用エンドポイント」として決められていて、認証が要るレジストリはここで 401 を返します。</p>
+
+    <p>解析は素朴な文字列処理です。<code>Bearer </code> を剥がして、カンマで割って、それぞれを <code>=</code> で2つに割って、値の引用符を取る。<code>SplitN(…, "=", 2)</code> の <code>2</code> が効いています。<code>realm="https://ghcr.io/token"</code> の値の中に <code>=</code> が入っていても（クエリ文字列付きの realm もあります）、<strong>最初の <code>=</code> でだけ割る</strong>ので壊れません。</p>
+
+    <p>そして 401 が返らなかった場合、<code>("", "", nil)</code> を返します。エラーではありません。<code>fetchToken</code> 側で <code>realm == ""</code> なら空トークンを返し、<code>s.get</code> は空トークンなら <code>Authorization</code> ヘッダを付けません。<strong>認証の要らないレジストリでは、認証の話が全部消える。</strong>条件分岐が3か所に散っているように見えますが、それぞれが「知らないことは付けない」という一貫した態度で書かれています。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 正直に書いておく · この環境では Docker Hub からレイヤを落とせなかった</div>
+      <p>この教材を書いた環境には、組織の egress ポリシー（外向き通信の制限）が掛かっています。そして <strong>Docker Hub のレイヤ配信ドメイン <code>production.cloudfront.docker.com</code> に出られませんでした</strong>（CONNECT が 403 で拒否される）。</p>
+      <p>症状が独特です。<strong>トークンは取れる。マニフェストも取れる。レイヤの取得だけが失敗する。</strong>Docker Hub は blob の配信を CDN の別ドメインに委ねているため、<code>registry-1.docker.io</code> は通っても CDN は通らない、という状態が起こりえます。Step 1・2 の curl が成功したのに Step 6 で落ちる場合、コードではなくネットワークを疑ってください。</p>
+      <p>ここで取った方針を明記します。<strong>回避策を実装に埋め込みませんでした。</strong>プロキシ設定やドメインの読み替えをコードに入れると、この環境でしか意味のない汚れが恒久的に残ります。代わりに、<strong>届くレジストリを利用者が指定できる</strong>という既にある性質（Step 8 の <code>ParseRef</code>）を使い、<code>mirror.gcr.io/library/alpine</code> を指定して進めました。この章の実測出力が全部 <code>mirror.gcr.io/…</code> になっているのはそのためです。取得できる中身は同一で、同じ digest <code>sha256:79ff19e9084a…</code> を指しています。</p>
+    </div>
+
+    <p>この「別のレジストリを指定して回避できた」という事実自体が、Step 8 と Step 9 を作った価値の証明になっています。レジストリ名をハードコードしていたら、この教材はここで止まっていました。</p>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>公開イメージなのに、なぜトークンが要るんですか? 誰も認証していないのに。</summary>
+      <div class="qa-body"><p>「認証」と「認可」を分けて考えると腑に落ちます。Docker Hub がトークンで管理しているのは、あなたが誰かではなく<strong>何をどれだけしていいか</strong>です。匿名のトークンには「library/alpine を pull する権限だけ」が入っていて、有効期限も付いています。</p>
+      <p>実利もあります。トークンには発行の記録が残るので、<strong>取得回数を数えられます</strong>。Step 7 で触れた匿名アクセスの回数制限は、この仕組みの上に乗っています。またレジストリ本体は「有効な鍵か」を確かめるだけでよく、認証サーバと配信サーバを分離できます。だから <code>auth.docker.io</code> と <code>registry-1.docker.io</code> は別のホストなのです。</p></div>
+    </details>
+
+    <details class="qa"><summary>Accept ヘッダを付け忘れると、具体的に何が返ってくるんですか?</summary>
+      <div class="qa-body"><p>manifest schema 1 という、Docker の初期からある古い形式です。中身の構造がまるごと違い、<code>layers</code> ではなく <code>fsLayers</code> という配列にレイヤが入っています（順序も逆向きです）。</p>
+      <p>厄介なのは<strong>エラーにならない</strong>ことです。HTTP は 200、JSON も正しい JSON なのでパースも通る。Go の <code>encoding/json</code> は知らないキーを黙って捨てるので、<code>man.Layers</code> は <code>nil</code> のまま。「なぜかレイヤが0枚」という結果だけが残ります。この実装が「schema 1 が返っている可能性があります」というエラーメッセージを持っているのは、まさにこの状態を後から見分けるためです。</p></div>
+    </details>
+
+    <details class="qa"><summary>マニフェストリストから自分で選ぶのは面倒です。docker は自動でやってくれますよね?</summary>
+      <div class="qa-body"><p>やってくれます。ただ、やっていることは <code>pickPlatform</code> と同じです。<code>docker</code> も自分の <code>GOOS</code>/<code>GOARCH</code>（正確にはビルド時のプラットフォーム情報）と <code>platform</code> を突き合わせて1件選んでいます。<code>docker pull --platform linux/arm64</code> というオプションがあるのは、その選択を手動で上書きするためです。</p>
+      <p>つまり「自動」というのは「あなたの代わりに誰かが同じコードを書いた」という意味でしかありません。この章でやったのは、その誰かの仕事を自分の手でやり直すことです。<strong>一度自分で書くと、<code>--platform</code> が何をするオプションなのかが完全に分かります。</strong></p></div>
+    </details>
+
+    <details class="qa"><summary>digest の照合って、そこまで必要ですか? HTTPS で取ってきているのに。</summary>
+      <div class="qa-body"><p>HTTPS が守るのは<strong>通信路</strong>であって<strong>中身</strong>ではありません。「registry-1.docker.io と名乗るサーバと確かに話した」「途中で誰にも書き換えられていない」ことは保証されますが、「そのサーバが渡してきたものが正しい中身か」は保証しません。</p>
+      <p>実際に起こりうるのは、CDN のキャッシュが壊れている、ミラーが古い、レジストリ側のストレージでビット反転が起きている、といったケースです。どれも HTTPS では検出できません。digest の照合は<strong>相手が誰であっても中身が正しいことを自分で確かめる</strong>ための、独立した安全網です。</p>
+      <p>それに、この照合はほとんどタダです。<code>io.TeeReader</code> のおかげで読み取り回数は増えず、追加コストは SHA-256 の計算だけ。3.67 MiB なら一瞬です。<strong>安いのだからやる</strong>、で十分な理由になります。</p></div>
+    </details>
+
+    <details class="qa"><summary>.complete というファイルを置くのはなぜですか? ディレクトリの有無で判定してはだめですか?</summary>
+      <div class="qa-body"><p>だめです。理由は「ディレクトリが存在する」と「中身が完全である」が別のことだからです。</p>
+      <p>展開の途中で Ctrl-C を押したり、ネットワークが切れたり、ディスクが一杯になったりすると、<strong>中途半端に展開されたディレクトリ</strong>が残ります。ディレクトリは存在します。ファイルもいくつか入っています。でも 516 ファイルのうち 200 ファイルしかありません。これを「取得済み」と判定すると、欠けたイメージでコンテナが起動し、しかも次回以降ずっとそのままです。</p>
+      <p>だから、<strong>すべてが終わった後にだけ置かれる別の印</strong>を使います。展開して、ハッシュを照合して、<code>rename</code> して、そこでようやく <code>.complete</code> を書く。この順序が守られている限り、印があることは中身が完全であることの証明になります。ちなみに展開先が <code>dir + ".tmp"</code> という別名なのも同じ理由で、<strong>本番の名前は完成品しか名乗れない</strong>ようにしてあります。</p></div>
+    </details>
+
+    <details class="qa"><summary>Docker Hub からレイヤが落とせません。私の環境でも起きますか?</summary>
+      <div class="qa-body"><p>起きるかもしれません。この教材を書いた環境では実際に起きました。組織の egress ポリシーで <code>production.cloudfront.docker.com</code>（Docker Hub が blob 配信に使う CDN）への接続が 403 で拒否されたためです。</p>
+      <p>見分け方は簡単です。<strong>Step 1 の curl（トークン）と Step 2 のマニフェスト取得は成功するのに、レイヤの取得だけが失敗する</strong>なら、まずこれを疑ってください。コードのバグではありません。Docker Hub は目録と中身を別のドメインで配っているので、片方だけ通るという状態が成立します。</p>
+      <p>回避は、届くレジストリを指定することです。<code>mydocker pull mirror.gcr.io/library/alpine</code> のように書けます。<code>ParseRef</code> が先頭要素のドットを見てレジストリ名だと判断し、<code>discoverAuth</code> がそのレジストリの認証方式を自分で調べてくれるので、コードを1行も変えずに切り替えられます。</p></div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。</p>
+
+    <details class="qa"><summary>Q1. Accept ヘッダを付けずにマニフェストを取ると何が返ってきて、その結果コードのどこで詰まりますか?</summary>
+      <div class="qa-body"><p>manifest schema 1 という古い形式が返ってきます。HTTP は 200 で、JSON のパースも成功します。ただし schema 1 には <code>layers</code> というキーが無い（<code>fsLayers</code> という別のキーになっている）ので、<code>manifest</code> 構造体の <code>Layers</code> は <code>nil</code> のままになります。</p>
+      <p>詰まるのは <code>Pull</code> の <code>if len(man.Layers) == 0 { return nil, fmt.Errorf("…マニフェストに layers がありません（schema 1 が返っている可能性があります）") }</code> の行です。<strong>エラーメッセージ自体が原因を名指ししている</strong>ので、ここに来たら <code>Accept</code> を疑います。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q2. マニフェストリストの「最初の項目」を選ぶ実装は、なぜ確実に壊れるのですか?</summary>
+      <div class="qa-body"><p>リストには、イメージではない項目——attestation（署名の付随物）——が混ざっているからです。<code>platform</code> が <code>{"architecture":"unknown","os":"unknown"}</code>、注釈に <code>vnd.docker.reference.type: attestation-manifest</code> が付いた項目です。</p>
+      <p>並び順は保証されていないので、いつ先頭に来るか分かりません。そして掴んでしまったときの壊れ方が悪質です。<strong>HTTP 200 で正しい JSON が返り、ただ <code>layers</code> だけが無い。</strong>Q1 と同じ症状になり、原因が <code>Accept</code> なのか選択ミスなのか分からなくなります。</p>
+      <p>正しくは <code>pickPlatform</code> のように、<code>d.Platform.OS == runtime.GOOS &amp;&amp; d.Platform.Architecture == runtime.GOARCH</code> で明示的に絞ります。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q3. レイヤの保存先ディレクトリ名に digest を使うと、なぜそれだけでキャッシュになるのですか?</summary>
+      <div class="qa-body"><p>digest は中身そのものの SHA-256 だからです。<strong>名前が中身によって決まっている</strong>ので、「同じ名前なら中身も同じ」が保証されます（content-addressable）。</p>
+      <p>この性質があると、キャッシュの判定が<strong>名前の存在確認だけ</strong>で済みます。中身を比較する必要も、更新日時を見る必要も、世代を管理する必要もありません。中身が変われば名前も変わるので、上書きという概念すら不要です。<code>isComplete(s.layerDir(layer.Digest))</code> という1行が、キャッシュ機構の全部です。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q4. fetchLayer で io.Copy(io.Discard, body) を呼んでいるのはなぜですか? 展開はもう終わっているのに。</summary>
+      <div class="qa-body"><p><strong>ハッシュを完成させるため</strong>です。</p>
+      <p><code>io.TeeReader</code> は「読まれたぶんだけ」ハッシュ計算器に流します。逆に言えば、読まれなかったバイトはハッシュに反映されません。<code>ExtractLayer</code> は gzip ストリームを解きながら tar を読みますが、tar の終端に達した時点で読むのをやめるので、ストリームの末尾に数バイト残ることがあります。</p>
+      <p>その状態で <code>hasher.Sum(nil)</code> を呼ぶと、<strong>途中までのハッシュ</strong>が出てきて digest と一致しません。展開は成功しているのに検証で落ちる、という理不尽なエラーになります。<code>io.Copy(io.Discard, body)</code> は残りを読み捨てて、TeeReader に最後まで流させるためだけの行です。「捨てるために読む」——目的はハッシュのほうにあります。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q5. ParseRef("localhost:5000/foo:1.0") はどう分解されますか? ポート番号のコロンと混同しないのはなぜですか?</summary>
+      <div class="qa-body"><p><code>Registry: "localhost:5000"</code>、<code>Repository: "foo"</code>、<code>Tag: "1.0"</code> になります。</p>
+      <p>順序が効いています。<strong>先にレジストリを剥がす</strong>ので、タグを切り出す段階で見ているのは <code>foo:1.0</code> だけです。先頭要素 <code>localhost:5000</code> にはコロンが含まれるため <code>strings.ContainsAny(head, ".:")</code> が真になり、ホスト名と判定されます。</p>
+      <p>さらに二重の保険が掛かっています。タグの切り出しは <code>strings.LastIndex(name, ":")</code>（最後のコロン）を使い、かつ <code>!strings.Contains(name[i:], "/")</code>——<strong>そのコロンより後ろにスラッシュが無いこと</strong>——を確認します。タグは参照の末尾に来るので、タグを表すコロンの後ろにスラッシュが現れることはありえません。<code>host:5000/bar</code> なら最後のコロンの後ろが <code>5000/bar</code> でスラッシュを含むため、タグとは判定されません。</p>
+      <p>ちなみに <code>library/</code> の補完はされません。Docker Hub 以外だからです（<code>ref.Registry == defaultRegistry</code> の条件）。</p></div>
+    </details>
+
+    <details class="qa"><summary>Q6. 2回目の mydocker pull が通信を1回もしないのはなぜですか? 何が揃っていればそうなりますか?</summary>
+      <div class="qa-body"><p><code>Pull</code> の<strong>いちばん先頭</strong>で <code>s.fromCache(ref)</code> を呼び、成功したらそこで <code>return</code> しているからです。<code>http.Client</code> を作るコードより前にあるので、トークンすら取りに行きません。</p>
+      <p><code>fromCache</code> が成功する条件は4つ全部です。①<code>manifests/&lt;参照名&gt;.json</code> が読めること ②そのマニフェストの <code>layers</code> が1枚以上あること ③すべてのレイヤに <code>.complete</code> の印があること ④<code>configs/&lt;config の digest&gt;.json</code> が読めること。1つでも欠ければ <code>false</code> を返し、通常どおり通信して取りに行きます。</p>
+      <p>この「疑わしきは使わない」設計のおかげで、キャッシュが壊れていても最悪 HTTP が1往復増えるだけで、間違った中身でコンテナが起動することはありません。</p></div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p><code>mydocker pull</code> で alpine を自力で取ってこられて、2回目が「ネットワークにはアクセスしません」と言えばこの章は完了です。<code>docker</code> は1度も呼んでいません。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker pull mirror.gcr.io/library/alpine
+<span class="out">マニフェストリストでした。linux/amd64 の 79ff19e9084a を取り直します
+レイヤ 1/1 55afa1ecc21d: 取得中 (3.7 MiB)
+mirror.gcr.io/library/alpine:latest: レイヤ 1 枚
+  1: /var/lib/mydocker/layers/sha256_55afa1ecc21d2bb5e5045f32dafee56272ffd89860bac26f6c32123439af26a4</span>
+<span class="ps">$</span> mydocker pull mirror.gcr.io/library/alpine
+<span class="out">キャッシュ: mirror.gcr.io/library/alpine:latest（ネットワークにはアクセスしません）
+mirror.gcr.io/library/alpine:latest: レイヤ 1 枚
+  1: /var/lib/mydocker/layers/sha256_55afa1ecc21d2bb5e5045f32dafee56272ffd89860bac26f6c32123439af26a4</span></code></pre>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p><code>docker pull</code> の中身が、全部見えました。トークンを取り、マニフェストを取り、リストだったので digest で取り直し、config を読み、tar.gz を落として展開する。使ったのは <code>net/http</code> と <code>encoding/json</code> と <code>crypto/sha256</code>、全部 Go の標準ライブラリです。そして分かったのは、<strong>イメージとは tar.gz の列と JSON でしかない</strong>という身も蓋もない事実でした。alpine の正体は、圧縮 3.67 MiB の tar.gz 1枚と、611 バイトの JSON です。魔法はどこにもありませんでした。あるのは、初見で必ず踏む4つの段差——<code>Accept</code> 忘れ、マニフェストリスト、attestation、取得回数制限——だけで、それも全部踏み終えました。</p>
+
+    <p>しかし、今できているのは<strong>tar.gz を1枚ずつ展開しただけ</strong>です。alpine はレイヤが1枚だったので、これで足りているように見えます。でも <code>Image.LayerDirs</code> が配列であることを思い出してください。実用的なイメージはレイヤが何枚もあります。そして私たちは、<strong>複数枚をどう重ねるか</strong>をまだ知りません。素朴に上から順に上書きコピーすればいい、と思うかもしれませんが、それでは足りないのです。<strong>上の層で「削除した」ファイルが、下の層にはまだ残っています。</strong>単純なコピーでは、消したはずのファイルが復活してしまいます。しかも、コンテナを起動するたびに 516 ファイルを全部コピーするのでは、起動が 12 ms で終わるはずがありません。</p>
+
+    <p>次章は OverlayFS です。カーネルに「この複数のディレクトリを、1つのディレクトリとして見せてくれ」と頼む仕組みで、重ね順も、削除の表現（whiteout）も、書き込みの行き先も、全部カーネルが面倒を見てくれます。そして——ここが本題ですが——<strong>コンテナの「使い捨て」の正体がここで分かります。</strong>なぜコンテナを消すと中で書いたファイルが消えるのか、なぜ同じイメージから 10 個のコンテナを立ち上げてもディスクが 10 倍にならないのか。<code>LayerDirs</code> のコメントにあった「★下から上の順（先頭が最下層）」という一言が、次章で効いてきます。</p>
+
+    <div class="chap-foot">
+      <a class="pager" href="04-cgroup.html"><span class="dir">← 前へ</span>第04章 · 資源に上限をかける</a>
+      <a class="pager next" href="06-overlay.html"><span class="dir">次へ →</span>第06章 · 層を重ねる</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
