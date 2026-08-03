@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第09章 さらに先へ — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第09章 / 全10章 · 層: BEYOND · 読了目安 2〜3時間</div>
+    <div class="eyebrow"><span>Beyond</span><span class="depth">— 足りないものを正直に並べる</span></div>
+    <h1>さらに先へ</h1>
+    <p class="lede">ここまでで <code>mydocker run alpine /bin/sh</code> は動きます。<code>ps</code> は 2 行、<code>hostname</code> は <code>mydocker</code>、<code>ls /</code> は alpine。E2E は 56 項目すべて通っています。それでも、これは Docker ではありません。この最終章は、自分で建てたものを賞めるための章ではなく、<strong>建てたものに何が足りないかを、一つずつ名前をつけて正直に並べるための章</strong>です。足りないものが言えて初めて、作ったものが何なのかが分かります。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p>ここまでに積んだ 7 つの層を、<strong>登り終えた側から</strong>もう一度見渡せるようになる。そのうえで、<code>mydocker</code> に足りないもの（ネットワーク・権限の絞り込み・rootless・ビルド・push・ボリューム・<code>exec</code> のマウント名前空間・その他）を、<strong>「何が無いか」「無いと何が起きるか」「実装するなら何が要るか」の 3 点セット</strong>で自分の言葉で説明できるようになる。</p>
+      <p>最後に、<strong>OCI ランタイム仕様に照らして <code>mydocker</code> がどの位置にいるか</strong>を言えるようにする。「準拠していない」ことを曖昧にせず、どこがどう違うのかを指させる状態が目標です。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#stack">積んだ層の総覧 — 登り終えた側から見る</a></li>
+        <li><a href="#missing">★足りないもの — 正直な棚卸し</a></li>
+        <li><a href="#step-1">Step 1 · ネットワークの隔離</a></li>
+        <li><a href="#step-2">Step 2 · 権限の絞り込み — capabilities と seccomp</a></li>
+        <li><a href="#step-3">Step 3 · rootless（user 名前空間）</a></li>
+        <li><a href="#step-4">Step 4 · イメージのビルド（Dockerfile 相当）</a></li>
+        <li><a href="#step-5">Step 5 · レジストリへの push</a></li>
+        <li><a href="#step-6">Step 6 · ボリューム管理</a></li>
+        <li><a href="#step-7">Step 7 · <code>exec</code> のマウント名前空間</a></li>
+        <li><a href="#step-8">Step 8 · その他の不足（シグナル・ゾンビ・logs・stop）</a></li>
+        <li><a href="#oci">OCI ランタイム仕様との差</a></li>
+        <li><a href="#runc">runc が実際にやっていること</a></li>
+        <li><a href="#next">ここから先の進み方</a></li>
+        <li><a href="#review">総括 — 「動くはず」がいちばん危険だった</a></li>
+      </ol>
+    </div>
+
+    <h2 id="stack">積んだ層の総覧 — 登り終えた側から見る</h2>
+
+    <p>序章で、この教材の地図を先に見せました。「層は下から積まれる。飛ばせない」という図です。あのときは、これから登る山の稜線を下から見上げている状態でした。いまは反対側にいます。<strong>登り終えた側から、同じ地図をもう一度見ます。</strong></p>
+
+    <div class="ascii">積み終えた層（下から順に建てた）
+
+  07  道具にする              mydocker run / ps / exec / rm / pull / info
+      state.json ── setns ──┐   実行中を覚えて、中へもう1つ入る
+  ────────────────────────  │
+  06  層を重ねる              │   lowerdir を逆順に、upper に書き込みを溜める
+      OverlayFS ── xattr ───┤   .wh. をキャラクタデバイスと opaque に翻訳
+  ────────────────────────  │
+  05  イメージを取ってくる      │   トークン → マニフェスト → レイヤ の3段
+      net/http だけ ────────┤   ここだけカーネルの話が出てこない
+  ────────────────────────  │
+  04  資源に上限をかける        │   memory.max / memory.limit_in_bytes に書く
+      cgroup v2 → v1 ──────┤   ★書いただけでは効かない。procs に PID を書く
+  ────────────────────────  │
+  03  根を挿げ替える            │   伝播を切る → bind → pivot_root → 古い根を捨てる
+      pivot_root ── mount ──┤   /proc を貼り直して初めて ps が正しくなる
+  ────────────────────────  │
+  02  見える世界を区切る         │   UTS / PID / MNT / IPC の4つ
+      namespace ────────────┤   ★NET は入っていない（第08章）
+  ────────────────────────  │
+  01  自分をもう一度起動する      │   /proc/self/exe を init という顔で起動
+      clone(2) のフラグ ─────┘   生まれた瞬間から新しい名前空間の中にいる
+  ════════════════════════
+  00  Linux の中に入る           特権 Linux 環境。ここが無いと1行も動かない</div>
+
+    <p>この 7 段が、いま手元にある <code>mydocker</code> の全体です。表にすると次のようになります。<strong>右の列に注目してください。</strong> 使ったものはほとんどが「Linux カーネルが最初から持っている機能」であって、私たちが発明したものは 1 つもありません。</p>
+
+    <table>
+      <thead>
+        <tr><th>章</th><th>建てたもの</th><th>使ったカーネルの機能</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>01</td><td>自分を再実行して名前空間を作る</td><td><code>clone(2)</code> のフラグ</td></tr>
+        <tr><td>02</td><td>視界を区切る（UTS/PID/MNT/IPC）</td><td>名前空間</td></tr>
+        <tr><td>03</td><td>根を挿げ替える</td><td><code>pivot_root(2)</code> / マウント</td></tr>
+        <tr><td>04</td><td>資源に上限をかける</td><td>cgroup（v2/v1）</td></tr>
+        <tr><td>05</td><td>イメージを取ってくる</td><td>（カーネルではなく HTTP）</td></tr>
+        <tr><td>06</td><td>層を重ねる</td><td>OverlayFS / xattr</td></tr>
+        <tr><td>07</td><td>道具にする</td><td><code>setns(2)</code> / <code>/proc</code></td></tr>
+      </tbody>
+    </table>
+
+    <p>05 の行だけ毛色が違います。イメージの取得は<strong>カーネルとまったく関係がありません</strong>。やっているのは HTTP でトークンを取り、JSON を読み、tar.gz を落として展開することだけです。「コンテナ」という言葉で束ねられているものの中に、カーネルの話とネットワークプロトコルの話という<strong>まったく別の技術が同居している</strong>ことが、この行から見えます。Docker が単一の何かではなく、寄せ集めであることの最初の証拠です。</p>
+
+    <h3>中心命題の回収 — 仮想化を 1 行も書いていない</h3>
+
+    <p>序章の 1 行目に、こう書きました。<strong>「コンテナは軽量な仮想マシンではない」</strong>。あのときは、そう言われても半信半疑だったはずです。ここで回収します。</p>
+
+    <p><strong>ここまでの 7 章で、仮想化のコードを 1 行も書いていません。</strong> 思い返してください。仮想の CPU を作りましたか。作っていません。メモリを仮想化しましたか。していません。ゲスト OS のカーネルをロードして起動しましたか。していません。ブートローダも、デバイスのエミュレーションも、ハイパーバイザも、この教材には一度も出てきませんでした。</p>
+
+    <p>代わりに書いたのは、次の 3 種類だけです。</p>
+
+    <div class="ascii">書いたものの全部
+
+  ① 視界を区切る    clone(2) にフラグを足す。台帳を別にする。
+                    → コードとしては「定数を OR で並べる」だけ
+
+  ② 上限を書く      cgroup のディレクトリを作り、数字をファイルに書き、
+                    cgroup.procs に PID を書く
+                    → コードとしては「文字列をファイルに書く」だけ
+
+  ③ 根を替える      伝播を切る → bind → pivot_root → 古い根を切り離す
+                    → コードとしては「mount(2) を正しい順に呼ぶ」だけ
+
+  この3つに「イメージを HTTP で取ってくる」「レイヤを重ねる」が足されたものが、
+  いま手元にある mydocker のすべてである。仮想化は、どこにも無い。</div>
+
+    <p>それでも、できあがったものの中で <code>ps</code> を打つと自分だけが PID 1 として並び、<code>hostname</code> はホストと違い、<code>ls /</code> には alpine の中身が出ます。<strong>仮想マシンのように見えるものが、仮想化なしで作れてしまった。</strong> これが「コンテナは軽量な仮想マシンではない」という命題の意味です。軽量な仮想マシンなのではなく、<em>そもそも仮想マシンではない</em>のです。</p>
+
+    <p>数字でも確かめておきます。キャッシュ済みの alpine で <code>/bin/true</code> を実行したときの起動時間は <strong>12〜15 ms</strong>（5 回計測で 15 / 13 / 12 / 12 / 12 ms）でした。対照として、ホストで <code>/bin/true</code> を直接実行すると <strong>3 ms</strong> です。差はおよそ 10 ms。この 10 ms の中身は、overlay のマウント、cgroup のディレクトリ作成、<code>state.json</code> の書き込み、そして <code>fork</code> と <code>exec</code> です。<strong>OS の起動時間はここに入っていません。起動する OS が無いからです。</strong></p>
+
+    <p>そして隔離の側。コンテナの中の <code>ps</code> は <strong>1 個</strong>（ヘッダを除いた行数）で、同じ瞬間のホストは <strong>85 個</strong>です。この 85 個は消えていません。同じマシンで、同じカーネルの上で、いまも動いています。<strong>見えないのは、参照している台帳が別だからです。</strong></p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>最後にもう一度、山頂の景色を確認しておきます。この 3 行が同時に成り立っていることが、この教材の到達点でした。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh -c 'ps; echo ---; hostname; echo ---; ls /'
+<span class="out">キャッシュ: mirror.gcr.io/library/alpine:latest（ネットワークにはアクセスしません）
+コンテナ a169666dadfc を起動しました (PID 23900)
+PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh -c ps; echo ---; hostname; echo ---; ls /
+    7 root      0:00 ps
+---
+mydocker
+---
+bin
+dev
+etc
+home
+lib
+media
+mnt
+opt
+proc
+root
+run
+sbin
+srv
+sys
+tmp
+usr
+var</span></code></pre>
+      <p>3 行目以降の <code>ps</code> が 2 行しか出ていないこと、<code>hostname</code> が <code>mydocker</code> であること、<code>ls /</code> がホストではなく alpine の中身であること。<strong>この 3 つが同時に成り立った瞬間が、要件定義書に書いた「目的の達成」です。</strong></p>
+    </div>
+
+    <h2 id="missing">★足りないもの — 正直な棚卸し</h2>
+
+    <p>ここからが、この章の本番です。<strong>できたことを並べるのは簡単ですが、できていないことを名前をつけて並べるほうがずっと難しく、ずっと役に立ちます。</strong></p>
+
+    <p>「動くものができた」で終わる教材は、読者に間違った自信を持たせます。<code>mydocker</code> は動きます。E2E も 56 項目通ります。しかしそれは<strong>「私が書いたテストの範囲では壊れていない」以上のことを何も意味しません</strong>。何をテストしていないかを言えなければ、そのテストは信頼の根拠になりません。</p>
+
+    <p>これから 8 つのステップで、足りないものを一つずつ棚卸しします。それぞれ必ず <strong>3 点セット</strong>で書きます。</p>
+
+    <div class="ascii">足りないものの並べ方（3点セット）
+
+  ① 何が無いか          コードのどこに、どのフラグ・どの呼び出しが無いのか
+                        「なんとなく足りない」ではなく、名前で指す
+
+  ② 無いと何が起きるか    実際に困ること。攻撃されうること。壊れる場面。
+                        ★ここを書かないと、ただの TODO リストになる
+
+  ③ 実装するなら何が要るか  必要なシステムコール・仕様・順序・難所。
+                        「やればできる」で済ませない。難所を先に名指しする</div>
+
+    <p>棚卸しの全体像を先に表で出しておきます。この表の 8 行が、これから 1 つずつ開かれます。</p>
+
+    <table>
+      <thead>
+        <tr><th>足りないもの</th><th>ひとことで言うと</th><th>危険度</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>ネットワークの隔離</td><td>ホストのネットワークをそのまま共有している</td><td>高</td></tr>
+        <tr><td>capabilities / seccomp</td><td>中の root が本物の root のまま</td><td><strong>最高</strong></td></tr>
+        <tr><td>rootless</td><td>動かすのに特権が要る</td><td>中</td></tr>
+        <tr><td>イメージのビルド</td><td>読めるが作れない</td><td>低（機能不足）</td></tr>
+        <tr><td>レジストリへの push</td><td>取れるが配れない</td><td>低（機能不足）</td></tr>
+        <tr><td>ボリューム管理</td><td>終わると全部消える</td><td>低（機能不足）</td></tr>
+        <tr><td><code>exec</code> のマウント名前空間</td><td>本体とは別のマウント名前空間にいる</td><td>低（既知の割り切り）</td></tr>
+        <tr><td>シグナル・ゾンビ・logs・stop</td><td>長時間動かす道具になっていない</td><td>中</td></tr>
+      </tbody>
+    </table>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>ネットワークの隔離</h2>
+
+    <p>第08章で丸ごと 1 章を使って地図を描いたところです。ここでは棚卸しの 1 項目として、3 点セットの形に圧縮して置き直します。</p>
+
+    <p><strong>① 何が無いか。</strong> <code>CLONE_NEWNET</code> です。<code>internal/container/run.go</code> の <code>Cloneflags</code> を見ると、並んでいるフラグは 4 つだけです。</p>
+
+    <div class="file-tag">internal/container/run.go（第01〜02章で書いた部分）</div>
+<pre><code>	cmd.SysProcAttr = &amp;syscall.<span class="ty">SysProcAttr</span>{
+		Cloneflags: syscall.<span class="ty">CLONE_NEWUTS</span> | <span class="cm">// ホスト名</span>
+			syscall.<span class="ty">CLONE_NEWPID</span> | <span class="cm">// プロセス番号</span>
+			syscall.<span class="ty">CLONE_NEWNS</span> | <span class="cm">// マウント</span>
+			syscall.<span class="ty">CLONE_NEWIPC</span>, <span class="cm">// プロセス間通信</span>
+		<span class="cm">// ⚠ これを忘れると、コンテナ内で行ったマウントがホスト側にも伝播する。</span>
+		<span class="cm">//    pivot_root が EINVAL で落ちる原因にもなる。「なぜか動かない」の筆頭。</span>
+		Unshareflags: syscall.<span class="ty">CLONE_NEWNS</span>,
+	}</code></pre>
+
+    <p>UTS・PID・NS・IPC。<strong>NET が入っていません。</strong> 名前空間の種類としては他に user（第08章では触れず、この章の Step 3 で扱います）と cgroup 名前空間もありますが、いま欠けていて実害が最も分かりやすいのは NET です。</p>
+
+    <p><strong>② 無いと何が起きるか。</strong> コンテナは<strong>ホストのネットワーク名前空間をそのまま共有します</strong>。共有するというのは、比喩ではなく文字どおりです。コンテナの中で <code>ip -o addr</code> を打つと、ホストの <code>eth0</code> がそのまま出ます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>コンテナの中からネットワークインタフェースを見ます。<code>lo</code> も <code>eth0</code> も、ホストのものがそのまま見えます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'ip -o addr'
+<span class="out">1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+2: eth0    inet 192.0.2.2/24 brd 192.0.2.255 scope global eth0\       valid_lft forever preferred_lft forever</span></code></pre>
+      <p>この <code>192.0.2.2/24</code> は<strong>ホストのアドレスそのもの</strong>です。コンテナ用に割り当てたアドレスではありません。</p>
+    </div>
+
+    <p>ここから具体的な帰結が並びます。<strong>ポートが衝突します</strong>——コンテナの中で 8080 番を待ち受けると、それはホストの 8080 番です。同じイメージのコンテナを 2 つ起動して両方が 8080 を掴もうとすれば、2 つめは <code>EADDRINUSE</code> で失敗します。<strong>ポートフォワード（<code>-p 8080:80</code>）が実装できません</strong>——転送する先と元が同じ名前空間にあるので、転送するという概念自体が成立しません。<strong>コンテナからホストのループバックが見えます</strong>——ホストの <code>127.0.0.1:5432</code> で待っている DB に、コンテナの中から素通りで接続できます。隔離されているつもりで動かした処理が、ホストのサービスに手を伸ばせます。<strong>コンテナ同士を別のネットワークに分けられません</strong>——全員が同じ 1 つのネットワークにいるので、「この 2 つだけ通信させる」ができません。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>CLONE_NEWNET</code> を足しただけでは、通信が全部止まる</div>
+      <p>「では <code>Cloneflags</code> に <code>CLONE_NEWNET</code> を 1 つ足せばいいのでは」と思うところですが、そこが第08章の出発点でした。新しいネットワーク名前空間は<strong>ほぼ空</strong>で作られます。あるのは <code>lo</code>（ループバック）だけ、しかも <strong>down 状態</strong>です。物理インタフェースもルーティング表も DNS の設定もありません。</p>
+      <p>つまり、フラグを 1 つ足した瞬間に <strong>コンテナは完全に沈黙します</strong>。名前解決もできず、外にも出られず、ホストとも通信できません。隔離は達成されますが、同時に何もできなくなります。ここから「使える状態」に戻すために、次の 4 段が必要になります。</p>
+    </div>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> 第08章で描いた 4 段構えです。</p>
+
+    <div class="ascii">ネットワークを通すための4段（1つでも欠けると通信できない）
+
+  ① 線を1本作る       veth ペア（仮想イーサネットの「両端」）を作る
+                     片方をホストに残し、片方をコンテナの名前空間へ移す
+
+  ② 橋につなぐ        ホスト側の端を bridge に挿す
+                     bridge が「コンテナたちが集まるスイッチ」になる
+
+  ③ 住所を配る        コンテナ側に IP を振り、up にし、
+                     既定の経路（default route）を bridge 側へ向ける
+
+  ④ 出るときに書き換える  外向きの通信の送信元アドレスをホストのものに差し替える
+                     （NAT / MASQUERADE）。これが無いと戻りが返ってこない
+
+  ★ 難所は「どれが欠けているか分からない」こと。
+    ping が通らないとき、①〜④のどこで止まっているのかを切り分ける手間が
+    MVP から外した最大の理由だった。</div>
+
+    <p>加えて、この教材の制約が効いてきます。<strong>Go の標準ライブラリだけで書く</strong>という前提です。veth の作成も bridge への接続も、実体は <strong>netlink</strong> というカーネルとのやりとり用のソケットプロトコルです。<code>ip</code> コマンドがやっているのもこれです。外部ライブラリを使わないなら、<code>AF_NETLINK</code> のソケットを開き、メッセージのバイト列を自分で組み立てて送ることになります。NAT の設定に至っては、<code>iptables</code> あるいは <code>nftables</code> 相当の設定を自前で書くことになり、これは単独で 1 つのプロジェクトの規模です。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · ネットワーク名前空間は「箱」であって「線」ではない</div>
+      <p>ネットワーク名前空間が区切るのは、<strong>インタフェース・ルーティング表・iptables のルール・ソケットの一覧・ポート番号空間</strong>です。区切られた箱の中に何も入れなければ、その箱は空のままです。</p>
+      <p>ここが他の名前空間と決定的に違う点です。PID 名前空間は作った瞬間に「自分が PID 1」という使える状態になります。UTS 名前空間も、ホスト名を書けばすぐ使えます。しかしネットワーク名前空間だけは、<strong>作った後に道具を持ち込まないと何もできない</strong>のです。だから実装量が跳ね上がります。</p>
+    </div>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>権限の絞り込み — capabilities と seccomp</h2>
+
+    <p><strong>ここがこの章でいちばん大事な項目です。</strong> ネットワークが無いのは不便ですが、これが無いのは危険です。読み飛ばさないでください。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 最重要 · 名前空間は「見える範囲」を区切るが、「できること」は区切らない</div>
+      <p>これがこの章で一番覚えて帰ってほしい一文です。ここまで 7 章かけて積んできた名前空間は、すべて<strong>「何が見えるか」の台帳を差し替える</strong>仕組みでした。プロセス一覧の台帳、ホスト名の台帳、マウントの台帳、プロセス間通信の台帳。どれも「見え方」の話です。</p>
+      <p><strong>「そのプロセスが何をしてよいか」は、名前空間とはまったく別の仕組みで決まります。</strong> そして <code>mydocker</code> は、その別の仕組みに一切手を付けていません。</p>
+    </div>
+
+    <p><strong>① 何が無いか。</strong> capabilities の絞り込みと、seccomp によるシステムコールのフィルタです。どちらも <code>src/</code> に該当するコードがありません。<code>internal/container/init.go</code> がやっているのは、ホスト名を書き、根を挿げ替え、特殊なファイルシステムを貼り、目的のコマンドを <code>exec</code> することだけです。<strong>権限を落とす処理は、どこにもありません。</strong></p>
+
+    <p><strong>② 無いと何が起きるか。</strong> ここを丁寧に見ます。</p>
+
+    <p>コンテナの中で <code>id</code> を打つと <code>uid=0(root)</code> と出ます。この root は、<strong>飾りではありません。ホストの root と同じ、本物の uid 0 です。</strong> user 名前空間を使っていない（Step 3）ので、ID の対応付けも起きていません。コンテナの中の uid 0 は、カーネルから見て文字どおりホストの uid 0 です。</p>
+
+    <div class="ascii">「見える範囲」と「できること」は別の軸
+
+                     見える範囲                できること
+                     （namespace）             （capabilities / seccomp / LSM）
+  ───────────────────────────────────────────────────────────────
+  mydocker が        UTS  PID  MNT  IPC        ★何もしていない
+  やったこと          の4つを区切った            = ホストの root と同じ全権
+
+  runc が            同じ + NET + USER          既定で 14 個程度の capability
+  やっていること        + cgroup 名前空間          だけを残し、それ以外は落とす
+                                              seccomp で数百のシステムコールを塞ぐ
+                                              AppArmor / SELinux も併用
+
+  ★ 名前空間だけでは、この右側の列が空のままになる。
+    「見えないから安全」は成り立たない。見えなくても、呼べてしまう。</div>
+
+    <p>本物の root が持つ全権のうち、Linux では権限が <strong>capability</strong> という単位に分割されています。<code>CAP_SYS_ADMIN</code>、<code>CAP_NET_ADMIN</code>、<code>CAP_MKNOD</code>、<code>CAP_SYS_MODULE</code>、<code>CAP_SYS_BOOT</code>——といった具合です。<strong>コンテナの中のプロセスは、これらを全部持っています。</strong></p>
+
+    <p>持っているとどうなるか。いちばん分かりやすい証拠は、<strong>私たち自身が書いたコード</strong>です。第03章で <code>pivot_root</code> を呼び、マウントの伝播を切り、<code>/proc</code> を貼り直しました。第09章のいま気づいてほしいのは、<strong>それができたのは <code>CAP_SYS_ADMIN</code> を持っていたからだ</strong>ということです。そして、その同じ <code>CAP_SYS_ADMIN</code> は、コンテナの中のプロセスも持ったままなのです。</p>
+
+    <p>つまり、<strong>コンテナの中のプロセスは、自分で <code>mount</code> できます。自分で <code>pivot_root</code> できます。</strong> 第03章で「<code>chroot</code> は破れるが <code>pivot_root</code> は破れない」と確かめました。あれは正しいのですが、前提があります。<em>相手が権限を持っていなければ</em>という前提です。<code>CAP_SYS_ADMIN</code> を持ったプロセスは、マウント木を自分で操作できます。第09章の視点から言い直すと、<strong>私たちが作った隔離は「破れないから安全」なのではなく、「破る権限を持ったまま、破らないでいてくれているから成立している」だけです。</strong></p>
+
+    <p>もう一つ具体例を挙げます。第03章の判断 9 で、<code>/dev</code> に tmpfs を敷き、必要なノードだけ <code>mknod</code> で作りました。ホストの <code>/dev</code> を bind mount すると、コンテナからホストのブロックデバイスに手が届いてしまうからです。この判断は正しかったのですが、<strong><code>CAP_MKNOD</code> が残っている以上、コンテナの中のプロセスは自分で <code>mknod</code> できます</strong>。ホストのディスクに対応するデバイスノードを自分で作り、それを開いて読めば、<code>pivot_root</code> で切り離したはずのホストのファイルシステムの中身がそのまま読めます。<strong>これは理屈上の話ではなく、権限が揃っているという事実そのものです。</strong></p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · capability の 5 つの集合</div>
+      <p>capability は「持っている／持っていない」の 1 ビットではなく、プロセスごとに <strong>5 つの集合</strong>を持ちます。おおまかには次のとおりです。</p>
+      <ul>
+        <li><strong>Permitted</strong> — 持つことが許されている capability の全体</li>
+        <li><strong>Effective</strong> — いま実際に効いているもの。カーネルが権限判定に使う</li>
+        <li><strong>Inheritable</strong> — <code>exec</code> をまたいで引き継がれる候補</li>
+        <li><strong>Bounding</strong> — その先で<strong>二度と取り戻せない</strong>ようにする天井。ここから落とすと復活できない</li>
+        <li><strong>Ambient</strong> — 特権の無いプログラムを <code>exec</code> しても残るもの（新しめの仕組み）</li>
+      </ul>
+      <p>「権限を落とす」というとき、実務上いちばん効くのは <strong>Bounding set から落とすこと</strong>です。Effective から外すだけでは、条件次第で戻せてしまうからです。この集合の多さが、capability の実装が「1 行足す」で済まない理由です。</p>
+    </div>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> 2 つの仕組みを、正しい順序で入れることになります。</p>
+
+    <p><strong>まず capabilities。</strong> 目的のコマンドを <code>exec</code> する直前に、要らない capability を落とします。Bounding set から落とすには <code>prctl(PR_CAPBSET_DROP, ...)</code> を必要な回数だけ呼び、現在の集合を書き換えるには <code>capset(2)</code> を呼びます。<strong>難所は順序です。</strong> <code>init</code> 側のコードは、<code>pivot_root</code> するにも <code>/proc</code> を貼るにも <code>CAP_SYS_ADMIN</code> を必要とします。ですから落とすタイミングは<strong>「マウント作業を全部終えた後、<code>exec</code> する直前」</strong>という一点しかありません。1 行早く落とすと自分のコードが動かなくなり、1 行遅らせると（<code>exec</code> の後になり）落とせません。</p>
+
+    <p><strong>次に seccomp。</strong> こちらは capability よりも細かく、<strong>システムコール単位</strong>で「呼んでよい／エラーを返す／プロセスを殺す」を決めます。実体は <strong>BPF のプログラム</strong>で、システムコール番号や引数を見て判定するフィルタを組み立て、<code>prctl(PR_SET_NO_NEW_PRIVS, 1)</code> を立ててから <code>seccomp(SECCOMP_SET_MODE_FILTER, ...)</code> で装着します。<code>PR_SET_NO_NEW_PRIVS</code> が先に要るのは、<strong>setuid されたプログラムを <code>exec</code> して権限を取り戻す経路を塞ぐため</strong>です。これを忘れると、フィルタをかけた意味が薄れます。</p>
+
+    <p>Go の標準ライブラリだけでこれを書くなら、BPF の命令列（比較・ジャンプ・戻り値）を構造体の配列として自分で組み立てることになります。数百のシステムコールを列挙した表を持ち、アーキテクチャごとに番号が違うことも扱う必要があります。<strong>「フラグを 1 つ足す」では絶対に終わりません。</strong></p>
+
+    <p>参考として、<code>runc</code> の既定はおおよそ次のようになっています。<strong>capability は既定で 14 個程度だけを残し、それ以外は落とします。seccomp では数百のシステムコールを塞ぎます</strong>（<code>reboot</code>、カーネルモジュールの読み込み、<code>kexec</code>、<code>swapon</code> といった、コンテナの中から呼ぶ理由が無いものが並びます）。<code>mydocker</code> はこのどちらも<strong>1 つもやっていません</strong>。ここが、自作したものと本物の実行環境との間にある、いちばん深い谷です。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 「隔離されている」と「安全である」は別のこと</div>
+      <p>ここまで来た読者が最も間違えやすいのが、この 2 つの混同です。<code>ps</code> が 2 行になり、<code>ls /</code> が alpine になった状態を見ると、「守られている」と感じます。しかし見えているのは<strong>隔離</strong>であって、<strong>安全</strong>ではありません。</p>
+      <p>隔離は「うっかり」を防ぎます。安全は「わざと」を防ぎます。<code>mydocker</code> が防げているのは前者だけです。<strong>信用できないコードを <code>mydocker</code> の中で走らせてはいけません。</strong> それは隔離ではなく、単に root でそのコードを実行しているのと変わりません。</p>
+    </div>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>rootless（user 名前空間）</h2>
+
+    <p><strong>① 何が無いか。</strong> <code>CLONE_NEWUSER</code> と、それに伴う ID の対応付け（<code>/proc/&lt;pid&gt;/uid_map</code> と <code>gid_map</code> の書き込み）です。<code>src/README.md</code> の冒頭に「これらを触るには<strong>特権</strong>（<code>CAP_SYS_ADMIN</code> など）が要る」と書いてあるとおり、<code>mydocker</code> は最初から最後まで root で動かすことを前提にしています。第00章で用意した開発環境が特権付きの Linux コンテナだったのも、そのためです。</p>
+
+    <p><strong>② 無いと何が起きるか。</strong> まず単純に、<strong>管理者権限が無いと 1 行も動きません</strong>。共有サーバや、権限が絞られた CI 環境では使えません。</p>
+
+    <p>より重要なのは事故のときの被害です。<code>mydocker</code> 自身が root で動き、コンテナの中も root です。ですから、<strong>tar の展開先の検証（第06章の <code>safeJoin</code>）に穴が 1 つあれば、それはホストの任意のファイルを root 権限で上書きできる穴になります。</strong> 第06章で 3 段の検証を入れ、E2E で細工した tar を実際に投入して確かめたのは、この危険度が理由でした。「テストを書いたから大丈夫」ではなく、<strong>「失敗したときの被害が最大だから、そこまでやった」</strong>という順番です。</p>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> ここが面白いところです。<strong>「コンテナの中の root を、ホストの一般利用者に対応付ける」</strong>という発想の転換が要ります。</p>
+
+    <div class="ascii">user 名前空間による ID の対応付け
+
+  【いま（特権前提）】                【rootless】
+
+  コンテナの中           ホスト        コンテナの中           ホスト
+  ───────────         ─────      ───────────         ─────
+   uid 0 (root)  ══同一══  uid 0        uid 0 (root)  ──対応──  uid 100000
+   uid 1000      ══同一══  uid 1000     uid 1000      ──対応──  uid 101000
+                                        ...                     ...
+   ★中の root は                        ★中では全権に見えるが、
+     本物の root                           ホストから見ればただの一般利用者
+
+  対応付けを書く場所: /proc/&lt;pid&gt;/uid_map  （gid は gid_map）
+  書式: 「中の開始 ID」「ホストの開始 ID」「個数」を空白区切りで1行ずつ
+
+     0 100000 65536
+     ↑  ↑     ↑
+     │  │     └ この範囲を対応させる
+     │  └ ホスト側の開始
+     └ コンテナ内の開始（0 = root）</div>
+
+    <p>Go では、<code>syscall.SysProcAttr</code> に <code>UidMappings</code> と <code>GidMappings</code> というフィールドがあり、<code>CLONE_NEWUSER</code> と組み合わせるとランタイムが対応付けの書き込みまで面倒を見てくれます。ですから「フラグと対応表を渡すだけ」に見えます。<strong>問題はその対応表の中身をどうやって手に入れるかです。</strong></p>
+
+    <p><strong>難所その 1、範囲を確保する権限。</strong> 特権の無い利用者が自分で <code>uid_map</code> に書ける対応は、原則として<strong>自分自身の 1 つの ID だけ</strong>です。上の図のように 65536 個の範囲を対応させるには特権が要ります。ここで登場するのが <code>newuidmap</code> / <code>newgidmap</code> という、<strong>setuid された小さな外部プログラム</strong>です。これらは <code>/etc/subuid</code> と <code>/etc/subgid</code> という設定ファイルを読み、「この利用者にはこの範囲を使ってよい」と管理者が事前に許可した範囲だけを、代理で書き込みます。</p>
+
+    <p>つまり rootless は、<strong>「まったく特権が要らない」わけではありません</strong>。管理者が事前に <code>/etc/subuid</code> に範囲を割り当てておく必要があり、その範囲を書き込むために setuid されたヘルパを呼ぶ必要があります。<strong>特権を「実行時」から「事前の設定」へ移動させた</strong>、というのが正確な理解です。そして、この教材の「標準ライブラリだけ」という制約に照らすと、外部プログラムを呼ぶことになる時点で少し話が変わってきます。</p>
+
+    <p><strong>難所その 2、ファイルの所有者。</strong> イメージの tar の中には <code>uid 0</code> 所有のファイルが並んでいます。rootless で展開すると、<strong><code>chown</code> できません</strong>（一般利用者は他人の ID に所有者を変えられません）。解決策は、user 名前空間の中に入ってから展開すること（中では自分が root なので <code>chown</code> が通る）、あるいは ID をずらして記録しておくことです。どちらにせよ、第06章で書いた展開処理はそのままでは動きません。</p>
+
+    <p><strong>難所その 3、overlayfs。</strong> user 名前空間の中から overlayfs をマウントすることは、長らくできませんでした。カーネル 5.11 以降で条件付きに許されるようになりましたが、それ以前は不可能でした。rootless の実行環境が <code>fuse-overlayfs</code>（ユーザ空間で overlay 相当を実現する FUSE ファイルシステム）を使っていたのは、この制約が理由です。<strong>第06章で「カーネルに重ね合わせを任せられる」と言えたのは、特権があったからこそ</strong>でした。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ MVP で特権を前提にしたのは、これを先送りするため</div>
+      <p>ここを曖昧にしないために、はっきり書いておきます。<strong>この教材が最初から「root で動かす」と決めたのは、rootless の難しさを意図的に先送りしたからです。</strong> 技術的に不要だと判断したのではありません。</p>
+      <p>もし最初から rootless で始めていたら、第01章の re-exec の前に ID の対応付けの話が入り、第03章の <code>pivot_root</code> の前に「その権限を持っているか」の話が入り、第06章の overlayfs は素直にマウントできず、教材の階段が最初の 3 段で崩れていました。<strong>要件定義書の §3.2 に「rootless 実行」をスコープ外として明記し、§7 の発展課題に回したのは、この判断の記録です。</strong></p>
+    </div>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>イメージのビルド（Dockerfile 相当）</h2>
+
+    <p><strong>① 何が無いか。</strong> <code>mydocker build</code> がありません。コマンド表にあるのは <code>run</code> / <code>ps</code> / <code>exec</code> / <code>rm</code> / <code>pull</code> / <code>info</code> の 6 つだけです。<strong>イメージを読むことはできますが、作ることはできません。</strong></p>
+
+    <p><strong>② 無いと何が起きるか。</strong> 自分のアプリケーションを入れたイメージを用意できません。既存のイメージをそのまま動かすか、<code>--rootfs</code> でローカルのディレクトリを根として使うか、<code>--layer</code> で重ねるレイヤを直接指定するか——手で組む方法しかありません。これは第06章の学習用としては十分に働きましたが、道具としては明らかに片肺です。</p>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> ここは、<strong>いちばん取り組みやすい発展課題</strong>です。理由は単純で、<strong>すでに構造を知っているから</strong>です。</p>
+
+    <div class="ascii">ビルドは「1手順 = 1レイヤ」の繰り返し
+
+  手順書                     やること                        できるもの
+  ─────────────────────────────────────────────────────────
+  FROM alpine       →  pull して展開（実装済み）        →  下地のレイヤ
+
+  RUN apk add curl  →  下地を lowerdir にして overlay    →  upper/ の中身
+                       をマウントし、その中でコマンドを      = 「curl を入れた
+                       実行する（= run とほぼ同じ）        　 という差分」1枚
+
+  COPY app /app     →  ホストから upper/ へコピーする     →  差分 1枚
+
+  CMD ["/app"]      →  ファイルは1つも変わらない          →  config だけ更新
+
+  ★ 各手順の後で upper/ を tar.gz に固め、digest を計算すれば、
+    それがそのまま「レイヤ」になる。第06章で読む側から見た構造の、書く側。</div>
+
+    <p>やることを具体的に並べると次のようになります。<strong>手順書のパーサ</strong>（<code>FROM</code> / <code>RUN</code> / <code>COPY</code> / <code>ENV</code> / <code>CMD</code> / <code>WORKDIR</code> あたりから）。<strong>各手順の実行</strong>——<code>RUN</code> は結局のところ、いま持っているコンテナ起動の仕組みをそのまま再利用します。第01〜04章で書いたものが、そっくりそのまま使えます。<strong>差分の取り出し</strong>——overlay の <code>upper/</code> が「その手順で変わったもの」そのものなので、これを tar.gz に固めます。ここで第06章のホワイトアウトの知識が逆向きに要ります（<code>upper/</code> にあるキャラクタデバイス 0:0 は、tar に書き出すとき <code>.wh.&lt;名前&gt;</code> に翻訳し直す必要があります）。<strong>config の生成</strong>——第05章で読む側を実装した <code>Env</code> / <code>Cmd</code> / <code>WorkingDir</code> を含む JSON を、今度は自分で書き出します。<strong>キャッシュの判定</strong>——同じ手順を同じ下地に対して実行するなら、前回のレイヤを再利用します。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · なぜ「取得（読む側）が先」なのか</div>
+      <p>要件定義書の §7 に「取得（読む側）が動いてから着手すると、レイヤの構造がすでに理解できているので進めやすい」と書きました。これは順序の好みではなく、<strong>デバッグのしやすさの話</strong>です。</p>
+      <p>ビルドを先に作ると、出来上がったレイヤが正しいかどうかを確かめる手段がありません。「自分で作ったものを自分で読む」ので、両方が同じように間違っていれば通ってしまいます。一方、読む側が先にあれば、<strong>本物のレジストリから取ってきた本物のイメージ</strong>という正解が手元にあります。自分が作ったレイヤを、その正解と同じ形式で作れているかで検証できます。<strong>正解のあるほうから作る。</strong> これは実装順序を決めるときの一般的な原則でもあります。</p>
+    </div>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span>レジストリへの push</h2>
+
+    <p><strong>① 何が無いか。</strong> 書き込み側のレジストリ API です。<code>internal/image/registry.go</code> にあるのは取得の経路（トークン → マニフェスト → レイヤ）だけで、その逆はありません。</p>
+
+    <p><strong>② 無いと何が起きるか。</strong> 作ったイメージ（Step 4 が実装できたとして）を配れません。手元のマシンだけで完結します。イメージの本質は「同じものが別のマシンで再現できること」なので、配れないイメージは価値の半分を失っています。</p>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> 取得の逆向きですが、<strong>3 点だけ性質が違います</strong>。</p>
+
+    <p><strong>1 つめ、トークンのスコープ。</strong> 第05章で取ったトークンは <code>scope=repository:library/alpine:pull</code> でした。push するには <code>pull,push</code> のスコープを要求し、しかも<strong>そのリポジトリに書き込む権限を持つ資格情報</strong>で認証する必要があります。匿名では取れません。ここで初めて、レジストリの認証が「誰でも取れるトークン」から「本人確認を伴うトークン」に変わります。</p>
+
+    <p><strong>2 つめ、アップロードが多段階であること。</strong> ブロブ（レイヤや config の実体）の送信は、1 回の POST では終わりません。おおまかには、<code>POST /v2/&lt;name&gt;/blobs/uploads/</code> でアップロード用の場所を確保し、返ってきた場所へ本体を送り、最後に digest を指定して確定させる、という流れになります。大きなレイヤを分割して送ることもできます。</p>
+
+    <p><strong>3 つめ、送らなくてよいものを送らない。</strong> レイヤは digest で同一性が決まるので、<strong>レジストリに既にあるものは送る必要がありません</strong>。送る前に「この digest はもうあるか」を問い合わせ、あればスキップします。これをやらないと、alpine を下地にしたイメージを push するたびに毎回 3.67 MiB を送ることになります。<strong>「同じものは 1 度だけ」という、第06章のレイヤ共有と同じ考え方が、ネットワーク越しにも適用されている</strong>わけです。</p>
+
+    <p>最後に、すべてのブロブを送り終えてからマニフェストを送ります。順序が逆だと、「マニフェストは登録されたが中身が無い」という壊れたイメージを作ることになります。<strong>ここでも順序が本質です。</strong></p>
+
+    <h2 class="step" id="step-6"><span class="step-no">Step 6</span>ボリューム管理</h2>
+
+    <p><strong>① 何が無いか。</strong> <code>docker run -v</code> に相当するもの、つまり「コンテナが終わっても残る置き場」です。<code>run</code> のオプションにあるのは <code>--memory</code> / <code>--cpus</code> / <code>--pids</code> / <code>--hostname</code> / <code>--rootfs</code> / <code>--layer</code> / <code>--quiet</code> の 7 つで、ボリュームはありません。</p>
+
+    <p><strong>② 無いと何が起きるか。</strong> <strong>コンテナの中で書いたものは、すべて消えます。</strong> 書き込みは overlay の <code>upper/</code> に溜まり、<code>upper/</code> は <code>/var/lib/mydocker/containers/&lt;ID&gt;/</code> の下にあり、<code>mydocker rm</code> でまとめて消えます。</p>
+
+    <p>これは要件そのものでした。FR-10「終了後に何も残さないこと」を徹底し、E2E でも「10 回起動しても overlay のマウント数が増えない（前 0 件 → 後 0 件）」「テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）」を実数で検査しています。<strong>意図した設計であって、バグではありません。</strong> ただし、その結果として、データベースのようにデータを持ち越したいものは <code>mydocker</code> では動かせません。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · ボリュームは「pivot_root の後」には貼れない</div>
+      <p>実装しようとすると、すぐに順序の壁に当たります。<code>-v /home/me/data:/data</code> を実現するには、ホストの <code>/home/me/data</code> をコンテナの <code>/data</code> に bind mount します。<strong>ではそれをどこで呼ぶか。</strong></p>
+      <p><code>pivot_root</code> の<strong>後</strong>では手遅れです。第03章でやったとおり、古い root は <code>MNT_DETACH</code> で切り離して <code>/.old_root</code> ごと消しています。<strong>その時点で、ホストのパスを指す方法がもう残っていません。</strong>（これは第03章で「<code>chroot</code> と違って参照ごと消える」と喜んだ性質の、裏返しです。）</p>
+      <p>ですから貼るのは <strong><code>pivot_root</code> の前</strong>、まだホストのパスが見えていて、かつ新しい rootfs（overlay の <code>merged</code>）も見えている一瞬です。<code>merged/data</code> に対してホストのディレクトリを bind mount しておけば、根を挿げ替えた後もそこに残ります。<strong>順序が要件を決めている</strong>という、この教材で何度も出てきた構図がここにもあります。</p>
+    </div>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> bind mount 自体は <code>mount(2)</code> に <code>MS_BIND</code> を付けて呼ぶだけで、コードとしては数行です。難しいのはその周りです。</p>
+
+    <p><strong>置き場の管理。</strong> 名前付きボリューム（<code>-v mydata:/data</code>）を作るなら、<code>/var/lib/mydocker/volumes/&lt;名前&gt;/</code> のような置き場と、その一覧・作成・削除のコマンドが要ります。<strong>削除の安全。</strong> 第07章と同じ問題です——使用中のボリュームを消してはいけないので、どのコンテナが使っているかを数える必要があります。<code>mydocker rm</code> が実行中のコンテナを拒否したのと同じ規律を、ボリュームにも適用することになります。<strong>読み取り専用の指定</strong>（<code>MS_RDONLY</code> の再マウントが要ります。bind mount と同時には効かないので 2 回呼ぶ必要がある、という細かい罠があります）。<strong>所有者と権限。</strong> ホスト側のディレクトリの uid と、コンテナの中の uid が食い違うと、書けたり書けなかったりします。Step 3 の rootless を入れるなら、ここは一段と複雑になります。</p>
+
+    <h2 class="step" id="step-7"><span class="step-no">Step 7</span><code>exec</code> のマウント名前空間</h2>
+
+    <p>これは<strong>既知の割り切り</strong>として <code>src/README.md</code> に明記してあるものです。第07章で扱いましたが、棚卸しの一項目として改めて並べます。</p>
+
+    <p><strong>① 何が無いか。</strong> <code>mydocker exec</code> が、コンテナ本体の<strong>マウント名前空間に参加していません</strong>。PID・UTS・IPC の 3 つには <code>setns</code> で参加しますが、マウント名前空間だけは新しく作り、同じ overlay の <code>merged</code> を根にしています。<code>internal/container/run.go</code> の <code>Exec</code> のコメントに、その理由がそのまま書いてあります。</p>
+
+    <p><strong>② 無いと何が起きるか。</strong> ここは正直に、<strong>実害が小さい</strong>と書きます。根にしているのが同一の <code>merged</code> なので、<strong>見えるファイルは完全に同一</strong>です。プロセス一覧もホスト名も本物の名前空間に参加しています。実測でも、<code>exec</code> したシェルからコンテナ本体の PID 1（<code>sleep 20</code>）がちゃんと見えています。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>実行中のコンテナに <code>exec</code> で入り、ホスト名とプロセス一覧を見ます。PID 1 がコンテナ本体であること、ホスト名が <code>mydocker</code> であることが確認できます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker ps
+<span class="out">CONTAINER ID   IMAGE                                 COMMAND    PID     STATUS   CREATED
+0c1be9ad663a   mirror.gcr.io/library/alpine:latest   sleep 20   16144   Up       0s
+合計 1 件</span>
+<span class="ps">$</span> mydocker exec 0c1be9ad663a /bin/sh -c 'hostname; ps'
+<span class="out">mydocker
+PID   USER     TIME  COMMAND
+    1 root      0:00 sleep 20
+    8 root      0:00 /bin/sh -c hostname; ps
+   15 root      0:00 ps</span></code></pre>
+      <p>PID 1 に <code>sleep 20</code> が並んでいます。<strong>これは <code>exec</code> したプロセスが、コンテナ本体と同じ PID 名前空間にいる証拠</strong>です。マウント名前空間だけが別、という割り切りが、この出力からは見えません。</p>
+    </div>
+
+    <p>では何が起きるのか。<strong>コンテナ本体が起動した後に自分で行ったマウントが、<code>exec</code> 側からは見えません。</strong> 逆に <code>exec</code> 側でマウントしたものも本体には見えません。ボリューム（Step 6）を実装した場合、貼る場所によってはこの差が表に出てきます。また、<code>/proc/&lt;pid&gt;/mountinfo</code> を比べると 2 つが別物であることが分かります。<strong>「見えるファイルが同一」は「マウント名前空間が同一」ではありません。</strong></p>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> 原因は Go のランタイムにあります。マウント名前空間への <code>setns(2)</code> は、<strong>呼び出し元がシングルスレッドでなければ <code>EINVAL</code> で失敗します</strong>。Go のランタイムは常に複数のスレッドを持つので、この条件を Go のコードから満たすことができません。<code>runtime.LockOSThread()</code> でスレッドを固定しても駄目です。固定は「今のゴルーチンをこのスレッドに縛る」だけで、<strong>プロセス全体のスレッド数を 1 にするわけではない</strong>からです。</p>
+
+    <p>解決策ははっきりしています。<strong><code>runc</code> と同じことをする</strong>——つまり cgo で C のコンストラクタを書き、<strong>Go のランタイムが起動してスレッドを増やす前に</strong> <code>setns</code> を済ませることです。<code>runc</code> の <code>nsexec</code> がまさにこれで、C の <code>__attribute__((constructor))</code> を使って <code>main</code> より前に走らせています。<strong>この教材が「標準ライブラリだけ」という前提を掲げた結果、唯一妥協した箇所がここです。</strong> cgo を許すなら、この割り切りは解消できます。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · <code>runtime.LockOSThread</code> でも足りない理由</div>
+      <p><code>runtime.LockOSThread()</code> は「このゴルーチンを、いま乗っている OS スレッドに固定する」関数です。<code>setns</code> のようにスレッド単位で効くシステムコールを扱うときには必須で、<code>Exec</code> でも実際に呼んでいます。PID・UTS・IPC への <code>setns</code> はこれで足ります。</p>
+      <p>しかしマウント名前空間の条件は「<strong>プロセスが単一スレッドであること</strong>」です。ゴルーチンを固定しても、ランタイムの GC やシステムコールの待ち受けのために別のスレッドが存在し続けます。<strong>Go で書いている限り、この条件は満たせません。</strong> これは Go の欠陥ではなく、「マルチスレッドのプロセスがマウント名前空間を移ると、スレッドごとに見えるファイルシステムが食い違う」というカーネル側の正当な制約です。</p>
+    </div>
+
+    <h2 class="step" id="step-8"><span class="step-no">Step 8</span>その他の不足 — 長時間動かす道具になっていない</h2>
+
+    <p>ここまでの 7 つは「大きな機能」でした。最後に、<strong>小さいけれど実務では必ず必要になるもの</strong>をまとめて並べます。共通しているのは、<strong>コンテナを「一瞬動かす」のではなく「動かし続ける」ときに効いてくる</strong>という点です。</p>
+
+    <h3>シグナルの転送</h3>
+
+    <p><strong>① 何が無いか。</strong> 親の <code>mydocker</code> が受け取ったシグナルを、コンテナの PID 1 へ<strong>転送する処理</strong>がありません。<code>internal/container/run.go</code> は <code>signal.Notify</code> でシグナルを受け取ってはいますが、それは<strong>親が死んで後片付けが飛ばされるのを防ぐため</strong>——受け流して無視するためです。コードのコメントにもそう書いてあります。</p>
+
+    <p><strong>② 無いと何が起きるか。</strong> 端末から Ctrl-C を押した場合は、シグナルが前景プロセスグループ全体に届くので子にも届きます。しかし、<strong>別のところから <code>mydocker</code> のプロセスに <code>SIGTERM</code> を送った場合、それはコンテナの中には伝わりません。</strong> 親は無視し、子は何も知らないまま走り続けます。プロセス管理の仕組みから止められない、という状態です。</p>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> 受け取ったシグナルを子の PID へ送り直すだけなら数行です。ただし<strong>どのシグナルを転送し、どれを親自身で処理するか</strong>の設計が要ります。<code>SIGCHLD</code> を転送してはいけませんし、後片付けのために親が生き残る必要もあります。</p>
+
+    <h3>PID 1 としての孤児の回収（zombie reaping）</h3>
+
+    <p><strong>① 何が無いか。</strong> コンテナの PID 1 が<strong>孤児プロセスを回収する処理</strong>を持っていません。<code>mydocker init</code> は最後に目的のコマンドを <code>exec</code> するので、PID 1 の中身はそのコマンドそのものに置き換わります。回収してくれるかどうかは、そのコマンド次第です。</p>
+
+    <p><strong>② 無いと何が起きるか。</strong> Linux では、親より先に子が終わると、<strong>その子の後始末は PID 1 が引き取る</strong>ことになっています。ホストでは <code>init</code>（systemd など）がこれをやっています。コンテナの中では、PID 1 は私たちが起動したコマンドです。</p>
+
+    <div class="ascii">孤児が溜まる仕組み
+
+  【ホスト】                        【コンテナの中】
+
+   init (PID 1)                     /app (PID 1)  ← 私たちが起動したコマンド
+    │  ちゃんと wait して                │  wait を知らない
+    │  後始末する                        │
+   親プロセス                          親プロセス
+    │                                  │
+   子（親より先に死ぬ）                 子（親より先に死ぬ）
+        │                                  │
+        └→ init が引き取って回収       └→ /app が引き取るが、回収しない
+                                             = ゾンビとして残り続ける
+
+  ★ ゾンビは PID を1つ占有する。溜まり続けると PID が枯渇する。
+    コンテナが「なぜか」プロセスを作れなくなる、という形で表面化する。</div>
+
+    <p><code>/bin/sh</code> は <code>wait</code> するので、この教材の例では問題が表に出ません。しかし、シェルを経由せずにアプリケーションを直接 PID 1 として起動すると、そのアプリが <code>wait</code> を知らない限りゾンビが溜まります。<code>docker run --init</code> というオプションが存在するのは、まさにこのためです。</p>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> PID 1 に小さな init を挟みます。<code>exec</code> で置き換えるのをやめ、<code>mydocker init</code> 自身が PID 1 として残って目的のコマンドを子として起動し、<code>SIGCHLD</code> を待って終わった子を回収し続け、目的のコマンドが終わったら自分も終わる、という構造です。<strong>ただしこれは「PID 1 が <code>exec</code> で目的のコマンドになる」という、この教材の分かりやすさを一つ手放すことでもあります。</strong> <code>ps</code> の出力の PID 1 が <code>/bin/sh</code> ではなくなるからです。教材としてどちらを取るかは、実際に手を動かすときに考えてみてください。</p>
+
+    <h3><code>logs</code></h3>
+
+    <p><strong>① 何が無いか。</strong> 標準出力・標準エラーの記録です。<code>run</code> は子の標準入出力を自分の標準入出力に直結しているだけなので（FR-1 の「標準入出力が起動した端末とつながる」がそれです）、<strong>端末を閉じたら出力は消えます</strong>。</p>
+
+    <p><strong>② 無いと何が起きるか。</strong> 後から出力を読めません。バックグラウンドで動かす仕組み（デタッチ実行）も無いので、そもそも「後から」という状況が作れない、というのが正確なところです。<strong>2 つの不足は連動しています。</strong></p>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> 出力をファイル（<code>/var/lib/mydocker/containers/&lt;ID&gt;/</code> の下）へも書くようにし、<code>mydocker logs &lt;ID&gt;</code> でそれを読みます。端末に直結する場合と、ファイルに落としつつ端末にも出す場合の切り替えが要ります。デタッチ実行まで踏み込むなら、親プロセスが終了してもコンテナが生き残る構造（親子関係の切り離し）が必要になり、そうすると「誰が後片付けするのか」という第07章の問題が再燃します。<strong>ここは見た目より深い変更です。</strong></p>
+
+    <h3><code>stop</code></h3>
+
+    <p><strong>① 何が無いか。</strong> コンテナを止めるコマンドです。いまあるのは <code>rm</code>（終了したコンテナの痕跡を片付ける）だけで、<strong>動いているものを止める手段がありません</strong>。実行中のコンテナに <code>rm</code> すると、正しく拒否されます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>実行中のコンテナを消そうとすると、こうなります。拒否は正しい振る舞いですが、<strong>「では止めるにはどうするのか」に対する答えを <code>mydocker</code> は持っていません</strong>。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker rm 0c1be9ad663a
+<span class="out">mydocker: コンテナ 0c1be9ad663a はまだ実行中です。先に終了させてください</span></code></pre>
+    </div>
+
+    <p><strong>③ 実装するなら何が要るか。</strong> 作法は決まっています。<strong><code>SIGTERM</code> を送る → 猶予（既定 10 秒など）を待つ → まだ生きていたら <code>SIGKILL</code></strong> です。「行儀よく終わる機会を与えてから、強制する」という 2 段構えです。</p>
+
+    <p>実装上の注意が 2 つあります。<strong>1 つめ、PID 1 のシグナルの扱いは特別です。</strong> PID 名前空間の PID 1 に対しては、<strong>そのプロセス自身がハンドラを登録していないシグナルは、カーネルが握りつぶします</strong>。つまり <code>SIGTERM</code> のハンドラを持たないプログラムを PID 1 として動かすと、<code>SIGTERM</code> は<strong>効きません</strong>。「<code>docker stop</code> が必ず 10 秒待たされる」という、よく知られた現象の正体がこれです。序章の FAQ で触れたとおりです。<strong>2 つめ、確実に止めたいなら cgroup の freezer を使う手もあります</strong>——プロセス群をまとめて凍らせてから処理する方法で、取りこぼしがありません。第04章で使った cgroup には、上限をかける以外にこういう使い道もあります。</p>
+
+    <h3>複数コンテナのオーケストレーション</h3>
+
+    <p>最後に、要件定義書の §3.2 でスコープ外にした最大の項目です。<strong>複数のコンテナをまとめて定義し、起動し、停止する</strong>仕組み。<code>docker compose</code> に相当するものです。</p>
+
+    <p>これについては「実装するなら何が要るか」より先に、<strong>順序</strong>を書いておきます。<strong>ネットワーク（Step 1）とボリューム（Step 6）が揃ってから着手する</strong>——要件定義書にもそう書きました。理由は明白で、複数のコンテナをまとめる意味は「それらが通信すること」と「データを共有すること」にあるからです。その 2 つが無い状態で「まとめて起動する」機能だけ作っても、<strong>できるのは「複数のコンテナをまとめて起動する」だけ</strong>です。それは <code>for</code> ループで足ります。</p>
+
+    <h2 id="oci">OCI ランタイム仕様との差</h2>
+
+    <p>足りないものを 8 つ並べました。ここで視点を変えます。<strong>「Docker と比べてどうか」ではなく、「標準規格と比べてどうか」</strong>という見方です。</p>
+
+    <p><strong>OCI ランタイム仕様</strong>（Open Container Initiative Runtime Specification）というものがあります。これは実装ではなく、<strong>取り決め</strong>です。ひとことで言うと、<strong>「バンドルを渡されたら、こう振る舞え」</strong>という約束を文章で定めたものです。</p>
+
+    <div class="ascii">OCI ランタイム仕様が定めているもの
+
+  【バンドル】= ランタイムに渡される入力。これだけ。
+
+    bundle/
+    ├── config.json     ★何をどう動かすかが全部書いてある JSON
+    └── rootfs/         コンテナの / になるディレクトリ木
+
+  config.json に書かれていること（抜粋）:
+    - process     : 実行するコマンド・環境変数・作業ディレクトリ
+                    ・capabilities の5つの集合・rlimits
+    - root        : rootfs のパス・読み取り専用かどうか
+    - mounts      : どこに何をどうマウントするか（順序も含めて全部）
+    - linux.namespaces  : どの名前空間を作るか（または既存のどれに入るか）
+    - linux.resources   : cgroup の上限
+    - linux.seccomp     : 許すシステムコール・拒否するシステムコール
+    - hooks       : 起動の前後に走らせる外部プログラム
+
+  ★ 仕様が定めるのは「振る舞い」であって「実装」ではない。
+    だから同じ config.json を渡せば、どの実装でも同じ結果になる（べき）。</div>
+
+    <p>ここが大事なところです。<strong><code>runc</code> は、この仕様の実装の 1 つにすぎません。</strong> 唯一の実装ではありません。C で書かれた <code>crun</code>、Rust で書かれた <code>youki</code>、仮想マシンで隔離を強化する <code>kata-containers</code>、ユーザ空間でシステムコールを横取りする <code>gVisor</code>（<code>runsc</code>）——どれも同じ <code>config.json</code> を受け取って動きます。<strong>「コンテナランタイム」という言葉が指しているのは、この仕様を満たす実装のことです。</strong></p>
+
+    <p>仕様はもう一つ、<strong>状態のライフサイクル</strong>も定めています。ランタイムは <code>create</code> / <code>start</code> / <code>state</code> / <code>kill</code> / <code>delete</code> という操作を持ち、コンテナは次の状態を遷移します。</p>
+
+    <table>
+      <thead>
+        <tr><th>状態</th><th>意味</th><th><code>mydocker</code> にあるか</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>creating</code></td><td>作成の処理中</td><td>無い（状態として存在しない）</td></tr>
+        <tr><td><code>created</code></td><td>作り終わったが、まだ走らせていない</td><td><strong>無い</strong>（作ると同時に走る）</td></tr>
+        <tr><td><code>running</code></td><td>実行中</td><td><code>state.json</code> の生死判定で代用</td></tr>
+        <tr><td><code>stopped</code></td><td>終了済み</td><td>無い（終了＝記録が消えるだけ）</td></tr>
+      </tbody>
+    </table>
+
+    <div class="box hazard"><div class="box-k">⚠ 曖昧にしない · <code>mydocker</code> は OCI ランタイム仕様に準拠していない</div>
+      <p>ここははっきり書きます。<strong><code>mydocker</code> は OCI ランタイム仕様に準拠していません。</strong> 「一部準拠」でも「準拠を目指している」でもなく、準拠していません。理由は 2 つあり、どちらも構造的なものです。</p>
+      <p><strong>1 つめ、<code>config.json</code> を読みません。</strong> <code>mydocker</code> の入力はコマンドライン引数（イメージ名・コマンド・オプション）です。バンドルという概念がありません。したがって、他のツールが用意したバンドルを <code>mydocker</code> で動かすことも、<code>mydocker</code> が作ったものを他のランタイムに渡すこともできません。</p>
+      <p><strong>2 つめ、状態のライフサイクルを持ちません。</strong> 上の表のとおり、<code>created</code>（作ったがまだ走らせていない）という状態が存在しません。<code>mydocker run</code> は作成と起動が一体です。この <code>created</code> 状態は、上位のツールが「コンテナを準備してから、タイミングを合わせて一斉に起動する」ためにあるもので、<strong>仕様の中でもかなり本質的な部分</strong>です。</p>
+      <p>準拠していないことは失敗ではありません。<strong>要件定義書に「OCI 準拠」と書いていないからです。</strong> 目的は「コンテナの正体はプロセスであることを体で理解する」ことであって、互換性のある実装を作ることではありませんでした。<strong>ただし、準拠していないものを準拠しているかのように語るのは、この教材で最もやってはいけないことです。</strong></p>
+    </div>
+
+    <h3>層の分かれ方 — 自作したのはどこか</h3>
+
+    <p>では <code>mydocker</code> は、実際の道具立ての中でどこに位置するのでしょうか。<code>docker</code> と打ったときに動くものの層を並べてみます。</p>
+
+    <div class="ascii">docker run と打ったときに動くもの（層の分かれ方）
+
+  ┌──────────────────────────────────────────────┐
+  │  docker CLI / dockerd                                │  利用者向けの窓口
+  │  ビルド・レジストリ・ネットワーク・ボリューム・compose  │  「使いやすさ」の層
+  ├──────────────────────────────────────────────┤
+  │  containerd                                          │  常駐して面倒を見る層
+  │  イメージの管理・スナップショット・コンテナの寿命管理    │  gRPC の API を持つ
+  ├──────────────────────────────────────────────┤
+  │  containerd-shim                                     │  親が死んでも
+  │  コンテナ1つにつき1つ。標準入出力と終了コードを預かる    │  コンテナが生き残る仕組み
+  ├──────────────────────────────────────────────┤
+  │  runc （OCI ランタイム仕様の実装）                     │  ★ここが「作る」層
+  │  bundle を受け取り、名前空間・cgroup・rootfs・        │  一瞬だけ動いて消える
+  │  capabilities・seccomp を整えて exec する            │
+  ├──────────────────────────────────────────────┤
+  │  Linux カーネル                                       │  clone / mount / cgroup
+  │  namespace  cgroup  overlayfs  capabilities  seccomp  │  実際に隔離しているのは
+  └──────────────────────────────────────────────┘  ここ
+
+  ★ mydocker がいるのは runc の位置。ただし
+    ・config.json を読まない（バンドルを受け取らない）
+    ・capabilities / seccomp を触らない
+    ・NET / USER 名前空間を作らない
+    ・状態のライフサイクルを持たない
+    → 「runc の位置の、ごく一部」というのが正確な言い方。
+
+  そのうえで、上の層の仕事も少しだけ持っている:
+    ・イメージの取得（本来 containerd の仕事）
+    ・レイヤの展開と重ね合わせ（本来 containerd のスナップショッタの仕事）
+    ・CLI（本来 docker CLI の仕事）</div>
+
+    <p>この図の見方を 2 つ書きます。</p>
+
+    <p><strong>1 つめ、<code>runc</code> は常駐しません。</strong> コンテナを 1 つ起動するとき、<code>runc</code> は呼ばれ、名前空間と cgroup と rootfs を整え、目的のコマンドを <code>exec</code> して、<strong>消えます</strong>。コンテナが動き続けている間、<code>runc</code> のプロセスはもういません。これは <code>mydocker</code> とは違うところで、<code>mydocker run</code> は子の終了を待つために生き続けます（後片付けをするためです）。<strong>「誰が後片付けするか」を解決するために、本物の道具立てでは <code>shim</code> という層が挟まっています。</strong> 第07章で「親が死んだら誰が片付けるのか」に悩んだ問題への、業界の答えがこれです。</p>
+
+    <p><strong>2 つめ、<code>mydocker</code> は層をまたいでいます。</strong> イメージの取得は本来 <code>containerd</code> の仕事で、<code>runc</code> はイメージを知りません。<code>runc</code> が受け取るのは、もう展開済みの <code>rootfs/</code> です。<code>mydocker</code> がレジストリと会話するのは、教材として「イメージとは何か」を扱うためで、<strong>層の分け方としては正しくありません</strong>。学習用の 1 本のバイナリだから、こう作ってあります。</p>
+
+    <h2 id="runc">runc が実際にやっていること</h2>
+
+    <p>層の位置が分かったところで、同じ位置にいる <code>runc</code> が、<code>mydocker</code> と比べて何を余計にやっているのかを並べます。<strong>これは「runc はすごい」という話ではありません。「なぜ runc のソースは読みにくいのか」という話です。</strong></p>
+
+    <table>
+      <thead>
+        <tr><th>runc がやっていること</th><th>何のためか</th><th><code>mydocker</code></th></tr>
+      </thead>
+      <tbody>
+        <tr><td>cgo による <code>nsexec</code></td><td>Go のランタイムが起動する前にマウント名前空間へ <code>setns</code> するため</td><td>やらない（Step 7 の割り切り）</td></tr>
+        <tr><td>capabilities の絞り込み</td><td>中の root から全権を取り上げる</td><td>やらない（Step 2）</td></tr>
+        <tr><td>seccomp フィルタ</td><td>呼べるシステムコールを数百単位で塞ぐ</td><td>やらない（Step 2）</td></tr>
+        <tr><td>AppArmor / SELinux</td><td>ディストリビューション側の強制アクセス制御と噛み合わせる</td><td>やらない</td></tr>
+        <tr><td>cgroup の完全な実装</td><td>デバイスの許可、freezer、統計の取得、v1/v2 両対応、systemd 連携</td><td>memory / cpu / pids だけ</td></tr>
+        <tr><td>フック（prestart / poststart / poststop）</td><td>ネットワークの設定などを外部プログラムに任せる</td><td>持たない</td></tr>
+        <tr><td>状態のライフサイクル</td><td><code>create</code> と <code>start</code> を分け、上位のツールが制御できるようにする</td><td>持たない（Step の表のとおり）</td></tr>
+        <tr><td>rootless 対応</td><td>特権なしで動かす</td><td>やらない（Step 3）</td></tr>
+        <tr><td>checkpoint / restore</td><td>動いているコンテナを凍らせて保存し、後で再開する</td><td>やらない</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>cgo による <code>nsexec</code></strong> は、Step 7 で書いたとおり、マウント名前空間への <code>setns</code> のための仕掛けです。C の <code>__attribute__((constructor))</code> で <code>main</code> より前に走らせ、Go のランタイムが動き出す前に名前空間の切り替えを済ませます。<strong><code>runc</code> のソースを読み始めた人が最初に面食らうのがここです</strong>——Go のプロジェクトなのに、いきなり C のファイルが出てきて、しかもそれが実行順序の最初にいるからです。第07章の割り切りの、本命の解決策がこれだと分かっていれば、読む理由がはっきりします。</p>
+
+    <p><strong>フック</strong>は、一見地味ですが構造的に重要です。<code>runc</code> はネットワークの設定を<strong>自分ではやりません</strong>。<code>prestart</code> フックで外部のプログラム（CNI プラグインなど）を呼び、そちらに任せます。第08章で「ネットワークは難しい」と書きましたが、<strong>業界の答えも「難しいので別の層に切り出す」でした。</strong> 責務の分割としては、この教材で <code>internal/cli</code> を薄く保ったのと同じ発想です。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 大事なこと · これらは全部「本番運用に必要な分岐と抽象」である</div>
+      <p>上の表を見て「runc には敵わない」と思う必要はありません。<strong>むしろ逆で、ここに自作した意味があります。</strong></p>
+      <p>要件定義書の §1.1 に、こう書きました——<strong>「既存のコンテナランタイムのソースを読む道もあるが、<code>runc</code> や <code>containerd</code> は本番運用に必要な分岐と抽象で厚く覆われており、核となる仕組みが埋もれている」</strong>と。上の表の 9 項目が、まさにその「厚く覆っているもの」です。</p>
+      <p><code>runc</code> のソースで <code>pivot_root</code> を呼んでいる箇所を探すと、たしかに見つかります。しかしその前後には、rootless かどうかの分岐、<code>config.json</code> のマウント指定を順に適用する処理、SELinux ラベルの付与、読み取り専用の再マウント、エラー時の巻き戻しが並んでいます。<strong>「伝播を切る → bind → pivot_root → 古い根を捨てる」という 4 行の骨格は、その中に埋まっています。</strong></p>
+      <p>私たちは、その骨格だけを先に自分の手で書きました。<strong>だから今なら、覆いの下に何があるかを知った状態で <code>runc</code> を読めます。</strong> これが「自作した意味」です。</p>
+    </div>
+
+    <h2 id="next">ここから先の進み方</h2>
+
+    <p>足りないものが 8 つ並び、<code>runc</code> との差も見えました。では、次に何をすればよいのか。<strong>順序を提案します。</strong> 難易度と、学べることの密度で並べてあります。</p>
+
+    <div class="ascii">おすすめの順序（下から積む、という原則はここでも同じ）
+
+  5.  runc のソースを読む            ← ここまで来れば読める
+      ↑
+  4.  OCI 仕様を読み、config.json を読めるようにする
+      ↑
+  3.  ネットワークを実装する（第08章の地図をなぞる）
+      ↑
+  2.  capabilities を落としてみる（何が壊れるかを見る）
+      ↑
+  1.  mydocker に stop を足す（シグナルの扱いを学ぶ）  ← 最初の一歩
+
+  ★ 1 と 2 は、どちらも「小さく始めて、すぐ結果が見える」もの。
+    3 は大きい。4 は読み物。5 は目的地。</div>
+
+    <p><strong>1. <code>mydocker</code> に <code>stop</code> を足す。</strong> いちばん小さい一歩です。<code>state.json</code> から PID を読み、<code>SIGTERM</code> を送り、猶予を待ち、まだ生きていたら <code>SIGKILL</code>。コード量は少ないのに、学べることが多い課題です。<strong>PID 1 のシグナルの特別扱い</strong>（ハンドラが無いシグナルは握りつぶされる）に必ずぶつかりますし、「生きているかどうか」の判定（第07章で <code>state.json</code> に PID と起動時刻を両方書いた理由）が効いてくる場面でもあります。<strong>何より、対照実験がしやすい</strong>——<code>SIGTERM</code> を受け取るシェルスクリプトと、受け取らないコマンドの両方で試せば、挙動の差がその場で見えます。</p>
+
+    <p><strong>2. capabilities を落としてみる。</strong> 実装する前に、<strong>壊してみる</strong>のがおすすめです。<code>init</code> の <code>exec</code> の直前で <code>CAP_SYS_ADMIN</code> を落とすコードを入れ、コンテナを起動してみてください。何が起きるでしょうか。次に、落とす位置を <code>pivot_root</code> の<strong>前</strong>に動かしてみてください。今度は何が起きるでしょうか。<strong>この 2 つの差が、Step 2 で書いた「順序が一点しかない」という話の実体験になります。</strong> そのうえで、どの capability が本当に要るのかを 1 つずつ確かめていくと、<code>runc</code> の既定が 14 個程度である理由が腑に落ちます。</p>
+
+    <p><strong>3. ネットワークを実装する。</strong> ここから大きくなります。第08章の 4 段構えの地図をなぞってください。<strong>おすすめは、いきなり <code>mydocker</code> に組み込まないことです。</strong> まず <code>ip</code> コマンドで手動で 4 段を通し、コンテナから外に <code>ping</code> が通る状態を作ってください。手で通せないものはコードでも通せません。手で通ってから、その手順を 1 段ずつ Go に移していきます。<strong>切り分けのコストが MVP から外した理由だった</strong>ので、切り分けやすい進め方をするのが対策です。</p>
+
+    <p><strong>4. OCI 仕様を読み、<code>config.json</code> を読めるようにする。</strong> 仕様そのものは、思ったより読みやすい文書です。そして、ここまで実装してきた読者にとっては<strong>ほとんどが既知のこと</strong>です。<code>linux.namespaces</code> の項目を読めば「ああ、<code>Cloneflags</code> のことか」と分かりますし、<code>linux.resources.memory.limit</code> を読めば「<code>memory.max</code> に書く値だな」と分かります。<strong>仕様の各項目が、自分の書いたコードのどの行に対応するかを指させる</strong>——これが、この段階で得られるものです。実装としては、<code>config.json</code> を読んで <code>Config</code> を組み立てる変換を書けば、既存の <code>Run</code> がそのまま使えます。</p>
+
+    <p><strong>5. <code>runc</code> のソースを読む。</strong> 目的地です。<strong>ここまで来れば読めます。</strong> 読む順番も提案しておきます——まず <code>nsexec</code> の C のコードを見て「Go が動き出す前に名前空間を切り替えている」ことを確認し、次に <code>libcontainer</code> の初期化の流れの中から <code>pivotRoot</code> を探し、その前後の分岐が何を吸収しているのかを見ます。<strong>骨格は自分が書いたものと同じです。</strong> 違うのは、その周りに何が積まれているかだけです。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · 他人のコードを読むときの足場</div>
+      <p>大きなプロジェクトのソースを読むとき、いちばん効くのは「<strong>自分が書いたことのある処理を探す</strong>」ことです。全体を上から順に読もうとすると、抽象の層に迷ってどこにいるか分からなくなります。</p>
+      <p>私たちにはもう足場があります。<code>pivot_root</code>、<code>Cloneflags</code>、<code>cgroup.procs</code>、<code>lowerdir</code>、<code>setns</code>——これらの語で検索すれば、<code>runc</code> の中の「自分が書いたのと同じことをしている場所」に直接降りられます。<strong>そこを起点にして、上下に読み広げる。</strong> これがこの教材が読者に渡そうとしていた、いちばん実用的な道具かもしれません。</p>
+    </div>
+
+    <h2 id="review">総括 — 「動くはず」がいちばん危険だった</h2>
+
+    <p>最後に、この教材全体を通して繰り返し出てきた教訓を 1 つにまとめます。技術の話ではなく、<strong>確かめ方</strong>の話です。</p>
+
+    <p>実装ログの最後に、こう書きました——<strong>「動いている時間より、動かない理由を探している時間のほうが長い。そしてその大半は、『効いていないように見えるが実は効いている』か、『効いているように見えるが実は効いていない』のどちらかだった」</strong>と。</p>
+
+    <p>この 2 つが、この教材の落とし穴ボックスのすべての出所です。そして共通する根っこは 1 つです。<strong>設定が通ったことと、効いていることは、別物である。</strong></p>
+
+    <div class="ascii">2種類の誤認 — どちらも「見た目」に騙される
+
+  ┌─────────────────────────────┬─────────────────────────────┐
+  │ ① 効いていないように見えるが       │ ② 効いているように見えるが        │
+  │    実は効いている                 │    実は効いていない              │
+  ├─────────────────────────────┼─────────────────────────────┤
+  │ 例: PID 名前空間を作ったのに      │ 例: memory.limit_in_bytes を    │
+  │     ps -e が 87 個も出る          │     読むと期待値どおり           │
+  │     （ホストは 85 個。むしろ多い）  │     なのに死なない               │
+  │                                 │                                 │
+  │ 正体: 名前空間は効いている。       │ 正体: 上限は効いていた。          │
+  │      /proc がホストのままで、      │      テストのほうが間違っていた。   │
+  │      見えていたのは名前空間では     │      head | wc はメモリを溜めない  │
+  │      なく /proc の中身だった       │      ので、上限に当たらなかった     │
+  │                                 │                                 │
+  │ 直し方: /proc を貼り直す          │ 直し方: 確かめ方を変える           │
+  │        （第03章）                │        （対照実験にする）          │
+  └─────────────────────────────┴─────────────────────────────┘
+
+  ★ ①は「実装」の問題。②は「テスト」の問題。
+    どちらも「見た目」だけを見ていると、正反対の結論に飛びつく。</div>
+
+    <h3>誤認 ① — <code>ps</code> が 87 個</h3>
+
+    <p>第02章で PID 名前空間を作った直後の話です。<code>ps -e</code> を打つと、ホストのプロセスがずらりと出ました。しかも数えると <strong>87 個</strong>。同じ瞬間のホストは <strong>85 個</strong>です。<strong>隔離したはずなのに、ホストより多い。</strong></p>
+
+    <p>手で確かめた実測がこれです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>unshare</code> で PID 名前空間だけを作った場合と、<code>/proc</code> も貼り直した場合の差です。</p>
+      <pre class="term"><code><span class="ps">$</span> unshare --pid --fork sh -c 'ps -e --no-headers | wc -l'
+<span class="out">87</span>
+<span class="ps">$</span> ps -e --no-headers | wc -l
+<span class="out">85</span>
+<span class="ps">$</span> unshare --pid --fork --mount-proc sh -c 'ps -e --no-headers | wc -l'
+<span class="out">3</span></code></pre>
+      <p>87 → 3。差を作ったのは <code>--mount-proc</code>、つまり <strong><code>/proc</code> を貼り直したかどうか</strong>だけです。名前空間は最初から効いていました。</p>
+    </div>
+
+    <p><strong>名前空間は最初から効いていたのです。</strong> <code>ps</code> はプロセスを直接数えているのではなく、<code>/proc</code> の下のディレクトリを読んでいます。その <code>/proc</code> がホストのものを指したままだったので、見えていたのは名前空間の中身ではなく <code>/proc</code> の中身でした。ホストより 2 個多いのは、<code>unshare</code> 自身と <code>sh</code> が増えたからです。</p>
+
+    <p><strong>ここで「名前空間が効いていない」と結論して <code>Cloneflags</code> をいじり始めたら、永遠に直りません。</strong> 直すべき場所は 1 つ下の層——ファイルシステムのほうにありました。</p>
+
+    <h3>誤認 ② — 上限は書けているのに死なない</h3>
+
+    <p>第04章の cgroup です。<code>memory.limit_in_bytes</code> に <code>10485760</code>（10 MB）を書き、読み返すと <code>10485760</code> が返ってきます。<code>memory.failcnt</code> も <strong>37</strong> まで増えていて、上限に当たった回数が記録されています。<strong>それなのに、テストしたプロセスが死にません。</strong></p>
+
+    <p>このとき最初に書いたテストがこれでした。</p>
+
+    <div class="file-tag">最初に書いた（間違っていた）テスト</div>
+<pre><code>mydocker run --memory 10m alpine sh -c <span class="st">'head -c 100000000 /dev/zero | wc -c'</span></code></pre>
+
+    <p>結果は <code>100000000</code> が表示されて終了コード 0。「上限が効いていない」と思いかけました。<strong>しかし間違っていたのはテストのほうです。</strong> <code>head | wc</code> は<strong>ストリームを流すだけでメモリを溜めません</strong>。1 億バイトを読みますが、一度に持っているのはバッファ 1 個分です。10 MB の上限には決して当たりません。</p>
+
+    <p>確かめ方を変えました。<code>dd</code> に大きな <code>bs</code> を与えて、<strong>1 回で 100 MB のバッファを確保させます</strong>。しかも<strong>上限あり・上限なしの両方で走らせて差を見ます</strong>。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>対照実験です。同じコマンドを、上限なしと上限ありの 2 回走らせます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="out">1+0 records in
+1+0 records out
+104857600 bytes (100.0MB) copied, 0.047161 seconds, 2.1GB/s</span>
+<span class="ps">$</span> echo $?
+<span class="out">0</span>
+<span class="ps">$</span> mydocker run --quiet --memory 10m alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="ps">$</span> echo $?
+<span class="out">137</span></code></pre>
+      <p>上限なしなら成功（0）、上限ありなら OOM で強制終了（137 = 128 + SIGKILL）。<strong>この「差」が出て初めて、上限が効いていると言えます。</strong></p>
+    </div>
+
+    <p><strong>教訓は、片方だけを走らせないことです。</strong> 上限ありだけを走らせて失敗したとき、失敗しているのが上限なのかテストなのか分かりません。上限なしでも同じように走らせて<strong>差を見る</strong>——これで初めて、上限が原因だと言えます。E2E には対照をペアで入れてあります。</p>
+
+    <h3>破って確かめる、という規律</h3>
+
+    <p>この 2 つの誤認から出てきた規律が、<strong>「破って確かめる」</strong>です。</p>
+
+    <p>「隔離できているか」を確かめるのに、いちばん弱いのは<strong>「隔離できているように見える」</strong>という観察です。<code>ps</code> の出力が空でないことを見ても、<code>/proc</code> の貼り直しを忘れていれば通ってしまいます（そのときはホストのプロセスがずらりと出るので、むしろ「空でない」は簡単に通ります）。<strong>だから、破りにいきます。</strong></p>
+
+    <ul>
+      <li><strong>第03章</strong>：<code>chroot</code> を実際に破りました。Python で <code>chroot</code> の前にディレクトリの fd を掴んでおき、<code>fchdir</code> で戻って <code>..</code> を登り切り、<code>chroot(".")</code> で牢を付け替える。<strong>「破れると聞いた」ではなく、自分の手で破りました。</strong></li>
+      <li><strong>第04章</strong>：上限を「書けたか」ではなく「効いたか」で確かめました。対照実験と、<code>137</code> という終了コードで。</li>
+      <li><strong>第06章</strong>：展開先の外にファイルを作る tar を<strong>自分で作って投入</strong>しました。「弾いているはず」で済ませず、外にファイルが作られないことをファイルの有無で確認しています。</li>
+      <li><strong>第07章</strong>：<code>mydocker</code> 自身を <strong>SIGKILL で殺して残骸を作り</strong>、それを <code>rm</code> が安全に回収できることを確かめました。正常系だけを試していたら、この経路は一度も通りません。</li>
+      <li><strong>全体</strong>：「多すぎ」側を検査しました。<code>ps</code> は<strong>行数ちょうど</strong>、一覧は<strong>合計 N 件</strong>。「1 つ以上ある」ではなく「ちょうどこの数である」を見る。</li>
+    </ul>
+
+    <p>E2E の 56 項目は、このために書かれています。<strong>機能が動くことを確かめるためではなく、動いているように見えて実は動いていない状態を弾くために書かれています。</strong></p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>E2E テストの結果と、その構成です。8 つのセクションが、そのまま要件 FR-1 〜 FR-10 に対応しています。</p>
+      <pre class="term"><code><span class="ps">$</span> python3 e2e_test.py
+<span class="out">== 0. 準備 — イメージの取得 ==
+== 1. コンテナの起動とコマンドの実行 (FR-1) ==
+== 2. ホストから隔離された視界 (FR-2, FR-3) ==
+== 3. 資源の上限 (FR-4) ==
+== 4. イメージの取得とキャッシュ (FR-5) ==
+== 5. 取得したイメージの安全な展開 (FR-6) ==
+== 6. レイヤの重ね合わせ (FR-7) ==
+== 7. 実行中コンテナの一覧 (FR-8) と追加コマンド実行 (FR-9) ==
+== 8. 後片付けとリーク (FR-10) ==
+
+RESULT: 56 passed, 0 failed</span></code></pre>
+      <p>代表的な項目を並べると、規律の輪郭が見えます。</p>
+      <pre class="term"><code><span class="out">  OK   コンテナ内の ps にホストのプロセスが1つも出ない（行数ちょうど）
+       （ホスト側の実行中プロセスは 86 個。コンテナ内は 1 個）
+  OK   メモリ上限 10m を超える確保が実際に失敗する（設定値の確認では済ませない）
+  OK   上限超過が OOM による強制終了として報告される (exit 137)
+  OK   10 回連続で起動・終了してもすべて成功する（実数で確認: 10/10 件成功）
+  OK   10 回起動しても overlay のマウント数が増えない（前 0 件 → 後 0 件）
+  OK   テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）</span></code></pre>
+      <p>2 行目の「設定値の確認では済ませない」という一言が、誤認 ② の再発防止そのものです。<strong>テストの名前に、なぜそう検査するかが書いてあります。</strong></p>
+    </div>
+
+    <p>それでも、この 56 項目は<strong>「私が思いついた壊れ方」しかカバーしていません</strong>。Step 2 で書いた capability の話は、この 56 項目のどこにも出てきません。テストが全部通ることと、安全であることは、まったく別のことです。<strong>この章の前半で 8 つの不足を並べたのは、そのためです。</strong></p>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary>これは Docker の代わりに使えますか?</summary>
+      <div class="qa-body">
+        <p><strong>使えません。</strong> 学習用です。この章で並べた 8 つの不足のうち、実務で使うなら最低でもネットワーク（Step 1）、権限の絞り込み（Step 2）、<code>stop</code> と <code>logs</code>（Step 8）が必須です。どれも実装していません。</p>
+        <p>もう少し正確に言うと、<strong>「Docker の代わり」という言い方自体が層を混同しています</strong>。Docker が提供しているのは、ビルド・レジストリ・ネットワーク・ボリューム・compose・API を含む一式です。<code>mydocker</code> が触れているのは <code>runc</code> の位置の一部と、<code>containerd</code> の仕事のごく一部だけです。比べる相手としては <code>runc</code> のほうが近く、その <code>runc</code> と比べても足りないものが表で 9 行あります。</p>
+        <p>ただし、<strong>「Docker の中で何が起きているか」を説明する道具としては、Docker より優れています。</strong> 9.0 MB のバイナリ 1 つで、依存ライブラリが 1 つも無く、全部読めるからです。用途が違います。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>本番で使ってはいけない理由を一言で言うと?</summary>
+      <div class="qa-body">
+        <p><strong>コンテナの中の root が、ホストの root だからです。</strong></p>
+        <p>これで足ります。capabilities を落としていないので <code>CAP_SYS_ADMIN</code> も <code>CAP_MKNOD</code> も残っており、seccomp も無いので危険なシステムコールも呼べます。user 名前空間も使っていないので ID の対応付けもありません。<strong>つまり、<code>mydocker</code> の中でコードを走らせることは、そのコードを root で走らせることとほとんど変わりません。</strong></p>
+        <p>ネットワークが隔離されていないこと（ホストのポートを直接掴む、ホストの <code>127.0.0.1</code> に届く）も、単体で十分に本番失格の理由になります。</p>
+        <p>逆に言えば、<strong>自分で書いたコードを、自分のマシンで、学習のために動かす</strong>用途なら問題ありません。危険なのは「信用していないものを、隔離されているつもりで動かす」ことです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>56 項目のテストが全部通っているのに「足りない」というのは矛盾していませんか?</summary>
+      <div class="qa-body">
+        <p>矛盾していません。<strong>テストが検査しているのは「要件を満たしているか」であって、「安全か」ではないからです。</strong></p>
+        <p>E2E のセクション構成を見てください。8 つのセクションがそれぞれ FR-1 〜 FR-10 に対応しています。要件定義書に書いた要件を、全部検査しています。<strong>そして要件定義書の §3.2 には、seccomp も rootless もネットワークも「スコープ外」と書いてあります。</strong> テストは、スコープ外のものを検査しません。</p>
+        <p>ここが「テストが通る」の限界です。テストは<strong>自分が書いた仕様に対する検査</strong>であって、仕様そのものの妥当性は検査しません。仕様に穴があれば、テストも同じ形の穴を持ちます。<strong>だから、テストの外側にあるものを言葉で並べる作業（この章の前半）が要るのです。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>capabilities を落とすと、mydocker 自身が動かなくなりませんか?</summary>
+      <div class="qa-body">
+        <p>落とすタイミングを間違えると、そうなります。<strong>これは実装するときに必ず踏む落とし穴です。</strong></p>
+        <p><code>mydocker init</code> がやることを順に並べると、ホスト名を書き（<code>CAP_SYS_ADMIN</code> が要る）、マウントの伝播を切り（要る）、bind mount し（要る）、<code>pivot_root</code> し（要る）、<code>/proc</code> と <code>/dev</code> を貼り（要る）、<code>mknod</code> でデバイスノードを作り（<code>CAP_MKNOD</code> が要る）、最後に目的のコマンドを <code>exec</code> します。</p>
+        <p><strong>権限を落としてよいのは、この最後の <code>exec</code> の直前だけです。</strong> 1 行早いと自分の作業ができなくなり、<code>exec</code> の後では自分のコードはもう存在しません。「たった一点」というのは比喩ではなく、文字どおり順序上の 1 か所です。</p>
+        <p>ちなみに、<strong>この「一点」の存在自体が、名前空間と権限が独立した仕組みであることの証拠</strong>でもあります。名前空間は作った瞬間に効き、あとは何をしても効き続けます。権限は、落とした時点から効きます。効き方の時間軸が違うのです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>rootless にすれば「危なくない」ということですか?</summary>
+      <div class="qa-body">
+        <p><strong>被害の上限は下がりますが、「危なくない」にはなりません。</strong></p>
+        <p>rootless の効果は、<strong>事故ったときにホストの一般利用者の権限しか奪われない</strong>ことです。tar 展開の検証に穴があっても、書けるのはその利用者が書ける場所だけになります。これは大きな改善です。</p>
+        <p>ただし、rootless にしても Step 2（capabilities / seccomp）は別途必要です。user 名前空間の中では<strong>その名前空間の範囲で全権を持つ</strong>ので、<code>CAP_SYS_ADMIN</code> 相当のことができます。範囲が限られているとはいえ、そこからカーネルの脆弱性を突く経路は残ります。<strong>実際、user 名前空間そのものを起点にしたカーネルの脆弱性は繰り返し報告されています。</strong></p>
+        <p>「隔離の仕組みを 1 つ足したから安全」という考え方自体が危険です。本物の実行環境が namespace・cgroup・capabilities・seccomp・AppArmor/SELinux を<strong>全部重ねている</strong>のは、どれか 1 つでは足りないと分かっているからです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>ここまで作ったのに、結局 runc を読まないと駄目なんですか?</summary>
+      <div class="qa-body">
+        <p>「駄目」ではありません。<strong>読めるようになった、というのが正しい言い方です。</strong></p>
+        <p>要件定義書の §1.1 に書いたとおり、この教材が生まれた動機は<strong>「<code>runc</code> のソースを読もうとしたが、本番運用に必要な分岐と抽象で核が埋もれていて読めなかった」</strong>という問題でした。その問題に対する答えが、「先に骨格を自分で書く」でした。</p>
+        <p>いま、骨格は手元にあります。<code>pivot_root</code> の前後 4 行、<code>Cloneflags</code> の 4 つ、<code>cgroup.procs</code> に PID を書く 1 行、<code>lowerdir</code> の逆順。<strong><code>runc</code> の中で同じことをしている場所を探せば、そこから読み広げられます。</strong> 覆いの下に何があるか知っているので、覆いを覆いとして認識できます。</p>
+        <p>読まなくても構いません。読まなくても、この教材の目的（コンテナの正体はプロセスであると理解すること）は達成されています。ただ、<strong>読みたくなったときに読める状態</strong>にはなりました。それがこの 9 章分の、いちばん実用的な成果かもしれません。</p>
+      </div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>最終章なので、総復習にします。第01章から第07章まで、各章から 1 問ずつです。<strong>自分の言葉で答えてから開いてください。</strong> 答えられなかった章があれば、その章に戻る合図です。</p>
+
+    <details class="qa"><summary>Q1.（第01章）なぜ「自分をもう一度起動する」必要があったのですか? 素直に unshare(CLONE_NEWPID) を呼んではいけない理由は?</summary>
+      <div class="qa-body">
+        <p><strong>PID 名前空間は、<code>unshare</code> を呼んだプロセス自身には適用されないからです。</strong> 適用されるのは、その後に作られた子プロセスからです。ですから自分が PID 1 になることは原理的にできません。</p>
+        <p>実際に手で確かめた差がこれでした。</p>
+        <pre class="term"><code><span class="ps">$</span> unshare --pid sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 25171</span>
+<span class="ps">$</span> unshare --pid --fork sh -c 'echo "自分の PID: $$"'
+<span class="out">自分の PID: 1</span></code></pre>
+        <p><code>--fork</code>（＝子を作る）を挟んで初めて 1 になります。Go では、<code>/proc/self/exe</code> を <code>init</code> という別のサブコマンドとして <code>Cloneflags</code> 付きで起動することが、この <code>--fork</code> に相当します。<strong><code>clone(2)</code> のフラグとして名前空間を渡すので、子は生まれた瞬間から新しい名前空間の中にいます。</strong></p>
+        <p>もう一つの理由もありました。Go のランタイムはマルチスレッドなので、<code>unshare(CLONE_NEWNS)</code> のようなスレッド単位の操作を素直に扱えません。この制約は、第07章の <code>exec</code> の割り切りとしてもう一度出てきました。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q2.（第02章）PID 名前空間を作った直後、ps -e が 87 個も出ました。ホストは 85 個です。何が起きていましたか?</summary>
+      <div class="qa-body">
+        <p><strong>名前空間は効いていました。壊れて見えていたのは <code>/proc</code> のせいです。</strong></p>
+        <p><code>ps</code> はカーネルに直接問い合わせているのではなく、<code>/proc</code> の下の数字のディレクトリを読んでいます。PID 名前空間を作っただけでは <code>/proc</code> はホストのものを指したままなので、<code>ps</code> にはホストのプロセスが全部見えます。<strong>見えていたのは名前空間の中身ではなく、<code>/proc</code> の中身でした。</strong></p>
+        <p>ホストより 2 個多いのは、<code>unshare</code> 自身と <code>sh</code> が増えたからです。<code>--mount-proc</code>（＝新しい <code>/proc</code> を貼り直す）を足すと 3 になります。</p>
+        <p><strong>この 87 という数字は、「名前空間が効いていない」ようにしか見えないのに効いている、という誤認の典型例です。</strong> ここで <code>Cloneflags</code> を疑い始めると永遠に直りません。直すべきは 1 つ下の層でした。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q3.（第03章）chroot でも「/ の見え方」は変わります。それなのに pivot_root を選んだのはなぜですか?</summary>
+      <div class="qa-body">
+        <p><strong><code>chroot</code> は破れるからです。しかも簡単に。</strong></p>
+        <p>手口は単純で、<strong><code>chroot</code> する前にディレクトリのファイルディスクリプタを掴んでおき</strong>、<code>chroot</code> 後に <code>fchdir</code> でそこへ戻り、<code>..</code> を登り切ってから <code>chroot(".")</code> するだけです。実際に Python で再現しました。</p>
+        <pre class="term"><code><span class="out">chroot 直後の ls / : ['bin', 'inner']
+脱獄後の  ls / : ['bin', 'bin.usr-is-merged', 'boot', 'container_info.json', 'dev', 'etc', 'home', 'lib', 'lib.usr-is-merged', 'lib64', 'lost+found', 'media']</span></code></pre>
+        <p>原因は、<strong><code>chroot</code> が「<code>/</code> の見え方」を変えるだけで、プロセスが既に持っている外側への参照を無効化しない</strong>ことです。</p>
+        <p><code>pivot_root</code> は古い root を <code>put_old</code> に押し出し、それを <code>MNT_DETACH</code> でマウント木から切り離します。<strong>参照ごと消えるので、同じ手は使えません。</strong> 実際、コンテナの中に <code>/.old_root</code> は残っていません。</p>
+        <p>ただし第09章の Step 2 で見たとおり、<strong>これは「相手が <code>CAP_SYS_ADMIN</code> を持っていなければ」という前提の上に成り立っています。</strong> 権限を持ったままの相手には、マウント木を操作されうるという別の話が残ります。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q4.（第04章）cgroup のディレクトリを作り、memory.limit_in_bytes に 10485760 と書きました。読み返すと 10485760 が返ります。これで上限は効いていますか?</summary>
+      <div class="qa-body">
+        <p><strong>効いていません。</strong> まだ何も起きません。</p>
+        <p>上限を書いただけでは、その上限が<strong>誰に適用されるか</strong>が決まっていないからです。効かせるには <code>cgroup.procs</code> に対象プロセスの PID を書く必要があります（<code>internal/cgroup/cgroup.go</code> の <code>Apply</code> がやっていることです）。<strong>作っただけでは効かない</strong>——これが第04章の山場でした。</p>
+        <p>さらに 2 つ、この章から持ち帰るべきものがあります。<strong>1 つめ、いつ書くか。</strong> 子を起動してから PID を書くまでの数ミリ秒の間に、子は既に走り始めています。だからパイプで同期し、cgroup への登録が終わるまで子を待たせています。<strong>2 つめ、効いたことをどう確かめるか。</strong> 読み返して期待値が返ることは、効いた証拠になりません。上限あり・上限なしの対照実験で <code>137</code> という差を見る必要があります（この章の誤認 ②）。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q5.（第05章）alpine:latest のマニフェストを取ったら layers がありませんでした。何が返ってきたのですか? そして「最初の項目を取る」実装が壊れるのはなぜですか?</summary>
+      <div class="qa-body">
+        <p>返ってきたのは<strong>マニフェストリスト（OCI インデックス）</strong>です。イメージそのものではなく、「アーキテクチャごとのマニフェストの一覧」です。だから <code>layers</code> がありません。</p>
+        <p>そして、そのリストには<strong>イメージではないもの</strong>が混ざっています。実測したインデックスの中には、<code>"platform":{"architecture":"unknown","os":"unknown"}</code> で、注釈に <code>"vnd.docker.reference.type":"attestation-manifest"</code> と書かれた項目が入っていました。これは<strong>署名の付随物</strong>であって、イメージではありません。</p>
+        <p><strong>ですから「最初の項目を取る」実装は、これを掴んで確実に壊れます。</strong> しかも「取れた JSON に <code>layers</code> が無い」という同じ症状が 2 回続くので、原因の切り分けが紛らわしくなります。</p>
+        <p>対処は、<code>platform.os</code> と <code>platform.architecture</code> で<strong>明示的に絞る</strong>ことでした（<code>pickPlatform</code>）。見つからなければ、あるものの一覧を添えてエラーにします。<strong>「たぶん最初のやつ」で済ませない、というのがこの章の教訓です。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q6.（第06章）レイヤの中の .wh.foo.txt を見つけたとき、なぜ foo.txt を削除せずに、キャラクタデバイス 0:0 を作るのですか?</summary>
+      <div class="qa-body">
+        <p><strong>レイヤをキャッシュとして共有できるようにするためです。</strong></p>
+        <p>全レイヤを 1 つのディレクトリに順に展開し、<code>.wh.</code> を見たら実体を削除する方法（平坦化）でも、結果のファイル木は正しくなります。しかし、<strong>その結果はそのイメージ専用</strong>になります。他のイメージと同じレイヤを共有できず、digest によるキャッシュが効きません。</p>
+        <p>レイヤごとに独立して展開し、<code>.wh.&lt;名前&gt;</code> を <strong>overlayfs の削除印（キャラクタデバイス 0:0）</strong>に、<code>.wh..wh..opq</code> を <strong><code>trusted.overlay.opaque="y"</code> という拡張属性</strong>に翻訳しておけば、各レイヤは digest をディレクトリ名にした<strong>独立・不変のキャッシュ</strong>になります。重ね合わせの判断はカーネルに任せられます。</p>
+        <p><strong>「後で組み合わせられる形で保存する」という設計判断です。</strong> 同じ考え方が、この章の Step 5（push のときに既にあるレイヤを送らない）にも出てきました。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q7.（第07章）mydocker exec は PID / UTS / IPC には setns で参加するのに、マウント名前空間だけ新しく作っています。なぜですか?</summary>
+      <div class="qa-body">
+        <p><strong>マウント名前空間への <code>setns(2)</code> は、呼び出し元がシングルスレッドでなければ <code>EINVAL</code> で失敗するからです。</strong> Go のランタイムは常に複数のスレッドを持つので、この条件を Go のコードから満たせません。</p>
+        <p><code>runtime.LockOSThread()</code> でゴルーチンをスレッドに固定しても足りません。固定は「このゴルーチンをこのスレッドに縛る」だけで、プロセス全体のスレッド数を 1 にするわけではないからです。</p>
+        <p>採った解決策は、<strong>PID / UTS / IPC には <code>setns</code> で参加し、マウント名前空間だけは新しく作って同じ overlay の <code>merged</code> を根にする</strong>ことでした。見えるファイルは完全に同一になります。</p>
+        <p><strong>これは「できたふり」ではありませんが、完全でもありません。</strong> 本体が起動後に自分で行ったマウントは <code>exec</code> 側から見えません。<code>src/README.md</code> に既知の割り切りとして明記してあります。本命の解決策は cgo で、<code>runc</code> の <code>nsexec</code> がまさにそれをやっています（この章の Step 7）。</p>
+      </div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p><strong>全11ページ、読み終わりました。</strong> 序章から第09章まで、地図を見て、環境を作り、自分を再実行し、視界を区切り、根を挿げ替え、資源を締め、イメージを取ってきて、層を重ねて、道具にして、足りないものを並べました。</p>
+      <p>最後にもう一度だけ、手を動かしてください。<strong>コンテナを起動して、<code>ps</code> を打ちます。</strong></p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh
+<span class="ps">/ #</span> ps
+<span class="out">PID   USER     TIME  COMMAND
+    1 root      0:00 /bin/sh
+    7 root      0:00 ps</span>
+<span class="ps">/ #</span> hostname
+<span class="out">mydocker</span></code></pre>
+      <p>PID 1 に自分だけが並びます。ホスト名は <code>mydocker</code> です。</p>
+      <p>そして、いまならこの 2 行が<strong>何によって作られているか</strong>を全部指させるはずです。PID 1 になっているのは <code>clone(2)</code> に <code>CLONE_NEWPID</code> を渡したから（第01〜02章）。ホストの 85 個が見えないのは <code>/proc</code> を貼り直したから（第03章）。<code>/bin/sh</code> が alpine のものなのは <code>pivot_root</code> で根を替えたから（第03章）、その根がレジストリから取ってきた 1 枚のレイヤを OverlayFS で重ねたものだから（第05〜06章）。ホスト名が <code>mydocker</code> なのは <code>CLONE_NEWUTS</code> と <code>Sethostname</code>（第02章）。</p>
+      <p><strong>この出力の全部の理由が言えたら、この教材は完了です。</strong> そして——ここに<strong>仮想化は 1 つも出てこない</strong>ことも、あわせて確認してください。序章の 1 行目が、ここで回収されます。</p>
+    </div>
+
+    <h2>まとめ — ここから先は、自分の手で</h2>
+
+    <p><strong>この教材で得たもの。</strong> 「コンテナは軽量な仮想マシンではない」という一文を、比喩ではなく<strong>コードとして</strong>持っている状態になりました。<code>clone(2)</code> にフラグを並べ、cgroup のファイルに数字を書き、<code>mount(2)</code> を正しい順に呼ぶ——書いたのはそれだけで、仮想化は 1 行もありません。それでも <code>ps</code> は 2 行になり、起動は 12〜15 ms（ホストで <code>/bin/true</code> を直接実行すると 3 ms）で、ホストの 85 個は見えなくなりました。加えて、もっと持ち帰る価値があるものがあります。<strong>「設定が通ったこと」と「効いていること」は別物だ、という感覚</strong>です。<code>ps</code> が 87 個出ても名前空間は効いていて、<code>memory.limit_in_bytes</code> が期待値を返しても上限は確かめられていない。この 2 つの誤認を実際に踏み、対照実験と「破って確かめる」という規律で抜けてきました。E2E の 56 項目は、その規律の形をしています。</p>
+
+    <p><strong>それでもまだ足りないもの。</strong> この章で 8 つ並べました。ネットワークは隔離されておらず、コンテナの中の root は本物の root のまま、rootless でもなく、イメージを作ることも配ることもできず、データは終了とともに消え、<code>exec</code> は別のマウント名前空間にいて、<code>stop</code> も <code>logs</code> もありません。OCI ランタイム仕様には<strong>準拠していません</strong>——<code>config.json</code> を読まず、<code>created</code> という状態も持ちません。層で言えば <code>runc</code> の位置の、しかもごく一部です。<strong>この列挙ができることが、この章の到達点です。</strong> 何が足りないかを言えない人は、自分が作ったものが何なのかも言えません。逆に、足りないものを 8 つ名前で言えるなら、作ったものの輪郭がはっきり見えているということです。<code>runc</code> のソースが「本番運用に必要な分岐と抽象で厚く覆われている」というのは、この 8 つ（と表の 9 行）のことでした。</p>
+
+    <p><strong>そして、ここから先へ。</strong> この教材にはもう次章がありません。次の一歩を決めるのは読者です。順序は提案しました——<strong><code>stop</code> を足す</strong>（小さい。シグナルと PID 1 の特別扱いが学べる）、<strong>capabilities を落としてみる</strong>（壊れ方を見る。落とす位置を 1 行動かすだけで結果が変わる）、<strong>ネットワークを実装する</strong>（大きい。まず <code>ip</code> コマンドで手動で通してから移す）、<strong>OCI 仕様を読む</strong>（仕様の各項目が自分のコードのどの行かを指す）、<strong><code>runc</code> を読む</strong>（骨格は同じ。覆いを覆いとして認識できる）。どれから始めても構いませんし、どれも始めなくても構いません。<strong>ただ、次に <code>docker run</code> と打ったときには、その一行の下でカーネルが何をしているかが見えているはずです。</strong> それはもう、比喩ではありません。自分で書いたコードとして知っていることです。<strong>その状態から先は、教材ではなく、あなたの手が続きを書きます。</strong></p>
+
+    <div class="chap-foot">
+      <a class="pager" href="08-network.html"><span class="dir">← 前へ</span>第08章 · 外とつながる</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
