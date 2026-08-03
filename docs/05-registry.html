@@ -1037,7 +1037,7 @@ mirror.gcr.io/library/alpine:latest: レイヤ 1 枚
      WWW-Authenticate: Bearer realm="https://ghcr.io/token",service="ghcr.io"
                               └─ 取りに行く先 ─┘  └─ 名乗る相手 ─┘
         ↓
-  ② realm + "?scope=repository:foo/bar:pull" + "&service=" + service を GET
+  ② realm + "?scope=repository:foo/bar:pull" + "&amp;service=" + service を GET
         ↓
      トークンが返る → あとは Docker Hub と同じ手順
 
