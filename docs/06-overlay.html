@@ -1,0 +1,1382 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第06章 層を重ねる — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第06章 / 全10章 · 層: LAYER · 読了目安 4〜5時間</div>
+    <div class="eyebrow"><span>Layer</span><span class="depth">— 使い捨ての正体</span></div>
+    <h1>層を重ねる</h1>
+    <p class="lede">前章で alpine のレイヤを取ってきて、<code>/var/lib/mydocker/layers/</code> の下に展開しました。8.7 MB、516 ファイル。ここまでは「材料」です。この材料を、書き換えても汚れない形でコンテナに渡さなければいけません。<strong>コンテナを消してもイメージが無傷で残る</strong>——あの当たり前を、この章で自分の手で作ります。着地点は一行で言えます。<strong>コンテナを消すというのは、<code>upperdir</code> を捨てるだけのこと</strong>です。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p><code>internal/overlay/overlay.go</code> と <code>internal/image/extract.go</code> を読み切り、次の4つを自分の言葉で説明できるようになる。①<code>lowerdir</code> / <code>upperdir</code> / <code>workdir</code> / <code>merged</code> がそれぞれ何を担当しているか。②<strong><code>lowerdir</code> の並び順がイメージのレイヤ順と逆</strong>である理由。③tar の中の <code>.wh.</code> を普通に展開してはいけない理由と、その翻訳先。④<code>umount</code> の失敗を握りつぶすと<strong>なぜイメージが消えるのか</strong>。仕上げに、<strong>手で <code>mount -t overlay</code> を打って重ね合わせを作り、mydocker が作った overlay マウント行を <code>/proc/mounts</code> で確かめる</strong>。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#step-1">手で重ねてみる</a></li>
+        <li><a href="#step-2"><code>lowerdir</code> は左が上 — 並べる順を逆にする</a></li>
+        <li><a href="#step-3"><code>workdir</code> の制約 — 同じ FS 上・空であること</a></li>
+        <li><a href="#step-4">書き込みは upperdir に溜まる（copy-up）</a></li>
+        <li><a href="#step-5">ホワイトアウト — 「消した」を tar でどう運ぶか</a></li>
+        <li><a href="#step-6">翻訳するか、平坦化するか</a></li>
+        <li><a href="#step-7">tar 展開のパス検証（Zip Slip）</a></li>
+        <li><a href="#step-8">アンマウントの安全 — ここを間違えるとイメージが消える</a></li>
+      </ol>
+    </div>
+
+    <h2>まず、素朴にやってみる — イメージをコピーする案</h2>
+
+    <p>前章の終わりで、私たちの手元にはこういう状態のディレクトリがあります。alpine のレイヤを1枚展開したものです。</p>
+
+    <div class="ascii">/var/lib/mydocker/layers/sha256_55afa1ecc21d…/
+  ├ bin/
+  ├ etc/            ← /etc/alpine-release に "3.24.1" が入っている
+  ├ lib/
+  ├ usr/
+  └ …               （展開後 8.7 MB / 516 ファイル）</div>
+
+    <p>さて。ここを <code>pivot_root</code> の行き先にすれば、第03章でやったとおりコンテナは立ち上がります。実際、立ち上がります。……そして、コンテナの中で <code>apk add curl</code> なり <code>rm -rf /etc</code> なりをやった瞬間、<strong>このディレクトリが書き換わります</strong>。次に別のコンテナを起動すると、前のコンテナが残した傷がそのまま見えます。<code>docker run alpine</code> を2回打って、2回目が1回目の残骸だらけだったら、誰も使いません。</p>
+
+    <p>では、起動のたびにコピーすればいい? これが素朴案です。私も最初にこれを考えました。</p>
+
+    <div class="ascii">【素朴案】起動のたびに丸ごとコピーする
+
+  layers/sha256_55afa…/  ──cp -a──▶  containers/a10f2703bb37/rootfs/
+       （8.7 MB, 516 ファイル）              （8.7 MB, 516 ファイル）
+                          ──cp -a──▶  containers/0c1be9ad663a/rootfs/
+                          ──cp -a──▶  containers/f280be2460e3/rootfs/
+
+  コンテナ 3 個 = 26.1 MB。ubuntu なら 1 個 80 MB 級。
+  そして起動のたびに 516 ファイルの I/O が走る。</div>
+
+    <p>破綻の仕方は2つです。<strong>容量</strong>と<strong>時間</strong>。alpine は小さいので 8.7 MB で済みますが、実務のイメージは数百 MB あります。コンテナを10個立てたら数 GB。そして起動のたびに全ファイルをコピーするので、起動が「一瞬」ではなくなる。私たちが最終的に到達する起動時間は<strong>12〜15 ms</strong> です。516 ファイルのコピーは、どう頑張ってもその桁には入りません。</p>
+
+    <p>ここで発想を変えます。<strong>コピーしないで、重ねる。</strong></p>
+
+    <h2>重ねる、という発想</h2>
+
+    <p>読み取り専用の材料はそのまま置いておいて、その<strong>上に透明な板を1枚載せる</strong>。読むときは上から順に覗いて、最初に見つかったものを返す。書くときは一番上の板にだけ書く。下の材料には触らない。これが union filesystem の考え方で、Linux では <strong>overlayfs</strong> がその実装です。</p>
+
+    <div class="ascii">3枚重ねたときの見え方
+
+                                   ┌──────────────────────────────┐
+   upperdir（書き込み用・空）      │                              │  ← コンテナが書いたものだけ
+                                   └──────────────────────────────┘
+   lowerdir 上（レイヤ3）          │  app.jar   config.yml        │
+   lowerdir 中（レイヤ2）          │  curl      config.yml(旧)    │
+   lowerdir 下（レイヤ1 = ベース） │  sh  ls  cat  config.yml(元) │
+                                   └──────────────────────────────┘
+                                                  ↓ 上から探して最初に当たったものを返す
+   merged（コンテナに見える /）    │  sh  ls  cat  curl  app.jar  config.yml ←レイヤ3のもの
+                                   └──────────────────────────────┘
+
+   config.yml は 3 枚すべてにあるが、コンテナから見えるのは **一番上の1枚だけ**。
+   下の 2 枚は隠れているだけで、消えてはいない。</div>
+
+    <p>大事なのは <code>config.yml</code> の扱いです。3枚とも持っているのに、<code>merged</code> から見えるのは<strong>一番上のもの1つ</strong>。下の2つは消えたのではなく、<strong>隠れている</strong>だけです。この「隠れているだけ」という性質が、この章の後半でホワイトアウトの話に効いてきます。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · union filesystem</div>
+      <p>複数のディレクトリツリーを重ね合わせて、1つのツリーとして見せるファイルシステムの総称です。「合併（union）」という名前のとおり、ファイルの集合としては和集合になり、同じパスが衝突したときは<strong>優先順位の高い層が勝つ</strong>というルールで解決します。</p>
+      <p>Linux の歴史の中では UnionFS、aufs、overlayfs などがこの役割を担ってきました。長らく本流はカーネル本体の外（out-of-tree パッチ）にあり、Docker は初期に aufs を使っていましたが、<strong>overlayfs は Linux 3.18 で本体に取り込まれた</strong>ので、追加のカーネルモジュールなしに使えます。私たちの環境は <code>6.18.5</code> なので、当然入っています。</p>
+      <p>overlayfs の用語は4つだけ覚えれば足ります。<code>lowerdir</code>（読み取り専用の下層。複数可）、<code>upperdir</code>（書き込み先。1つだけ）、<code>workdir</code>（カーネルが内部作業に使う場所）、そして重ね合わせた結果が現れる<strong>マウントポイント</strong>（この教材では <code>merged</code> と呼びます）。</p>
+    </div>
+
+    <h2>用語表 — この章で出てくる4つの場所と3つの印</h2>
+
+    <p>先に表にしておきます。読みながら迷ったらここに戻ってきてください。</p>
+
+    <table>
+      <thead>
+        <tr><th>名前</th><th>正体</th><th>この教材での実体</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>lowerdir</code></td><td>読み取り専用の下層。複数を <code>:</code> で連結できる。<strong>左が上（優先）</strong></td><td><code>/var/lib/mydocker/layers/sha256_…</code>（イメージのレイヤ）</td></tr>
+        <tr><td><code>upperdir</code></td><td>書き込み先。コンテナが作った・変えた・消したものが全部ここに溜まる</td><td><code>/var/lib/mydocker/containers/&lt;ID&gt;/upper</code></td></tr>
+        <tr><td><code>workdir</code></td><td>カーネルが copy-up などの途中経過を置く作業場所。中身を人間が触ることはない</td><td><code>/var/lib/mydocker/containers/&lt;ID&gt;/work</code></td></tr>
+        <tr><td><code>merged</code></td><td>重ね合わせた結果が見えるマウントポイント。これがコンテナの <code>/</code> になる</td><td><code>/var/lib/mydocker/containers/&lt;ID&gt;/merged</code></td></tr>
+        <tr><td>copy-up</td><td>下層のファイルに書き込もうとしたとき、カーネルが upperdir へコピーしてから書く動作</td><td>カーネルが勝手にやる（私たちのコードは何もしない）</td></tr>
+        <tr><td><code>.wh.&lt;名前&gt;</code></td><td>tar の中で「このファイルは上の層で削除された」ことを表すエントリ</td><td><code>extract.go</code> でキャラクタデバイス 0:0 に翻訳する</td></tr>
+        <tr><td><code>.wh..wh..opq</code></td><td>tar の中で「このディレクトリの下層の中身をまるごと隠す」ことを表すエントリ</td><td><code>extract.go</code> で xattr <code>trusted.overlay.opaque="y"</code> に翻訳する</td></tr>
+      </tbody>
+    </table>
+
+    <p>この章の作業は、大きく2つのファイルに分かれます。<strong>重ね合わせを作る側</strong>が <code>internal/overlay/overlay.go</code>、<strong>重ねる材料（レイヤ）を正しく作る側</strong>が <code>internal/image/extract.go</code> です。前者から始めます。手で触れるので。</p>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>手で重ねてみる</h2>
+
+    <p>コードを書く前に、シェルで一度やります。overlayfs は「マウントオプションを3つ渡すだけ」で使える、驚くほど素朴な仕組みです。まず4つのディレクトリを用意します。</p>
+
+    <div class="ascii">/tmp/ovl/
+  ├ lower/     ← 読み取り専用にしたい材料（イメージのつもり）
+  ├ upper/     ← 書き込みが溜まる場所（空のまま用意する）
+  ├ work/      ← カーネルの作業場所（空のまま用意する）
+  └ merged/    ← ここに重ね合わせた結果が現れる（空のまま用意する）</div>
+
+    <p>この4つを作ったら、<code>mount</code> を1回打つだけです。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>mount -t overlay</code> に3つのオプションを渡します。<code>-t overlay</code> の直後の <code>overlay</code> は「デバイス名」の位置ですが、overlayfs には実デバイスが無いので慣習でこの文字列を置きます。マウントできたら <code>mount</code> で確かめます。</p>
+      <pre class="term"><code><span class="ps">$</span> mount -t overlay overlay -o lowerdir=/tmp/ovl/lower,upperdir=/tmp/ovl/upper,workdir=/tmp/ovl/work /tmp/ovl/merged
+<span class="ps">$</span> mount | grep overlay
+<span class="out">overlay on /tmp/ovl/merged type overlay (rw,relatime,lowerdir=/tmp/ovl/lower,upperdir=/tmp/ovl/upper,workdir=/tmp/ovl/work,uuid=on)</span></code></pre>
+      <p>これだけです。<code>/tmp/ovl/merged</code> を <code>ls</code> すれば <code>lower</code> の中身が見え、そこにファイルを作れば <code>upper</code> の下に現れます。カーネルが全部やってくれます。<code>uuid=on</code> はカーネルが自分で付けた既定値で、私たちは指定していません。</p>
+    </div>
+
+    <p>コマンド1つで済むということは、Go 側も <code>syscall.Mount</code> を1回呼ぶだけということです。実際そうなります。ただしその1回を安全に呼ぶために、前後に地味な準備がいる——この章はほぼその話です。</p>
+
+    <p>まずファイルの入り口から読みます。パッケージのコメントに、この章の結論がそのまま書いてあります。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go</div>
+<pre><code><span class="cm">// Package overlay は OverlayFS で複数のレイヤを1つのファイルシステムに重ね合わせる。</span>
+<span class="cm">//</span>
+<span class="cm">// コンテナの「使い捨て」の正体はここにある。</span>
+<span class="cm">// 読み取り専用の下層（lowerdir）はイメージそのままで、書き込みは全部 upperdir に溜まる。</span>
+<span class="cm">// コンテナを消すときは upperdir を捨てるだけでよい。イメージには指一本触れていない。</span>
+<span class="kw">package</span> overlay
+
+<span class="kw">import</span> (
+	<span class="st">"fmt"</span>
+	<span class="st">"os"</span>
+	<span class="st">"path/filepath"</span>
+	<span class="st">"strings"</span>
+	<span class="st">"syscall"</span>
+)
+
+<span class="cm">// Mount は1つの overlay マウントを表す。</span>
+<span class="kw">type</span> <span class="ty">Mount</span> <span class="kw">struct</span> {
+	<span class="ty">Merged</span> <span class="kw">string</span>   <span class="cm">// 重ね合わせた結果が見えるディレクトリ（＝コンテナの /）</span>
+	<span class="ty">Upper</span>  <span class="kw">string</span>   <span class="cm">// 書き込み先。コンテナを消すときはここを捨てる</span>
+	<span class="ty">Work</span>   <span class="kw">string</span>   <span class="cm">// overlayfs が内部で使う作業場所</span>
+	<span class="ty">Lowers</span> []<span class="kw">string</span> <span class="cm">// 下から上の順（先頭が最下層）</span>
+}</code></pre>
+
+    <p>構造体は、さっきシェルで打った4つの場所とそのまま対応しています。<code>Merged</code>・<code>Upper</code>・<code>Work</code> が1つずつ、<code>Lowers</code> だけがスライス。<strong>下層は何枚あってもよく、上層は1枚だけ</strong>という overlayfs の非対称性が、型にそのまま出ています。</p>
+
+    <p><code>Lowers</code> のコメントに <strong>「下から上の順（先頭が最下層）」</strong> と書いてあるのを覚えておいてください。Step 2 の山場がここです。</p>
+
+    <p>次は「そもそもこの環境で overlayfs が使えるか」を調べる関数です。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go</div>
+<pre><code><span class="cm">// Supported はこの環境で overlayfs が使えるかを返す。</span>
+<span class="cm">// /proc/filesystems に overlay が並んでいるかで判定する。</span>
+<span class="kw">func</span> <span class="ty">Supported</span>() <span class="kw">bool</span> {
+	b, err := os.<span class="ty">ReadFile</span>(<span class="st">"/proc/filesystems"</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	<span class="kw">for</span> _, line := <span class="kw">range</span> strings.<span class="ty">Split</span>(<span class="kw">string</span>(b), <span class="st">"\n"</span>) {
+		<span class="kw">if</span> strings.<span class="ty">TrimSpace</span>(line) == <span class="st">"nodev\toverlay"</span> || strings.<span class="ty">HasSuffix</span>(strings.<span class="ty">TrimSpace</span>(line), <span class="st">"\toverlay"</span>) ||
+			strings.<span class="ty">TrimSpace</span>(line) == <span class="st">"overlay"</span> {
+			<span class="kw">return</span> <span class="kw">true</span>
+		}
+	}
+	<span class="kw">return</span> strings.<span class="ty">Contains</span>(<span class="kw">string</span>(b), <span class="st">"overlay"</span>)
+}</code></pre>
+
+    <p>逐行で見ます。</p>
+
+    <p><code>/proc/filesystems</code> は「このカーネルが今扱えるファイルシステムの一覧」です。1行が1つのファイルシステムで、デバイスを必要としないものには行頭に <code>nodev</code> とタブが付きます。overlayfs は実デバイスを持たないので <code>nodev</code> 側に並びます。</p>
+
+    <p>判定が3つ並んでいるのは、この行の書式がカーネルのバージョンや表示のされ方で微妙に揺れるからです。<code>nodev\toverlay</code> ちょうど、末尾が <code>\toverlay</code>、行そのものが <code>overlay</code>——どれかに当たれば <code>true</code>。最後の <code>strings.Contains</code> は保険で、上の3つがどれも当たらなくても文字列として含まれていれば通します。ここは厳密さより<strong>「使えるのに使えないと誤判定して機能を落とす」ことを避ける</strong>ほうを優先した書き方です。</p>
+
+    <p>この関数の戻り値は、<code>mydocker info</code> の表示にそのまま出ます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>mydocker info</code> は、状態の置き場・資源制限の方式・overlayfs が使えるか・今いくつ overlay が張られているかを1画面で出します。<code>Supported()</code> が <code>true</code> を返すと「利用可能」の行になります。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker info
+<span class="out">状態の置き場: /var/lib/mydocker
+資源制限:     cgroup v1 (/sys/fs/cgroup, 利用可能: memory cpu pids)
+overlayfs:    利用可能
+overlay 数:   0 件
+実行中:       0 件</span></code></pre>
+      <p><code>overlay 数: 0 件</code> は、この後で読む <code>CountMounts("overlay")</code> の戻り値です。「起動と終了を繰り返しても、この数が増えていかないこと」がこの章の裏テーマになります。</p>
+    </div>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span><code>lowerdir</code> は左が上 — 並べる順を逆にする</h2>
+
+    <p>ここが1つめの落とし穴です。しかも<strong>エラーにならない</strong>種類の落とし穴なので、たちが悪い。</p>
+
+    <p>イメージのレイヤは、マニフェストの <code>layers</code> 配列に並んでいます。この並びは<strong>「後のものほど上」</strong>です。ベースイメージが先頭で、その上に <code>RUN</code> や <code>COPY</code> が積み上がっていく。人間の直感どおりです。</p>
+
+    <p>ところが <code>lowerdir</code> のオプション文字列は<strong>逆</strong>です。<code>lowerdir=A:B:C</code> と書いたとき、<strong>一番左の <code>A</code> が最も優先度の高い（＝上の）層</strong>になります。</p>
+
+    <div class="ascii">イメージのレイヤ順 と lowerdir の文字列は 逆 になる
+
+  【マニフェストの layers 配列】        【overlayfs から見た積み方】
+
+    layers[0]  ベース          ─────▶      ┌────────────┐  上（優先）
+    layers[1]  curl を入れた   ─────▶      │ layers[2]  │
+    layers[2]  設定を書いた    ─────▶      │ layers[1]  │
+                                            │ layers[0]  │
+    （後のものほど「上」）                  └────────────┘  下
+
+  ↓ これをオプション文字列にすると…
+
+    lowerdir=layers[2]:layers[1]:layers[0]
+             └──左が上───┘         └下┘
+
+  ⚠ そのまま layers[0]:layers[1]:layers[2] と書くと、
+     ベースが最優先になり、後から書いた設定が **ベースに隠される**。
+     エラーは出ない。ただ「更新が反映されていない」ように見えるだけ。</div>
+
+    <p>この間違いが怖いのは、<strong>マウントは成功する</strong>ところです。<code>syscall.Mount</code> はエラーを返しません。コンテナは起動します。ただ、中に入ると <code>curl</code> が入っていなかったり、書いたはずの設定が古いままだったりする。原因を「イメージのビルドが反映されていないのかな」と疑い始めると、丸一日溶けます。</p>
+
+    <p>だから mydocker では、<strong>呼び出し側には人間の直感どおりの順（下から上）で渡してもらい、逆転は <code>New</code> の中に閉じ込める</strong>ことにしました。<code>New</code> の全文です。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go</div>
+<pre><code><span class="cm">// New は base の下に merged / upper / work を用意し、lowers を重ねてマウントする。</span>
+<span class="cm">// lowers は **下から上の順**（先頭が最下層）で渡すこと。イメージのレイヤ順そのままでよい。</span>
+<span class="kw">func</span> <span class="ty">New</span>(base <span class="kw">string</span>, lowers []<span class="kw">string</span>) (*<span class="ty">Mount</span>, <span class="kw">error</span>) {
+	<span class="kw">if</span> <span class="kw">len</span>(lowers) == <span class="st">0</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"重ねる下層が1つもありません"</span>)
+	}
+	<span class="kw">for</span> _, l := <span class="kw">range</span> lowers {
+		<span class="kw">if</span> fi, err := os.<span class="ty">Stat</span>(l); err != <span class="kw">nil</span> || !fi.<span class="ty">IsDir</span>() {
+			<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"下層が見つかりません: %s"</span>, l)
+		}
+		<span class="cm">// ⚠ lowerdir のオプション文字列は ":" 区切り、"," でオプションが切れる。</span>
+		<span class="cm">//    パスにこれらが混ざると文字列が壊れる。digest 由来のパスなら起きないが、念のため弾く。</span>
+		<span class="kw">if</span> strings.<span class="ty">ContainsAny</span>(l, <span class="st">":,"</span>) {
+			<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"下層のパスに : か , が含まれています: %s"</span>, l)
+		}
+	}
+
+	m := &amp;<span class="ty">Mount</span>{
+		<span class="ty">Merged</span>: filepath.<span class="ty">Join</span>(base, <span class="st">"merged"</span>),
+		<span class="ty">Upper</span>:  filepath.<span class="ty">Join</span>(base, <span class="st">"upper"</span>),
+		<span class="ty">Work</span>:   filepath.<span class="ty">Join</span>(base, <span class="st">"work"</span>),
+		<span class="ty">Lowers</span>: <span class="kw">append</span>([]<span class="kw">string</span>(<span class="kw">nil</span>), lowers...),
+	}
+	<span class="kw">for</span> _, d := <span class="kw">range</span> []<span class="kw">string</span>{m.<span class="ty">Merged</span>, m.<span class="ty">Upper</span>, m.<span class="ty">Work</span>} {
+		<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(d, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="kw">nil</span>, err
+		}
+	}
+	<span class="cm">// ⚠ workdir は空でなければならない。前回の残骸があると EINVAL で落ちる。</span>
+	<span class="cm">//    ⚠ upperdir と同じファイルシステム上に無いと EXDEV / EINVAL になる。</span>
+	<span class="cm">//      ここでは同じ base の下に作っているので条件を満たす。</span>
+	<span class="kw">if</span> err := emptyDir(m.<span class="ty">Work</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+
+	<span class="cm">// ⚠ lowerdir は **左が上（優先）**。</span>
+	<span class="cm">//    イメージのレイヤは「後のものほど上」なので、並べる順を逆にする必要がある。</span>
+	<span class="cm">//    ここを間違えると、古い層が新しい層を隠して「更新が反映されていない」ように見える。</span>
+	rev := <span class="kw">make</span>([]<span class="kw">string</span>, <span class="st">0</span>, <span class="kw">len</span>(lowers))
+	<span class="kw">for</span> i := <span class="kw">len</span>(lowers) - <span class="st">1</span>; i &gt;= <span class="st">0</span>; i-- {
+		rev = <span class="kw">append</span>(rev, lowers[i])
+	}
+	opts := fmt.<span class="ty">Sprintf</span>(<span class="st">"lowerdir=%s,upperdir=%s,workdir=%s"</span>,
+		strings.<span class="ty">Join</span>(rev, <span class="st">":"</span>), m.<span class="ty">Upper</span>, m.<span class="ty">Work</span>)
+
+	<span class="kw">if</span> err := syscall.<span class="ty">Mount</span>(<span class="st">"overlay"</span>, m.<span class="ty">Merged</span>, <span class="st">"overlay"</span>, <span class="st">0</span>, opts); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"overlay のマウントに失敗しました (%s): %w"</span>, opts, err)
+	}
+	<span class="kw">return</span> m, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>上から順に読みます。</p>
+
+    <p><strong>①下層が0枚なら即エラー。</strong> <code>lowerdir</code> が空の overlay は作れません。ここで弾かないと、あとで意味の分からないマウントエラーになります。</p>
+
+    <p><strong>②各下層が本当にディレクトリとして存在するか確かめる。</strong> <code>os.Stat</code> でエラーが出るか、ディレクトリでなければ弾きます。<code>err != nil || !fi.IsDir()</code> の短絡評価が効いていて、<code>err != nil</code> のときは <code>fi</code> が <code>nil</code> なので <code>fi.IsDir()</code> は評価されません。順序を入れ替えると panic します。</p>
+
+    <p><strong>③パスに <code>:</code> か <code>,</code> が入っていたら弾く。</strong> これは overlayfs のオプションが「<strong>ただの文字列</strong>」であることに由来する制約です。<code>lowerdir=A:B,upperdir=C</code> という1本の文字列をカーネルが自分でパースするので、パスの中に区切り文字が混ざると意味が変わってしまいます。私たちのパスは <code>sha256_55afa1ecc21d…</code> のような digest 由来なので実際には起きませんが、<strong>「起きないはず」を「起きない」に変える</strong>のがこの3行です。</p>
+
+    <p><strong>④3つのディレクトリのパスを組み立てて作る。</strong> <code>base</code> の下に <code>merged</code> / <code>upper</code> / <code>work</code>。この「同じ親の下に3つ」という配置が Step 3 の制約を自動的に満たします。</p>
+
+    <p><strong>⑤<code>Lowers</code> のコピー。</strong> <code>append([]string(nil), lowers...)</code> は Go でスライスを複製する定番の書き方です。呼び出し元が渡してきたスライスをそのまま持つと、あとで呼び出し元が中身を書き換えたときに <code>Mount</code> の状態が黙って変わります。ここでコピーを取っておけば、この <code>Mount</code> は自分の値を自分で持ちます。</p>
+
+    <p><strong>⑥そして逆転。</strong> ここが本題です。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go（New の中・再掲）</div>
+<pre><code>	rev := <span class="kw">make</span>([]<span class="kw">string</span>, <span class="st">0</span>, <span class="kw">len</span>(lowers))
+	<span class="kw">for</span> i := <span class="kw">len</span>(lowers) - <span class="st">1</span>; i &gt;= <span class="st">0</span>; i-- {
+		rev = <span class="kw">append</span>(rev, lowers[i])
+	}</code></pre>
+
+    <p><code>make([]string, 0, len(lowers))</code> は「長さ0・容量 <code>len(lowers)</code> のスライス」を作ります。長さ0から <code>append</code> していくので、要素は先頭から詰まっていきます。容量を最初に確保してあるので、途中で内部配列の作り直しは起きません。</p>
+
+    <p>ループは <code>i</code> を<strong>末尾から先頭へ</strong>動かします。<code>len(lowers)-1</code> から始めて <code>0</code> まで、<code>i--</code>。取り出した要素を順に <code>append</code> するので、<code>rev</code> には元の並びが反転して入ります。<code>lowers = [A, B, C]</code>（A が最下層）なら <code>rev = [C, B, A]</code>。</p>
+
+    <p>これを <code>strings.Join(rev, ":")</code> で連結すると <code>C:B:A</code> になり、<strong>最上層の C が一番左＝最優先</strong>という overlayfs の期待どおりの文字列になります。</p>
+
+    <p><strong>⑦オプション文字列を組み立てて <code>syscall.Mount</code>。</strong> 第1引数 <code>"overlay"</code> はデバイス名の位置（実デバイスが無いので慣習の文字列）、第2引数がマウント先、第3引数がファイルシステム型、第4引数のフラグは <code>0</code>、第5引数が今組み立てたオプション文字列です。Step 1 でシェルに打ったものと、<strong>1対1で対応しています</strong>。</p>
+
+    <p><strong>⑧エラーメッセージに <code>opts</code> をそのまま埋めている</strong>のは意図的です。overlayfs のマウント失敗は <code>EINVAL</code> の一言で返ってくることが多く、<strong>何が悪いのかカーネルは教えてくれません</strong>。せめて「どの文字列で失敗したか」が手元に残っていれば、パスの綴りや順序を目で追えます。<code>%w</code> で元のエラーを包んでいるので、呼び出し元は <code>errors.Is</code> で <code>syscall.EINVAL</code> かどうかを判定できます。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>lowerdir</code> の順序を逆にすると、エラーは出ずに「更新が消える」</div>
+      <p>もう一度書きます。<strong><code>lowerdir</code> は左が上（優先）です。</strong> イメージのレイヤ配列は「後のものほど上」なので、<strong>そのまま <code>:</code> で繋ぐと上下が引っくり返ります</strong>。</p>
+      <p>そして最悪なことに、この間違いは<strong>マウントに成功します</strong>。カーネルには「どちらが正しい順か」を知る手段がありません。ただ言われたとおりに重ねるだけです。症状として現れるのは「新しいレイヤで入れたはずのコマンドが無い」「変更したはずの設定ファイルが古い」——つまり<strong>ビルドの問題に見える症状</strong>です。</p>
+      <p>見分け方を1つ。<code>/proc/mounts</code> の <code>lowerdir=</code> を見て、<strong>一番左に来ているのが最後に積んだレイヤかどうか</strong>を確かめてください。ここが合っていれば順序は正しい。合っていなければ、<code>rev</code> の <code>for</code> 文を疑ってください。</p>
+    </div>
+
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span><code>workdir</code> の制約 — 同じ FS 上・空であること</h2>
+
+    <p><code>workdir</code> は、私たちが中身を読むことも書くこともない場所です。カーネルが copy-up の途中経過などを一時的に置くために使います。「何もしなくていいなら気楽だ」と思うところですが、この <code>workdir</code> には<strong>2つの厳しい制約</strong>があり、どちらも破ると <code>mount</code> がその場で失敗します。</p>
+
+    <p><strong>制約1: <code>upperdir</code> と同じファイルシステム上になければならない。</strong></p>
+
+    <p>理由は copy-up の実装にあります。下層のファイルに書き込もうとしたとき、カーネルは <code>workdir</code> の中に一時ファイルを作って中身をコピーし、<strong>それを <code>upperdir</code> の目的地へ <code>rename</code> で移す</strong>という手順を踏みます。<code>rename(2)</code> は<strong>同じファイルシステムの中でしか成立しません</strong>。別のファイルシステムをまたぐ <code>rename</code> は <code>EXDEV</code>（cross-device link）というエラーになります。</p>
+
+    <p>この「原子的に完成品を置く」という性質が要るので、<code>workdir</code> と <code>upperdir</code> は同居していなければならない。違反すると <code>mount</code> の時点で <code>EXDEV</code> か <code>EINVAL</code> で弾かれます。たとえば <code>upperdir</code> をディスク上に置いて <code>workdir</code> を <code>/tmp</code>（tmpfs）に置く、といった配置がこれに当たります。</p>
+
+    <p><strong>制約2: 空でなければならない。</strong></p>
+
+    <p>前回の <code>work</code> の残骸——たとえばプロセスが強制終了して <code>work/work/</code> の下に中途半端なファイルが残っている状態——があると、<code>mount</code> は <code>EINVAL</code> で落ちます。カーネルは「この作業場所は自分だけのものだ」という前提で使うので、知らないものが置いてあると使用を拒否します。</p>
+
+    <div class="ascii">workdir の 2 つの制約
+
+  【制約1】upperdir と同じファイルシステム上に置く
+
+     base/                       ← 同じ FS の中
+       ├ upper/  ──┐
+       ├ work/   ──┴─ rename(2) で移動できる ✓
+       └ merged/
+
+     upper=/var/lib/…/upper （ディスク）
+     work =/tmp/work        （tmpfs）      ── rename が FS をまたぐ ✗ → EXDEV / EINVAL
+
+  【制約2】空であること
+
+     work/                       work/
+       （空）        ✓             └ work/  ← 前回の残骸  ✗ → EINVAL
+                                        └ #3f2a…（中途半端な一時ファイル）</div>
+
+    <p>mydocker では、制約1は<strong>配置で</strong>、制約2は<strong>コードで</strong>満たしています。</p>
+
+    <p>制約1のほうは <code>New</code> の中でこう書いてありました。<code>filepath.Join(base, "upper")</code> と <code>filepath.Join(base, "work")</code>。<strong>同じ <code>base</code> の下に並べる</strong>ので、どんな <code>base</code> を渡されても2つは必ず同じファイルシステムに乗ります。設定項目にせず、構造で保証しているわけです。コメントの3行目「ここでは同じ base の下に作っているので条件を満たす」がそれを言っています。</p>
+
+    <p>制約2のほうが <code>emptyDir</code> です。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go</div>
+<pre><code><span class="kw">func</span> emptyDir(dir <span class="kw">string</span>) <span class="kw">error</span> {
+	entries, err := os.<span class="ty">ReadDir</span>(dir)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">for</span> _, e := <span class="kw">range</span> entries {
+		<span class="kw">if</span> err := os.<span class="ty">RemoveAll</span>(filepath.<span class="ty">Join</span>(dir, e.<span class="ty">Name</span>())); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> err
+		}
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>短い関数ですが、書き方に選択があります。</p>
+
+    <p><code>os.RemoveAll(dir)</code> して <code>os.MkdirAll(dir)</code> し直す——つまり<strong>ディレクトリごと作り直す</strong>——ほうが1行短くなります。それをしていないのは、<strong><code>dir</code> 自身のパーミッションや所有者を保ちたい</strong>のと、作り直しの一瞬だけディレクトリが存在しない状態が生まれるのを避けたいからです。ここでは「入れ物は残して、中身だけ空にする」。</p>
+
+    <p><code>os.ReadDir</code> で一覧を取り、<code>os.RemoveAll</code> で1つずつ消します。<code>Remove</code> ではなく <code>RemoveAll</code> なのは、残骸がディレクトリのこともあるからです（overlayfs は <code>work/work/</code> というサブディレクトリを自分で作ります）。エラーは握りつぶさず、最初の1つで返します。<strong>消せない残骸がある状態でマウントに進んでも、どうせ <code>EINVAL</code> で落ちる</strong>ので、ここで止まったほうが原因が分かりやすい。</p>
+
+    <p>そして呼び出しの位置。<code>New</code> の中で <strong><code>MkdirAll</code> の直後・<code>syscall.Mount</code> の前</strong>に置いてあります。「毎回マウントの直前に必ず空にする」という順序にしておけば、前のコンテナがどんな終わり方をしていても、次の起動は必ず綺麗な <code>work</code> から始まります。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>workdir</code> の制約を破ると、原因を教えてくれない <code>EINVAL</code> が返る</div>
+      <p>overlayfs のマウント失敗は、ほとんどが <code>invalid argument</code>（<code>EINVAL</code>）です。<strong>何が invalid なのかは返ってきません。</strong> 犯人はだいたいこの3つのどれかです。</p>
+      <p>①<code>workdir</code> が <code>upperdir</code> と別のファイルシステムにある。②<code>workdir</code> が空でない。③<code>lowerdir</code> のパスの綴りが違う、または存在しない。</p>
+      <p>デバッグの順番としては、まず <code>New</code> が吐くエラーメッセージの中の <code>opts</code> 文字列をそのままコピーして、シェルで <code>mount -t overlay overlay -o &lt;その文字列&gt; /tmp/試し</code> と打ってみるのが速いです。<code>dmesg</code> の末尾に overlayfs が理由を書いていることもあります。カーネル側のヒントはそこにしか出ません。</p>
+      <p>なお <code>workdir</code> を <strong><code>upperdir</code> の中に作る</strong>のも駄目です（<code>upper/work</code> のような配置）。<code>workdir</code> の中身が <code>merged</code> から見えてしまい、overlayfs はこれも拒否します。<code>base</code> の下に3つ<strong>並べて</strong>置くのが正解です。</p>
+    </div>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>書き込みは upperdir に溜まる（copy-up）</h2>
+
+    <p>ここで、この章の一番気持ちのいい部分に来ます。<strong>コンテナの「使い捨て」の正体</strong>です。</p>
+
+    <p>overlayfs の読み書きのルールは、たった2行で書けます。</p>
+
+    <p><strong>読むときは、上から順に探して最初に見つかったものを返す。</strong><br><strong>書くときは、必ず <code>upperdir</code> に書く。</strong></p>
+
+    <p>問題は「下層にしか無いファイルを書き換えたい」ときです。下層は読み取り専用なので書けません。かといって「書けません」と返したら、ほとんどのプログラムが動かなくなります。overlayfs はここで<strong>copy-up</strong>という動作をします。書き込みが起きた瞬間に、そのファイルを<strong>下層から <code>upperdir</code> へまるごとコピーし、コピーのほうに書く</strong>のです。以後そのパスを読むと、上層のコピーが先に見つかるので、下層の原本は永遠に隠れます。</p>
+
+    <div class="ascii">copy-up — 「下層のファイルに書く」瞬間に何が起きるか
+
+  【1】書く前                        【2】echo "v2" &gt; /etc/conf を実行
+
+   upper │ （空）                     upper │ etc/conf ("v2")  ← ここにコピーされて、書かれた
+         │                                  │        ▲
+   lower │ etc/conf ("v1")            lower │ etc/conf ("v1")  ← 原本は無傷のまま隠れる
+         │ bin/sh                           │ bin/sh
+   ──────┼──────────────              ──────┼──────────────
+  merged │ etc/conf ("v1")           merged │ etc/conf ("v2")  ← 上が先に見つかる
+         │ bin/sh                           │ bin/sh
+
+  ※ コピーは「書き込みが起きたファイル1つ」だけ。bin/sh は触られていない。
+  ※ 読むだけなら copy-up は起きない。lower から直接読む（コピーもメモリも増えない）。</div>
+
+    <p>copy-up の効き方には、地味だけれど決定的な特徴があります。</p>
+
+    <p><strong>コピーされるのは、触られたファイルだけ。</strong> alpine の 516 ファイルのうち、コンテナが書き換えたのが1つなら、<code>upperdir</code> に増えるのは1ファイルです。残りの 515 は下層のまま、しかも<strong>すべてのコンテナで物理的に同じ実体</strong>を共有しています。素朴案の「起動のたびに 8.7 MB コピー」が、「書いたぶんだけ」に変わりました。</p>
+
+    <p><strong>読むだけなら何も起きない。</strong> コンテナが <code>/bin/sh</code> を実行しても、下層のページキャッシュをそのまま使います。10個のコンテナが同じ <code>/bin/sh</code> を動かしていても、メモリ上のコードは1つです。これがコンテナが「軽い」と言われる理由の実体で、起動時間が <strong>12〜15 ms</strong> で済むのもここが効いています。</p>
+
+    <p>そして——本題です。</p>
+
+    <div class="ascii">コンテナを消す、とは何をすることか
+
+  containers/a10f2703bb37/
+    ├ merged/   ← まずアンマウント（重ね合わせを解く）
+    ├ upper/    ← ★これを rm -rf する。コンテナが書いたものは全部ここ
+    └ work/     ← これも rm -rf
+
+  layers/sha256_55afa1ecc21d…/   ← ここには **指一本触れていない**
+    └ 8.7 MB / 516 ファイル、次のコンテナがそのまま使う
+
+  「コンテナは使い捨て」の実装 = upperdir を捨てるだけ。</div>
+
+    <p>これがパッケージコメントの最後の一文、<strong>「コンテナを消すときは upperdir を捨てるだけでよい。イメージには指一本触れていない。」</strong>の意味です。</p>
+
+    <p>普段 <code>docker run --rm</code> と打つとき、私たちは何気なく「コンテナは使い捨て」と言っています。その「使い捨て」に対応する実装は、驚くほど素朴でした。<strong>書き込み先のディレクトリを1つ消すだけ。</strong> イメージ側には何のロールバック処理もトランザクションも要らない。<strong>最初から一度も書いていないから</strong>です。</p>
+
+    <p>逆に言うと、この設計を成立させるために <code>upperdir</code> を1つに限定し、下層をすべて読み取り専用にしている、とも読めます。「消しやすさ」は後付けの機能ではなく、構造からの帰結です。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>mydocker が実際に張った overlay マウントを <code>/proc/mounts</code> から採取したものです（末尾の <code>,uuid=on</code> はカーネルが付ける既定値なので除いてあります）。Step 1 で手打ちしたものと、構造がまったく同じであることを確かめてください。</p>
+      <pre class="term"><code><span class="ps">$</span> grep overlay /proc/mounts
+<span class="out">overlay /var/lib/mydocker/containers/a10f2703bb37/merged overlay rw,relatime,lowerdir=/var/lib/mydocker/layers/sha256_55afa1ecc21d2bb5e5045f32dafee56272ffd89860bac26f6c32123439af26a4,upperdir=/var/lib/mydocker/containers/a10f2703bb37/upper,workdir=/var/lib/mydocker/containers/a10f2703bb37/work 0 0</span></code></pre>
+      <p>読み解きます。マウント先は <code>containers/a10f2703bb37/merged</code>——コンテナ ID ごとのディレクトリの下です。<code>lowerdir</code> は <code>layers/sha256_55afa1ecc21d…</code> の<strong>1つだけ</strong>。前章で見たとおり alpine はレイヤ1枚のイメージなので、<code>:</code> 区切りは登場しません（1枚なので、Step 2 の逆転も結果としては同じ文字列になります）。<code>upperdir</code> と <code>workdir</code> は、<strong>どちらも <code>containers/a10f2703bb37/</code> の下</strong>にあります。Step 3 の制約1が、この配置で満たされているのが目で見えます。</p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>E2E テストの「<code>== 6. レイヤの重ね合わせ (FR-7) ==</code>」では、自作の2枚のレイヤを使って重ね合わせの挙動を直接確かめています。下の層に <code>keep.txt</code> / <code>gone.txt</code> / <code>version.txt</code>（中身 <code>v1</code>）を置き、上の層に <code>version.txt</code>（中身 <code>v2</code>）と <code>.wh.gone.txt</code> を置く。重ねると <code>version.txt</code> は <code>v2</code> になり、<code>gone.txt</code> は見えなくなり、<code>keep.txt</code> はそのまま残ります。</p>
+      <p>後片付けの側も、数で確かめています。</p>
+      <pre class="term"><code><span class="ps">$</span> python3 e2e_test.py
+<span class="out">  OK   10 回連続で起動・終了してもすべて成功する（実数で確認: 10/10 件成功）
+  OK   10 回起動しても overlay のマウント数が増えない（前 0 件 → 後 0 件）
+  OK   テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）
+RESULT: 56 passed, 0 failed</span></code></pre>
+      <p>「前 0 件 → 後 0 件」。10 回起動して 10 個の overlay が残っていたら、そのぶんホストのマウントテーブルが埋まり、<code>mount</code> の出力が読めなくなり、最終的にはディスクも埋まります。<strong>張ったものは必ず外す</strong>——Step 8 でその作法を扱います。</p>
+    </div>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span>ホワイトアウト — 「消した」を tar でどう運ぶか</h2>
+
+    <p>ここから後半、<code>internal/image/extract.go</code> の話に移ります。<strong>重ねる材料をどう作るか</strong>の話です。</p>
+
+    <p>問題設定から始めます。イメージのレイヤは tar で配られます。tar は「ファイルの一覧」です。<strong>ファイルを追加する</strong>ことは表現できます。<strong>ファイルを書き換える</strong>ことも、同じパスで新しい中身を入れれば表現できます。では——</p>
+
+    <p><strong>「下の層にあるファイルを、この層で削除した」を tar でどう表現するのでしょうか?</strong></p>
+
+    <p>tar には「このファイルを消せ」というエントリの種類がありません。<code>Dockerfile</code> に <code>RUN rm /etc/foo</code> と書いたとき、そのレイヤの tar には何が入るのか。答えは<strong>約束ごと</strong>です。<code>.wh.</code> という接頭辞を付けた、中身が空のファイルを入れます。</p>
+
+    <div class="ascii">tar の中の ホワイトアウト（whiteout）
+
+  【下の層の tar】            【上の層の tar】
+    etc/hosts                   etc/.wh.hosts     ← "etc/hosts を消した" という意味
+    etc/passwd                  usr/bin/curl
+    bin/sh                      var/.wh..wh..opq  ← "var/ の下層の中身を全部隠す"
+
+  この 2 つは **普通のファイルではない**。tar の上での「印」であって、
+  そのまま展開すると .wh.hosts という名前のゴミファイルが1つ増えるだけで、
+  肝心の etc/hosts は消えないまま残る。</div>
+
+    <p>接頭辞は <code>.wh.</code>（whiteout）。ディレクトリまるごとの場合は <code>.wh..wh..opq</code>（opaque）という、見るからに事故を避けたい名前になっています。<code>extract.go</code> の冒頭で、この2つを定数にしています。</p>
+
+    <div class="file-tag">internal/image/extract.go</div>
+<pre><code><span class="cm">// whiteoutPrefix は「このファイルは上の層で削除された」ことを表す印。</span>
+<span class="cm">// 例: 下層の /etc/hosts を消したいとき、上層の tar には .wh.hosts というエントリが入る。</span>
+<span class="kw">const</span> whiteoutPrefix = <span class="st">".wh."</span>
+
+<span class="cm">// whiteoutOpaque は「このディレクトリの下層の中身をまるごと隠す」印。</span>
+<span class="kw">const</span> whiteoutOpaque = <span class="st">".wh..wh..opq"</span></code></pre>
+
+    <p>さて、これを<strong>普通のファイルとして展開すると何が起きるか</strong>。2つのことが同時に起きます。</p>
+
+    <p><strong>①消えるべきファイルが残る。</strong> 下層の <code>etc/hosts</code> はそのままなので、重ね合わせると見えてしまいます。削除したはずのファイルが生き残る。イメージのビルド時に「秘密鍵を消した」つもりのレイヤがあったら、それは消えていません。</p>
+
+    <p><strong>②変な名前のファイルが増える。</strong> <code>etc/.wh.hosts</code> という 0 バイトのファイルが、コンテナの中に見えます。<code>ls -a /etc</code> したときに <code>.wh.</code> で始まるものが並んでいたら、それはこの処理を書き忘れた証拠です。</p>
+
+    <p>では、正しくはどうするか。ここで大事なのは、<strong>私たちがやりたいのは「削除」ではない</strong>ということです。</p>
+
+    <p>思い出してください。レイヤは <code>digest</code> をディレクトリ名にした<strong>キャッシュ</strong>として、他のイメージと共有したい。だから各レイヤは<strong>独立して</strong>展開されます。「下の層」は、展開している時点では手元に無いかもしれないし、あっても触ってはいけません。<strong>削除しようにも、削除する相手がここには居ない</strong>のです。</p>
+
+    <p>やりたいのは、「あとで重ね合わせたときに、カーネルがこれを見て下層を隠してくれる」印を残すこと。overlayfs には、そのための約束があります。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · キャラクタデバイス 0:0 という約束</div>
+      <p>overlayfs は、<strong>上層にあるメジャー番号 0・マイナー番号 0 のキャラクタデバイス</strong>を「このパスは削除された」という印として扱います。<code>lowerdir</code> に同名のファイルがあっても、<code>merged</code> からは<strong>見えなくなります</strong>。デバイスファイル自体も見えません。ただ「無い」ように振る舞います。</p>
+      <p>なぜデバイスファイルなのか。普通のファイルや空ディレクトリでは「本物のファイル」と区別が付かないからです。<strong>0:0 というデバイス番号は Linux では実在のデバイスに割り当てられていない</strong>ので、これを印として使っても本物と衝突しません。ファイルシステムのメタデータだけで表現でき、tar にも（キャラクタデバイスのエントリとして）そのまま入れられる。手近にあった空き番地を約束の場所にした、という感じの設計です。</p>
+      <p>作るには <code>mknod(2)</code> を使います。シェルなら <code>mknod path c 0 0</code>、Go なら <code>syscall.Mknod(path, syscall.S_IFCHR|0o000, 0)</code>。<strong>デバイスファイルを作るには root（正確には <code>CAP_MKNOD</code>）が要ります</strong>ので、イメージの展開は特権付きで行う必要があります。</p>
+      <p>ちなみに <code>ls -l</code> でこの印を見ると、行頭が <code>c</code>（キャラクタデバイス）になり、サイズの欄が <code>0, 0</code> と表示されます。レイヤのディレクトリを直接覗いたときにこれが並んでいたら、それは<strong>正しく翻訳されている</strong>証拠です。</p>
+    </div>
+
+    <div class="ascii">ホワイトアウトが効いている状態
+
+   upper（コンテナの書き込み）  │                                  │
+   lower 上（レイヤ2）          │ crw------- 0, 0  gone.txt  ★印   │  version.txt("v2")
+   lower 下（レイヤ1）          │ -rw-r--r--       gone.txt        │  version.txt("v1")  keep.txt
+   ─────────────────────────────┼──────────────────────────────────┤
+   merged（コンテナに見える）   │ （gone.txt は無い）              │  version.txt("v2")  keep.txt
+
+   ・レイヤ1 の gone.txt は **消えていない**。ディスク上に今もある
+   ・レイヤ2 の 0:0 デバイスが、それを覆い隠している
+   ・レイヤ2 を外して重ね直せば、gone.txt はまた見えるようになる</div>
+
+    <p>ディレクトリまるごとを隠す <code>.wh..wh..opq</code> のほうは、デバイスファイルではなく<strong>拡張属性</strong>で表現します。そのディレクトリに <code>trusted.overlay.opaque="y"</code> を付けると、overlayfs は「このディレクトリについては下層を一切見ない」と解釈します。</p>
+
+    <p>なぜ違う仕組みなのか。ディレクトリを 0:0 デバイスで潰してしまうと、<strong>そのディレクトリ自体が消えてしまう</strong>からです。<code>.wh..wh..opq</code> がやりたいのは「<code>var/</code> は残したまま、<code>var/</code> の下層の中身だけを無かったことにする」。ディレクトリを生かしたまま印だけ付ける必要があるので、ファイルの実体ではなくメタデータ（xattr）に印を置きます。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>.wh.</code> を普通のファイルとして展開してはいけない</div>
+      <p><code>archive/tar</code> でループを回して、ヘッダの型どおりに素直に書き出す——という実装は、<strong>1レイヤのイメージでは完全に正しく動きます</strong>。alpine はレイヤ1枚なので、テストも通ります。</p>
+      <p>壊れるのは<strong>2枚目以降を持つイメージを引いたとき</strong>です。しかも壊れ方が「エラー」ではありません。<code>ls -a</code> に <code>.wh.</code> で始まる 0 バイトのファイルが並び、消したはずのファイルが見えている。<strong>気付くのはずっと後</strong>です。</p>
+      <p>だから <code>ExtractLayer</code> は、ファイルの型で分岐するより<strong>先に</strong>名前で分岐します。ホワイトアウトの判定を <code>switch hdr.Typeflag</code> の前に置く——この順序が本質です。</p>
+    </div>
+
+    <h2 class="step" id="step-6"><span class="step-no">Step 6</span>翻訳するか、平坦化するか</h2>
+
+    <p>実装に入る前に、私が実際に迷った分かれ道を1つ見せます。<strong>ホワイトアウトの扱いには、もう1つ素朴でまっとうな案があります。</strong></p>
+
+    <p><strong>案A: 全レイヤを1つのディレクトリに順に展開し、<code>.wh.</code> を見たら実体を削除する。</strong></p>
+
+    <p>レイヤを下から順に同じディレクトリへ展開していけば、上のレイヤが下を自然に上書きします。<code>.wh.foo</code> に出会ったら、その時点で <code>foo</code> を <code>os.Remove</code> すればいい。<strong>overlayfs すら要りません。</strong> 出来上がった1枚のディレクトリを <code>pivot_root</code> の行き先にすれば動きます。第03章までの知識だけで完成します。</p>
+
+    <div class="ascii">案A（平坦化） vs 案B（翻訳）
+
+  【案A】レイヤを1枚に潰す                  【案B】レイヤごとに独立して展開する
+
+   layers/                                    layers/
+     nginx-flat/   ← nginx 専用                 sha256_aaa…/  ← ベース（共有できる）
+       （ベース+nginx を潰したもの）             sha256_bbb…/  ← nginx の層
+     redis-flat/   ← redis 専用                  sha256_ccc…/  ← redis の層
+       （ベース+redis を潰したもの）
+                                               nginx  = aaa + bbb
+   ベースの中身が **2 回** ディスクに乗る       redis  = aaa + ccc
+   ベースだけ更新しても両方を作り直し           ★ aaa は 1 つで済む
+   digest でのキャッシュ判定が効かない          ★ digest = ディレクトリ名 = 不変のキャッシュ</div>
+
+    <p>案Aを却下した理由は1つです。<strong>平坦化した結果は、そのイメージ専用になる。</strong></p>
+
+    <p>前章でレイヤを <code>digest</code> ごとにキャッシュした意味を思い出してください。<code>sha256:55afa1ecc21d…</code> というレイヤは、それを使うどのイメージから見ても<strong>同じ中身</strong>です。だから一度取ってくれば、次からはネットワークに出なくていい。<code>mydocker pull</code> の2回目が「キャッシュ:（ネットワークにはアクセスしません）」と即答できるのは、この不変性のおかげでした。</p>
+
+    <p>平坦化すると、その不変性が壊れます。「ベース+nginx を潰したもの」には <code>digest</code> がありません。ベースを共有している別のイメージが来ても、共有できる部分が無い。ディスクは重複し、キャッシュの判定もできなくなります。</p>
+
+    <p><strong>だから採ったのは案B——「overlayfs が理解する形への翻訳」</strong>です。</p>
+
+    <table>
+      <thead>
+        <tr><th>tar の中の印</th><th>翻訳先</th><th>使う道具</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>.wh.&lt;名前&gt;</code></td><td><code>&lt;名前&gt;</code> の位置にキャラクタデバイス 0:0</td><td><code>syscall.Mknod</code></td></tr>
+        <tr><td><code>.wh..wh..opq</code></td><td>そのディレクトリに <code>trusted.overlay.opaque="y"</code></td><td><code>syscall.Setxattr</code></td></tr>
+      </tbody>
+    </table>
+
+    <p>これで各レイヤは <code>digest</code> をディレクトリ名にした<strong>独立・不変のキャッシュ</strong>になり、重ね合わせの実際の計算は<strong>カーネルに丸投げできます</strong>。私たちのコードは「印を正しい形に翻訳する」だけ。楽になったうえに、正しくなりました。</p>
+
+    <p>では <code>ExtractLayer</code> を読みます。まず入り口です。</p>
+
+    <div class="file-tag">internal/image/extract.go</div>
+<pre><code><span class="cm">// ExtractLayer は tar（gzip 圧縮されていてもいなくてもよい）を dest に展開する。</span>
+<span class="cm">// 展開したエントリ数を返す。</span>
+<span class="cm">//</span>
+<span class="cm">// このレイヤは後で OverlayFS の lowerdir として使うので、</span>
+<span class="cm">// ホワイトアウトは「消す」のではなく **overlayfs が理解する形に翻訳する**:</span>
+<span class="cm">//</span>
+<span class="cm">//	.wh.&lt;名前&gt;     → dest/&lt;名前&gt; にキャラクタデバイス 0:0 を作る（overlay の削除印）</span>
+<span class="cm">//	.wh..wh..opq   → そのディレクトリに trusted.overlay.opaque="y" を付ける</span>
+<span class="cm">//</span>
+<span class="cm">// こうしておくと、重ね合わせたときにカーネル側が下層を隠してくれる。</span>
+<span class="kw">func</span> <span class="ty">ExtractLayer</span>(r io.<span class="ty">Reader</span>, dest <span class="kw">string</span>) (<span class="kw">int</span>, <span class="kw">error</span>) {
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(dest, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>, err
+	}
+	realDest, err := filepath.<span class="ty">EvalSymlinks</span>(dest)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>, err
+	}
+
+	tr, closeFn, err := newTarReader(r)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>, err
+	}
+	<span class="kw">defer</span> closeFn()
+
+	<span class="cm">// ディレクトリのパーミッションと時刻は、中身を書き終えてから当て直す。</span>
+	<span class="cm">// 先に 0555 のディレクトリを作ってしまうと、その中にファイルを置けなくなるため。</span>
+	<span class="kw">type</span> dirMeta <span class="kw">struct</span> {
+		path <span class="kw">string</span>
+		mode os.<span class="ty">FileMode</span>
+	}
+	<span class="kw">var</span> dirs []dirMeta
+
+	count := <span class="st">0</span>
+	<span class="cm">// …（ループの中身は次に）</span>
+}</code></pre>
+
+    <p>3つ、先に押さえておきたい点があります。</p>
+
+    <p><strong>①<code>filepath.EvalSymlinks(dest)</code> で「本物の展開先」を求めている。</strong> これが Step 7 の検証の基準点になります。<code>dest</code> 自体がシンボリックリンクだったり、途中に <code>/var</code> → <code>/private/var</code> のようなリンクが挟まっていたりすると、文字列比較での安全判定が意味をなさなくなります。<strong>比較する前に、両方を実体のパスに揃える</strong>——これが鉄則です。</p>
+
+    <p><strong>②<code>defer closeFn()</code>。</strong> <code>newTarReader</code> は「gzip なら展開器を挟み、そうでなければ素通し」を返します。gzip の場合だけ <code>Close</code> が要るので、閉じる処理を関数として一緒に返す形にしています。呼ぶ側は中身を知らずに <code>defer</code> するだけ。</p>
+
+    <p><strong>③ディレクトリのパーミッションを後回しにする。</strong> これは実装中に踏んだ罠です。tar の中に <code>mode 0555</code> のディレクトリがあると、その場でパーミッションを当ててしまうと<strong>書き込み権限が無くなり、その中のファイルを展開できません</strong>。だから作るときは一律 <code>0755</code> にしておき、<code>dirs</code> に <code>(パス, 本来の mode)</code> を溜めておいて、全部展開し終わってから当て直します。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · <code>archive/tar</code> と <code>compress/gzip</code></div>
+      <p>Go の標準ライブラリだけで tar.gz を読めます。<code>compress/gzip</code> の <code>Reader</code> は <code>io.Reader</code> を受け取って <code>io.Reader</code> を返し、<code>archive/tar</code> の <code>Reader</code> も <code>io.Reader</code> を受け取ります。つまり<strong>そのまま数珠つなぎにできます</strong>。</p>
+      <p>問題は「今流れてくるのが gzip かどうか」です。レイヤの <code>mediaType</code> は <code>application/vnd.oci.image.layer.v1.tar+gzip</code> なので普通は gzip ですが、非圧縮の tar が来ることもあります。そこで<strong>先頭2バイトを覗いて自分で見分けます</strong>。gzip のマジックナンバーは <code>1f 8b</code> です。</p>
+      <p>ただし「覗く」ためには読んでしまった2バイトを戻せなければいけません。<code>io.Reader</code> にはそんな機能はない。ここで <code>bufio.Reader</code> の <code>Peek</code> が効きます。<strong><code>Peek(n)</code> は先頭 n バイトを返すが、読み位置は進めません。</strong> バッファに溜めて見せてくれるだけです。</p>
+      <div class="file-tag">internal/image/extract.go</div>
+<pre><code><span class="cm">// newTarReader は gzip 圧縮されている場合だけ展開してから tar として読む。</span>
+<span class="cm">// レイヤは通常 tar.gz だが、非圧縮の tar が来ることもあるので先頭2バイトで見分ける。</span>
+<span class="kw">func</span> newTarReader(r io.<span class="ty">Reader</span>) (*tar.<span class="ty">Reader</span>, <span class="kw">func</span>(), <span class="kw">error</span>) {
+	br := bufio.<span class="ty">NewReader</span>(r)
+	magic, err := br.<span class="ty">Peek</span>(<span class="st">2</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> &amp;&amp; !errors.<span class="ty">Is</span>(err, io.<span class="ty">EOF</span>) {
+		<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">func</span>() {}, err
+	}
+	<span class="kw">if</span> <span class="kw">len</span>(magic) == <span class="st">2</span> &amp;&amp; magic[<span class="st">0</span>] == <span class="st">0x1f</span> &amp;&amp; magic[<span class="st">1</span>] == <span class="st">0x8b</span> {
+		zr, err := gzip.<span class="ty">NewReader</span>(br)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">func</span>() {}, fmt.<span class="ty">Errorf</span>(<span class="st">"gzip として読めませんでした: %w"</span>, err)
+		}
+		<span class="kw">return</span> tar.<span class="ty">NewReader</span>(zr), <span class="kw">func</span>() { zr.<span class="ty">Close</span>() }, <span class="kw">nil</span>
+	}
+	<span class="kw">return</span> tar.<span class="ty">NewReader</span>(br), <span class="kw">func</span>() {}, <span class="kw">nil</span>
+}</code></pre>
+      <p><code>Peek(2)</code> のエラーで <code>io.EOF</code> だけ許しているのは、<strong>2バイト未満の入力（空のレイヤなど）を異常扱いしない</strong>ためです。その場合 <code>magic</code> の長さが 2 未満になるので、次の <code>if</code> が自然に <code>false</code> になり、素の tar として扱われて即 EOF で終わります。</p>
+      <p>戻り値の <code>func()</code> が2種類あることにも注目してください。gzip のときは <code>func() { zr.Close() }</code>、そうでないときは<strong>何もしない <code>func() {}</code></strong>。呼び出し側に <code>if</code> を書かせないための書き方です。Go では「nil かもしれない Closer」より「何もしない関数」のほうが安全に扱えます。</p>
+    </div>
+
+    <p>次が本題、ループの中のホワイトアウト処理です。</p>
+
+    <div class="file-tag">internal/image/extract.go（ExtractLayer の続き）</div>
+<pre><code>	count := <span class="st">0</span>
+	<span class="kw">for</span> {
+		hdr, err := tr.<span class="ty">Next</span>()
+		<span class="kw">if</span> errors.<span class="ty">Is</span>(err, io.<span class="ty">EOF</span>) {
+			<span class="kw">break</span>
+		}
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> count, fmt.<span class="ty">Errorf</span>(<span class="st">"tar の読み取りに失敗しました: %w"</span>, err)
+		}
+		<span class="cm">// PAX のグローバルヘッダなどは実体を持たない</span>
+		<span class="kw">if</span> hdr.<span class="ty">Typeflag</span> == tar.<span class="ty">TypeXGlobalHeader</span> || hdr.<span class="ty">Typeflag</span> == tar.<span class="ty">TypeXHeader</span> {
+			<span class="kw">continue</span>
+		}
+
+		target, err := safeJoin(realDest, hdr.<span class="ty">Name</span>)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> count, fmt.<span class="ty">Errorf</span>(<span class="st">"%w: %q"</span>, err, hdr.<span class="ty">Name</span>)
+		}
+
+		base := filepath.<span class="ty">Base</span>(target)
+		parent := filepath.<span class="ty">Dir</span>(target)
+
+		<span class="cm">// --- ホワイトアウトの処理（普通のファイルとして展開してはいけない）---</span>
+		<span class="kw">if</span> base == whiteoutOpaque {
+			<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(parent, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> count, err
+			}
+			<span class="cm">// trusted.* の xattr は CAP_SYS_ADMIN が要る。付けられない環境では</span>
+			<span class="cm">// 「下層が透けて見える」ことになるので、黙って無視せず警告する。</span>
+			<span class="kw">if</span> err := syscall.<span class="ty">Setxattr</span>(parent, <span class="st">"trusted.overlay.opaque"</span>, []<span class="kw">byte</span>(<span class="st">"y"</span>), <span class="st">0</span>); err != <span class="kw">nil</span> {
+				fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"警告: opaque 印を付けられませんでした (%s): %v\n"</span>, parent, err)
+			}
+			count++
+			<span class="kw">continue</span>
+		}
+		<span class="kw">if</span> strings.<span class="ty">HasPrefix</span>(base, whiteoutPrefix) {
+			victim := filepath.<span class="ty">Join</span>(parent, strings.<span class="ty">TrimPrefix</span>(base, whiteoutPrefix))
+			<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(parent, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> count, err
+			}
+			_ = os.<span class="ty">RemoveAll</span>(victim) <span class="cm">// 同じレイヤ内で先に実体が来ていた場合に備える</span>
+			<span class="cm">// overlayfs の「削除された」印はキャラクタデバイス 0:0 である。</span>
+			<span class="kw">if</span> err := syscall.<span class="ty">Mknod</span>(victim, syscall.<span class="ty">S_IFCHR</span>|<span class="st">0o000</span>, <span class="st">0</span>); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> count, fmt.<span class="ty">Errorf</span>(<span class="st">"ホワイトアウトを作れませんでした (%s): %w"</span>, victim, err)
+			}
+			count++
+			<span class="kw">continue</span>
+		}
+
+		<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(parent, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> count, err
+		}
+		<span class="cm">// …（型ごとの分岐は Step 7 で）</span>
+	}</code></pre>
+
+    <p>逐行で追います。</p>
+
+    <p><strong><code>tr.Next()</code> でヘッダを1つ進める。</strong> <code>archive/tar</code> の <code>Reader</code> は「次のエントリのヘッダを読む → <code>tr</code> 自身をそのエントリの中身の <code>io.Reader</code> として使う」という作りです。<code>io.EOF</code> が返ったら終わり。<code>errors.Is</code> を使っているのは、ラップされたエラーでも判定できるようにするためです。</p>
+
+    <p><strong>PAX ヘッダを飛ばす。</strong> <code>TypeXGlobalHeader</code> と <code>TypeXHeader</code> は、長いパス名や大きな uid を運ぶための<strong>メタ情報のエントリ</strong>で、実体のファイルではありません。<code>archive/tar</code> は中身を解釈して次のヘッダに反映してくれるので、私たちは無視すればいい。ここで無視し忘れると、<code>PaxHeaders/…</code> という妙なファイルが展開先に生えます。</p>
+
+    <p><strong><code>safeJoin</code> でパスを検証しつつ絶対パスに変換。</strong> Step 7 の主役です。ここでエラーが出たら<strong>その場で展開を打ち切ります</strong>。「そのエントリだけ飛ばして続行」ではありません。展開先の外を狙うエントリが1つでも入っているイメージは、もう信用できないからです。</p>
+
+    <p><strong><code>base</code> と <code>parent</code> に分ける。</strong> ホワイトアウトの判定は<strong>ファイル名の部分だけ</strong>で行います。<code>etc/.wh.hosts</code> なら <code>base</code> は <code>.wh.hosts</code>、<code>parent</code> は <code>&lt;dest&gt;/etc</code>。パス全体に <code>strings.Contains</code> をかけたりすると、<code>/opt/.wh.d/normal.txt</code> のようなパスで誤判定します。</p>
+
+    <p><strong>opaque の処理。</strong> <code>base</code> が <code>.wh..wh..opq</code> ちょうどなら、その<strong>親ディレクトリ</strong>に xattr を付けます。<code>var/.wh..wh..opq</code> というエントリが意味するのは「<code>var/</code> を opaque にせよ」なので、印を付ける相手は <code>parent</code> です。付ける前に <code>MkdirAll(parent)</code> しているのは、tar の中でディレクトリのエントリが先に来ているとは限らないからです。</p>
+
+    <p><strong>xattr が付けられなくてもエラーにしない。</strong> ここは判断が分かれるところですが、<code>trusted.*</code> 名前空間には <code>CAP_SYS_ADMIN</code> が要るので、<strong>権限の無い環境では必ず失敗します</strong>。そこで展開全体を止めてしまうと、非特権環境でイメージを覗くことすらできなくなる。かといって黙って通すと、後で「下層が透けて見える」という分かりにくい不具合になります。だから<strong>標準エラーに警告を出して続行</strong>する、という中間を採りました。「黙って無視せず警告する」とコメントに書いてあるのはそういう意味です。</p>
+
+    <p><strong><code>.wh.</code> の処理。</strong> <code>base</code> が <code>.wh.</code> で始まるなら、接頭辞を外した名前が「消したい相手（victim）」です。<code>.wh.hosts</code> → <code>hosts</code>。<code>parent</code> と繋いで <code>victim</code> のフルパスを作ります。</p>
+
+    <p><strong><code>os.RemoveAll(victim)</code> を先にやる。</strong> エラーを <code>_</code> で捨てているのは、無くて当たり前だからです。ではなぜ呼ぶのか。<strong>同じレイヤの tar の中で、先に <code>hosts</code> の実体が来ていた場合</strong>に備えています。その状態で <code>Mknod</code> すると <code>EEXIST</code> で失敗します。順序に依存しないようにするための1行です。</p>
+
+    <p><strong><code>syscall.Mknod(victim, syscall.S_IFCHR|0o000, 0)</code>。</strong> ここが翻訳の核心です。第2引数はモードで、<code>S_IFCHR</code>（キャラクタデバイスである）に <code>0o000</code>（誰にも読み書きさせない）を OR しています。第3引数の <code>0</code> がデバイス番号で、<strong>メジャー 0・マイナー 0</strong>。この <code>0</code> こそが overlayfs との約束です。</p>
+
+    <p>そして <code>Mknod</code> のエラーは<strong>握りつぶしません</strong>。ここが失敗するということは削除の印を作れないということで、そのまま進めば<strong>消えるべきファイルが見えるイメージ</strong>が出来上がります。静かに壊れるより、その場で止まったほうがいい。</p>
+
+    <p><strong>どちらの分岐も <code>count++</code> して <code>continue</code>。</strong> 印もエントリとして数えます。そして <code>continue</code> で<strong>型ごとの分岐に絶対に到達させません</strong>。ホワイトアウトのエントリは tar 上ではただの空ファイル（<code>TypeReg</code>）なので、下まで流すと普通のファイルとして書き出されてしまいます。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · 拡張属性（xattr）と trusted 名前空間</div>
+      <p>拡張属性（extended attributes）は、ファイルやディレクトリに<strong>「名前 = 値」のメタデータを追加でぶら下げる</strong>仕組みです。中身（データ）でもなく、パーミッションや時刻（標準の inode 情報）でもない、第三の置き場所だと思ってください。<code>setfattr</code> / <code>getfattr</code> コマンドで人間も触れます。</p>
+      <p>名前は必ず「名前空間.属性名」の形をしていて、4つの名前空間があります。</p>
+      <ul>
+        <li><code>user.*</code> — 誰でも付けられる。アプリケーションが自由に使う</li>
+        <li><code>trusted.*</code> — <strong><code>CAP_SYS_ADMIN</code> が無いと読み書きできない</strong>。一般ユーザーからは存在すら見えない</li>
+        <li><code>security.*</code> — SELinux などのセキュリティモジュール用</li>
+        <li><code>system.*</code> — ACL などカーネルが使う</li>
+      </ul>
+      <p>overlayfs が <code>trusted.overlay.*</code> を使うのには理由があります。もし <code>user.*</code> を使っていたら、<strong>コンテナの中から自分で「このディレクトリは opaque だ」と宣言できてしまう</strong>。ファイルシステムの構造をユーザーが書き換えられるということです。<code>trusted.*</code> にしておけば、印を付けられるのは特権を持つ側（＝私たちの展開処理）だけになります。</p>
+      <p>実務上の注意が1つ。<strong>ファイルシステムによっては xattr が使えません。</strong> 古い設定の tmpfs や、一部のネットワークファイルシステムがそうです。レイヤの置き場所をそういう場所にすると、opaque の印が黙って落ちます。<code>ExtractLayer</code> が警告を標準エラーに出しているのは、まさにこの状況を人間に気付かせるためです。</p>
+    </div>
+
+    <h2 class="step" id="step-7"><span class="step-no">Step 7</span>tar 展開のパス検証（Zip Slip）</h2>
+
+    <p>ここはセキュリティの話です。この章で一番、<strong>手を抜くと本当に危ない</strong>ところです。</p>
+
+    <p>前提を確認します。<strong>私たちが展開している tar は、私たちが作ったものではありません。</strong> レジストリからダウンロードしてきた、他人が作ったバイト列です。前章で digest を検証したので「配信途中で改竄されていない」ことは保証できますが、<strong>作った本人が悪意を持っている</strong>可能性は digest では何も潰せません。正しく配信された悪意あるイメージ、というものが存在します。</p>
+
+    <p>tar のエントリ名は、ただの文字列です。カーネルもレジストリも、その文字列が「展開先の中を指しているか」など気にしません。だから<strong>展開する側が確かめるしかない</strong>。この種の脆弱性には <strong>Zip Slip</strong> という名前が付いています（zip でも tar でも同じ話です）。</p>
+
+    <p>素朴な攻撃はすぐ思い付きます。</p>
+
+    <div class="ascii">素朴な 2 つの手口
+
+  【手口1】絶対パス
+     エントリ名: /etc/passwd
+     ナイーブな実装が filepath.Join(dest, "/etc/passwd") をすると…
+     → Join は先頭の / を潰すので dest/etc/passwd になる（この実装なら助かる）
+     → だが自前で dest + name と文字列連結していると /etc/passwd に直撃
+
+  【手口2】.. で登る
+     エントリ名: ../../../../etc/passwd
+     dest/          = /var/lib/mydocker/layers/sha256_xxx
+     .. を 4 回登ると /var/lib
+     → /var/lib/../../etc/passwd … 登り切れば本物の /etc/passwd に届く</div>
+
+    <p>この2つは、名前を見れば分かります。<strong>先頭が <code>/</code> なら拒否、要素に <code>..</code> があれば拒否</strong>。これで手口1と手口2は塞がります。</p>
+
+    <p>——そして、私が実装中に気付いたのは、<strong>この2つだけでは足りない</strong>ということでした。</p>
+
+    <p>3つめの手口は、名前がまったく無害に見えます。</p>
+
+    <div class="ascii">【手口3】シンボリックリンクで踏み台を作る
+
+  エントリ1: foo -> /          （シンボリックリンク。名前に .. も / も無いので ①② を通過）
+  エントリ2: foo/etc/passwd    （名前は無害。しかし書き込み先は本物の /etc/passwd）
+
+  展開の様子:
+
+    ステップ1                         ステップ2
+    dest/                             dest/
+      └ foo ─────────┐                  └ foo ─────────┐
+                     ▼                                 ▼
+                     /  （ホストの根）                 /
+                                                       └ etc/
+                                                            └ passwd  ★ここに書かれる
+
+  ・エントリ1 の名前は "foo"。絶対パスでも .. でもない → ① ② を通過
+  ・エントリ2 の名前は "foo/etc/passwd"。これも絶対パスでも .. でもない → ① ② を通過
+  ・しかし dest/foo は / を指しているので、実際の書き込み先は /etc/passwd
+
+  文字列だけを見ていては絶対に防げない。**ファイルシステムの実体を見る**必要がある。</div>
+
+    <p>手口3の核心は、<strong>攻撃者が2手に分けている</strong>ことです。1手目で踏み台（シンボリックリンク）を置き、2手目でそこを通り抜ける。それぞれの手は完全に無害です。<strong>組み合わせだけが有害</strong>なので、エントリ名を1つずつ眺めていても永遠に見つかりません。</p>
+
+    <p>防ぐには、<strong>書き込む直前に、そのパスの親が本当に <code>dest</code> の中にあるかをファイルシステムに聞く</strong>しかありません。それが3段目の検証です。</p>
+
+    <p><code>safeJoin</code> の全文です。</p>
+
+    <div class="file-tag">internal/image/extract.go</div>
+<pre><code><span class="cm">// safeJoin は tar のエントリ名を dest 配下の絶対パスに変換する。</span>
+<span class="cm">// ⚠ ここがイメージ展開のセキュリティの要である。3段で守る:</span>
+<span class="cm">//</span>
+<span class="cm">//  1. 絶対パス（"/etc/passwd"）を拒否する</span>
+<span class="cm">//  2. ".." を含むパス（"../../etc/passwd"）を拒否する</span>
+<span class="cm">//  3. 途中のディレクトリが dest の外を指すシンボリックリンクになっていないか確認する</span>
+<span class="cm">//</span>
+<span class="cm">// 3 が要るのは、レイヤが先に「foo -&gt; /」というリンクを作り、</span>
+<span class="cm">// 次に "foo/etc/passwd" を書こうとする手口があるため。1 と 2 だけでは通ってしまう。</span>
+<span class="kw">func</span> safeJoin(realDest, name <span class="kw">string</span>) (<span class="kw">string</span>, <span class="kw">error</span>) {
+	<span class="kw">if</span> name == <span class="st">""</span> {
+		<span class="kw">return</span> <span class="st">""</span>, <span class="ty">ErrPathEscape</span>
+	}
+	<span class="cm">// tar の中の区切りは常に "/"</span>
+	clean := filepath.<span class="ty">Clean</span>(<span class="st">"/"</span> + strings.<span class="ty">ReplaceAll</span>(name, <span class="st">"\\"</span>, <span class="st">"/"</span>))
+	<span class="kw">if</span> strings.<span class="ty">HasPrefix</span>(name, <span class="st">"/"</span>) {
+		<span class="kw">return</span> <span class="st">""</span>, <span class="ty">ErrPathEscape</span>
+	}
+	<span class="kw">for</span> _, part := <span class="kw">range</span> strings.<span class="ty">Split</span>(name, <span class="st">"/"</span>) {
+		<span class="kw">if</span> part == <span class="st">".."</span> {
+			<span class="kw">return</span> <span class="st">""</span>, <span class="ty">ErrPathEscape</span>
+		}
+	}
+	target := filepath.<span class="ty">Join</span>(realDest, clean)
+	<span class="kw">if</span> target != realDest &amp;&amp; !strings.<span class="ty">HasPrefix</span>(target, realDest+<span class="kw">string</span>(os.<span class="ty">PathSeparator</span>)) {
+		<span class="kw">return</span> <span class="st">""</span>, <span class="ty">ErrPathEscape</span>
+	}
+
+	<span class="cm">// 途中の実体がシンボリックリンクで外へ抜けていないかを確かめる。</span>
+	<span class="cm">// 親ディレクトリが既に存在する場合だけ検査すればよい（無ければこれから作る＝外へは出ない）。</span>
+	parent := filepath.<span class="ty">Dir</span>(target)
+	<span class="kw">if</span> realParent, err := filepath.<span class="ty">EvalSymlinks</span>(parent); err == <span class="kw">nil</span> {
+		<span class="kw">if</span> realParent != realDest &amp;&amp; !strings.<span class="ty">HasPrefix</span>(realParent, realDest+<span class="kw">string</span>(os.<span class="ty">PathSeparator</span>)) {
+			<span class="kw">return</span> <span class="st">""</span>, <span class="ty">ErrPathEscape</span>
+		}
+	}
+	<span class="kw">return</span> target, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>返しているエラーは、ファイルの先頭で定義した番兵です。</p>
+
+    <div class="file-tag">internal/image/extract.go</div>
+<pre><code><span class="cm">// ErrPathEscape は tar のエントリが展開先の外を指していたことを表す。</span>
+<span class="cm">// いわゆる Zip Slip。イメージの提供者は自分ではないので、必ず弾く。</span>
+<span class="kw">var</span> <span class="ty">ErrPathEscape</span> = errors.<span class="ty">New</span>(<span class="st">"tar のエントリが展開先の外を指しています"</span>)</code></pre>
+
+    <p>1段ずつ読みます。</p>
+
+    <p><strong>0段目: 空の名前を拒否。</strong> <code>name == ""</code> は正常な tar には現れません。壊れた tar か、細工されたものです。</p>
+
+    <p><strong>正規化。</strong> <code>strings.ReplaceAll(name, "\\", "/")</code> でバックスラッシュをスラッシュに揃えます。tar の中の区切りは常に <code>/</code> と決まっているので、<code>\</code> が出てくること自体が異常ですが、Windows 由来のツールが作った tar で混ざることがあります。放っておくと <code>..\..\etc</code> のような形で <code>..</code> の検査をすり抜けかねないので、先に潰します。</p>
+
+    <p>その上で <code>filepath.Clean("/" + …)</code>。先頭に <code>/</code> を付けてから <code>Clean</code> することで、<strong><code>..</code> が根より上へ突き抜けないよう Go 側が丸めてくれます</strong>。<code>/a/../../b</code> は <code>/b</code> になります。</p>
+
+    <p><strong>1段目: 絶対パスを拒否。</strong> <code>strings.HasPrefix(name, "/")</code>。ここで見ているのは <code>clean</code> ではなく<strong>元の <code>name</code></strong> です。<code>clean</code> は必ず <code>/</code> で始まるように作ったので、そちらを見ても意味がありません。<strong>「攻撃者が書いた文字列そのもの」を検査する</strong>のが大事です。</p>
+
+    <p><strong>2段目: <code>..</code> を含むパスを拒否。</strong> こちらも元の <code>name</code> を <code>/</code> で分割して、<strong>要素として <code>..</code> ちょうど</strong>のものがあれば拒否します。<code>strings.Contains(name, "..")</code> のような雑な検査にしていないのは、<code>foo..bar</code> や <code>a..b/c</code> のような<strong>正当なファイル名を誤って弾かないため</strong>です。逆に、要素単位で見れば <code>..</code> は絶対に正当なファイル名になりません。</p>
+
+    <p><strong>連結と、念のための文字列検査。</strong> <code>filepath.Join(realDest, clean)</code> で目的地を作り、それが <code>realDest</code> そのものか、<code>realDest/</code> で始まるかを確かめます。1段目・2段目を通っていればここは必ず通るはずですが、<strong>「はず」を残さない</strong>ための帯とサスペンダーです。<code>realDest+string(os.PathSeparator)</code> と<strong>区切り文字まで含めて</strong>比較しているのが要点で、これを忘れると <code>/var/lib/mydocker/layers/sha256_aaa</code> に対して <code>/var/lib/mydocker/layers/sha256_aaa_evil</code> が前方一致で通ってしまいます。</p>
+
+    <p><strong>3段目: 親の実体を確かめる。</strong> ここが手口3への答えです。</p>
+
+    <p><code>filepath.Dir(target)</code> で親ディレクトリを取り、<code>filepath.EvalSymlinks</code> に渡します。この関数は<strong>パスに含まれるシンボリックリンクを全部辿って、実体のパスを返します</strong>。<code>dest/foo</code> が <code>/</code> を指すリンクなら、<code>dest/foo/etc</code> の実体は <code>/etc</code> です。文字列としては <code>dest/</code> の中に見えていたものが、実体では外に出ていることが<strong>ここで初めて分かります</strong>。</p>
+
+    <p>あとは同じ前方一致の検査を、今度は<strong>実体のパスに対して</strong>行うだけ。<code>realParent</code> が <code>realDest</code> の中でなければ拒否します。</p>
+
+    <p><strong>エラーを無視して <code>err == nil</code> のときだけ検査しているのはなぜか。</strong> <code>EvalSymlinks</code> は、パスが存在しないとエラーを返します。tar の展開では<strong>親ディレクトリがまだ作られていないことが普通にあります</strong>（これから <code>MkdirAll</code> するので）。まだ存在しないディレクトリは、当然シンボリックリンクでもないので、外を指しようがない。だから「存在するときだけ検査すればよい」——コメントの「無ければこれから作る＝外へは出ない」がそれを言っています。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · <code>filepath.EvalSymlinks</code></div>
+      <p><code>filepath.EvalSymlinks(path)</code> は、パスに含まれるシンボリックリンクを<strong>すべて解決した実体のパス</strong>を返します。最後の要素だけでなく、<strong>途中の全要素</strong>を辿るのがポイントです。<code>/a/b/c</code> の <code>b</code> がリンクなら、そこも展開されます。パスが存在しない場合はエラーになります。</p>
+      <p>似た関数に <code>filepath.Abs</code>（相対パスを絶対パスにするだけ。リンクは辿らない）と <code>filepath.Clean</code>（文字列として <code>.</code> や <code>..</code> を畳むだけ。ファイルシステムを一切見ない）があります。<strong>この3つの違いを取り違えると、そのまま脆弱性になります。</strong> <code>Clean</code> は文字列処理、<code>EvalSymlinks</code> はファイルシステムへの問い合わせです。</p>
+      <p>正直に書いておくと、<code>EvalSymlinks</code> による検査は<strong>TOCTOU（検査した瞬間と使う瞬間のずれ）に対して完璧ではありません</strong>。検査した直後に別のプロセスがそのパスをリンクに差し替えれば、理屈の上ではすり抜けます。本当に厳密にやるなら <code>openat2(2)</code> の <code>RESOLVE_BENEATH</code> のように、<strong>カーネルに「この下から出るな」と指示する</strong>仕組みを使います。この教材では標準ライブラリの範囲に留めましたが、<strong>限界があることを知って使っているか、知らずに使っているか</strong>は大きな違いです。</p>
+    </div>
+
+    <p>もう1つ、<strong>書き込みそのものにも同じ穴があります</strong>。<code>writeFile</code> を見てください。</p>
+
+    <div class="file-tag">internal/image/extract.go</div>
+<pre><code><span class="kw">func</span> writeFile(target <span class="kw">string</span>, r io.<span class="ty">Reader</span>, mode os.<span class="ty">FileMode</span>) <span class="kw">error</span> {
+	<span class="cm">// 既存を上書きするときは一度消す。シンボリックリンクを開くと</span>
+	<span class="cm">// リンク先（＝展開先の外かもしれない）に書いてしまうため。</span>
+	_ = os.<span class="ty">Remove</span>(target)
+	f, err := os.<span class="ty">OpenFile</span>(target, os.<span class="ty">O_CREATE</span>|os.<span class="ty">O_WRONLY</span>|os.<span class="ty">O_EXCL</span>, mode)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">if</span> _, err := io.<span class="ty">Copy</span>(f, r); err != <span class="kw">nil</span> {
+		f.<span class="ty">Close</span>()
+		<span class="kw">return</span> err
+	}
+	<span class="kw">return</span> f.<span class="ty">Close</span>()
+}</code></pre>
+
+    <p>普通に書くなら <code>os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)</code> です。既にあれば切り詰めて上書き。1行で済みます。</p>
+
+    <p><strong>それが穴になります。</strong> <code>target</code> が既にシンボリックリンクとして存在していたら、<code>open</code> は<strong>リンクを辿った先を開きます</strong>。リンク先が <code>/etc/passwd</code> なら、そこに tar の中身が書かれる。<code>safeJoin</code> の3段目は<strong>親ディレクトリ</strong>を見ますが、<strong>最後の要素そのものがリンク</strong>である場合はそこでは捕まえていません。</p>
+
+    <div class="ascii">O_TRUNC と Remove→O_EXCL の違い
+
+  【危ない】O_TRUNC で開く
+     dest/foo は既に「-&gt; /etc/passwd」というリンク
+     open("dest/foo", O_CREATE|O_WRONLY|O_TRUNC)
+        └─ リンクを辿る ─▶ /etc/passwd を開いて 0 バイトに切り詰め、書き込む  ✗
+
+  【安全】一度 Remove してから O_EXCL で作る
+     os.Remove("dest/foo")        ← リンク **そのもの** を消す（リンク先は無傷）
+     open("dest/foo", O_CREATE|O_WRONLY|O_EXCL)
+        └─ 何も無い場所に新規作成。既にあれば EEXIST でエラー          ✓</div>
+
+    <p>だから<strong>必ず一度 <code>os.Remove</code> してから作ります</strong>。<code>os.Remove</code> はシンボリックリンクを辿らず、<strong>リンクそのもの</strong>を消します（<code>unlink(2)</code> の挙動です）。リンク先の <code>/etc/passwd</code> には何も起きません。</p>
+
+    <p>そして開くときは <code>O_TRUNC</code> ではなく <strong><code>O_EXCL</code></strong>。「既に存在したらエラー」という意味です。直前に <code>Remove</code> しているので通常は存在せず、<strong>もし存在したら、それは想定外の何かが起きた証拠</strong>なので止まるべきです。<code>Remove</code> と <code>O_EXCL</code> は必ずセットで使います。</p>
+
+    <p>同じ用心が、<code>ExtractLayer</code> の型ごとの分岐にも徹底されています。残りを読みます。</p>
+
+    <div class="file-tag">internal/image/extract.go（ExtractLayer の続き）</div>
+<pre><code>		<span class="kw">switch</span> hdr.<span class="ty">Typeflag</span> {
+		<span class="kw">case</span> tar.<span class="ty">TypeDir</span>:
+			<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(target, <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> count, err
+			}
+			dirs = <span class="kw">append</span>(dirs, dirMeta{target, hdr.<span class="ty">FileInfo</span>().<span class="ty">Mode</span>().<span class="ty">Perm</span>()})
+
+		<span class="kw">case</span> tar.<span class="ty">TypeReg</span>:
+			<span class="kw">if</span> err := writeFile(target, tr, hdr.<span class="ty">FileInfo</span>().<span class="ty">Mode</span>().<span class="ty">Perm</span>()); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> count, err
+			}
+
+		<span class="kw">case</span> tar.<span class="ty">TypeSymlink</span>:
+			<span class="cm">// シンボリックリンクの中身は検証しない（リンク先が外を指していても、</span>
+			<span class="cm">// 実際にそこへ書き込むときに safeJoin が弾く）。</span>
+			_ = os.<span class="ty">Remove</span>(target)
+			<span class="kw">if</span> err := os.<span class="ty">Symlink</span>(hdr.<span class="ty">Linkname</span>, target); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> count, err
+			}
+
+		<span class="kw">case</span> tar.<span class="ty">TypeLink</span>:
+			source, err := safeJoin(realDest, hdr.<span class="ty">Linkname</span>)
+			<span class="kw">if</span> err != <span class="kw">nil</span> {
+				<span class="kw">return</span> count, fmt.<span class="ty">Errorf</span>(<span class="st">"%w: ハードリンク先 %q"</span>, err, hdr.<span class="ty">Linkname</span>)
+			}
+			_ = os.<span class="ty">Remove</span>(target)
+			<span class="kw">if</span> err := os.<span class="ty">Link</span>(source, target); err != <span class="kw">nil</span> {
+				<span class="kw">return</span> count, err
+			}
+
+		<span class="kw">case</span> tar.<span class="ty">TypeChar</span>, tar.<span class="ty">TypeBlock</span>, tar.<span class="ty">TypeFifo</span>:
+			mode := <span class="kw">uint32</span>(hdr.<span class="ty">FileInfo</span>().<span class="ty">Mode</span>().<span class="ty">Perm</span>())
+			<span class="kw">switch</span> hdr.<span class="ty">Typeflag</span> {
+			<span class="kw">case</span> tar.<span class="ty">TypeChar</span>:
+				mode |= syscall.<span class="ty">S_IFCHR</span>
+			<span class="kw">case</span> tar.<span class="ty">TypeBlock</span>:
+				mode |= syscall.<span class="ty">S_IFBLK</span>
+			<span class="kw">case</span> tar.<span class="ty">TypeFifo</span>:
+				mode |= syscall.<span class="ty">S_IFIFO</span>
+			}
+			_ = os.<span class="ty">Remove</span>(target)
+			dev := <span class="kw">int</span>(mkdev(<span class="kw">uint32</span>(hdr.<span class="ty">Devmajor</span>), <span class="kw">uint32</span>(hdr.<span class="ty">Devminor</span>)))
+			<span class="kw">if</span> err := syscall.<span class="ty">Mknod</span>(target, mode, dev); err != <span class="kw">nil</span> {
+				<span class="cm">// 権限が無くてデバイスノードを作れないことはある。致命ではない。</span>
+				fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"警告: デバイスノードを作れませんでした (%s): %v\n"</span>, target, err)
+			}
+
+		<span class="kw">default</span>:
+			<span class="cm">// 未知の型は無視する（GNU の長名ヘッダなどは archive/tar が吸収済み）</span>
+			<span class="kw">continue</span>
+		}
+
+		<span class="kw">if</span> hdr.<span class="ty">Typeflag</span> != tar.<span class="ty">TypeSymlink</span> {
+			_ = os.<span class="ty">Chown</span>(target, hdr.<span class="ty">Uid</span>, hdr.<span class="ty">Gid</span>)
+		} <span class="kw">else</span> {
+			_ = os.<span class="ty">Lchown</span>(target, hdr.<span class="ty">Uid</span>, hdr.<span class="ty">Gid</span>)
+		}
+		count++
+	}
+
+	<span class="cm">// ディレクトリのパーミッションを後から当てる（深い順に）</span>
+	<span class="kw">for</span> i := <span class="kw">len</span>(dirs) - <span class="st">1</span>; i &gt;= <span class="st">0</span>; i-- {
+		_ = os.<span class="ty">Chmod</span>(dirs[i].path, dirs[i].mode)
+	}
+	<span class="kw">return</span> count, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>順に見ます。</p>
+
+    <p><strong><code>TypeDir</code>。</strong> <code>0o755</code> で作って、本来の <code>mode</code> は <code>dirs</code> に控えておきます。Step 6 で触れた「後で当て直す」ためです。</p>
+
+    <p><strong><code>TypeReg</code>。</strong> <code>writeFile</code> に <code>tr</code> をそのまま渡します。<code>archive/tar</code> の <code>Reader</code> は、現在のエントリの中身を読む <code>io.Reader</code> としてそのまま振る舞います。<code>io.Copy</code> がエントリの終わりで自然に止まってくれるので、サイズを自分で数える必要はありません。</p>
+
+    <p><strong><code>TypeSymlink</code>。</strong> ここが面白いところです。<strong>リンク先（<code>hdr.Linkname</code>）は検証していません。</strong> <code>foo -&gt; /</code> というリンクを、そのまま作ります。</p>
+
+    <p>危なく見えますが、正しいのです。理由は2つ。第一に、<strong>リンク先が展開先の外を指すこと自体は正当</strong>です。コンテナの中の <code>/bin/sh -&gt; /bin/busybox</code> のようなリンクは、展開先ディレクトリを基準にすれば「外」を指しています。コンテナが <code>pivot_root</code> した後の世界では正しく解決されます。ここで弾いたら、まともなイメージがほとんど展開できません。</p>
+
+    <p>第二に、<strong>危ないのはリンクを作ることではなく、リンクを通り抜けて書き込むこと</strong>です。そして通り抜けようとした瞬間に <code>safeJoin</code> の3段目が捕まえます。コメントの「実際にそこへ書き込むときに safeJoin が弾く」はこの意味です。<strong>防御を、危険が実現する一点に集中させている</strong>。</p>
+
+    <p><strong><code>TypeLink</code>（ハードリンク）。</strong> こちらは<strong>リンク先も <code>safeJoin</code> にかけます</strong>。シンボリックリンクと違い、ハードリンクは<strong>作った瞬間に相手の inode そのものを掴みます</strong>。<code>/etc/shadow</code> へのハードリンクを展開先に作られたら、レイヤのディレクトリ経由でホストの <code>/etc/shadow</code> が読めてしまう。しかもハードリンクは実体そのものなので、後から「通り抜けるとき」に捕まえる機会がありません。<strong>作る前に止めるしかない</strong>ので、ここで検証します。</p>
+
+    <p>シンボリックリンクは検証せず、ハードリンクは検証する——この非対称は、気まぐれではなく<strong>2つのリンクの性質の違いから来ています</strong>。</p>
+
+    <p><strong>デバイス・FIFO。</strong> <code>hdr.FileInfo().Mode().Perm()</code> でパーミッションを取り、型に応じて <code>S_IFCHR</code> / <code>S_IFBLK</code> / <code>S_IFIFO</code> を OR します。<code>mknod(2)</code> のモード引数は「ファイル種別 + パーミッション」を1つの整数に詰めたものなので、この OR が必要です。デバイス番号は <code>mkdev</code> で組み立てます。</p>
+
+    <p>ここでは失敗しても<strong>警告だけで続行</strong>します。デバイスノードの作成には特権が要り、非特権環境では必ず失敗するからです。そして<strong>デバイスノードが無くてもコンテナはたいてい動きます</strong>（<code>/dev</code> は起動時に別途用意します）。Step 6 のホワイトアウトの <code>Mknod</code> が<strong>エラーで止まる</strong>のと対照的ですが、これも理由があります。<strong>ホワイトアウトが作れないと、消えるべきファイルが見える＝正しさが壊れる。</strong> デバイスノードが作れないのは<strong>機能が1つ減るだけ</strong>。壊れ方の質が違います。</p>
+
+    <p><strong>所有者。</strong> <code>Chown</code> と <code>Lchown</code> を型で使い分けています。<code>Chown</code> はシンボリックリンクを辿るので、リンクに使うと<strong>リンク先の所有者を変えてしまいます</strong>。リンクそのものの所有者を変えるには <code>Lchown</code>。ここも「辿るか辿らないか」の違いです。エラーを <code>_</code> で捨てているのは、非 root で展開する場合に必ず失敗するからで、所有者が合わないことは致命ではありません。</p>
+
+    <p><strong>最後にディレクトリのパーミッションを当てる。</strong> <code>for i := len(dirs) - 1; i &gt;= 0; i--</code> と<strong>逆順</strong>に回しています。<code>dirs</code> には tar に現れた順（＝浅いものから深いものへ）で入っているので、逆順に回すと<strong>深いものから</strong>当たります。浅いディレクトリを先に <code>0555</code> にしてしまうと、その下のディレクトリを <code>chmod</code> できなくなるかもしれない。深い側から順に閉じていけば、その心配がありません。</p>
+
+    <p>最後に、デバイス番号を組み立てる小さな関数です。</p>
+
+    <div class="file-tag">internal/image/extract.go</div>
+<pre><code><span class="cm">// mkdev は major/minor からデバイス番号を組み立てる（Linux の makedev 相当）。</span>
+<span class="kw">func</span> mkdev(major, minor <span class="kw">uint32</span>) <span class="kw">uint64</span> {
+	<span class="kw">return</span> <span class="kw">uint64</span>(minor&amp;<span class="st">0xff</span>) | (<span class="kw">uint64</span>(major&amp;<span class="st">0xfff</span>) &lt;&lt; <span class="st">8</span>) |
+		((<span class="kw">uint64</span>(minor) &amp;^ <span class="st">0xff</span>) &lt;&lt; <span class="st">12</span>) | ((<span class="kw">uint64</span>(major) &amp;^ <span class="st">0xfff</span>) &lt;&lt; <span class="st">32</span>)
+}</code></pre>
+
+    <p>C の <code>makedev()</code> マクロをそのまま Go に書き写したものです。デバイス番号は「メジャーとマイナーを1つの整数にビットで詰め込んだもの」で、歴史的な事情から<strong>詰め方が飛び飛び</strong>になっています。マイナーの下位8ビットが最下位に、メジャーの下位12ビットがその上に、残りがさらに上に。<code>&amp;^</code> は Go 独自の AND NOT 演算子で、<code>x &amp;^ 0xff</code> は「下位8ビットを落とす」という意味です。</p>
+
+    <p>この式を暗記する必要はまったくありません。<strong>「デバイス番号は単なる整数のパックである」</strong>ことだけ分かっていれば十分です。ちなみに Step 6 で使った 0:0 は、この式に入れると当然 <code>0</code> になります。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 「弾いているはず」で済ませない</div>
+      <p>パス検証のコードは、<strong>正常なイメージを展開している限り一度も発動しません</strong>。だから書いた本人も、本当に効いているのか確かめないまま次に進みがちです。私も最初はそうでした。</p>
+      <p>E2E テストでは、<strong>細工した tar を実際に作って投入</strong>しています。絶対パスのエントリ、<code>..</code> で登るエントリ、そして手口3のシンボリックリンク2手。投入したうえで、<code>/tmp/mydocker-escaped-*.txt</code> という<strong>ファイルが作られていないこと</strong>をファイルの有無で確認します（テストの「<code>== 5. 取得したイメージの安全な展開 (FR-6) ==</code>」の節です）。</p>
+      <p>「エラーが返った」ではなく<strong>「外にファイルが無い」</strong>を見るのが肝心です。エラーを返しつつ書き込みは済んでいた、という失敗の仕方があり得るからです。<strong>守りのコードは、破ろうとして初めてテストになります。</strong></p>
+    </div>
+
+    <h2 class="step" id="step-8"><span class="step-no">Step 8</span>アンマウントの安全 — ここを間違えるとイメージが消える</h2>
+
+    <p>最後です。そして、この章で<strong>一番怖い</strong>話です。</p>
+
+    <p>コンテナを消す手順は、Step 4 で見たとおり2つです。<strong>①重ね合わせをアンマウントする。②<code>upper</code> と <code>work</code> を <code>rm -rf</code> する。</strong> 順番はこれ以外にありません。</p>
+
+    <p>では、①が失敗したのに②に進んだら、何が起きるでしょうか。</p>
+
+    <div class="ascii">アンマウントに失敗したまま rm -rf したときに起きること
+
+  【正しい順序】                        【①の失敗を無視した場合】
+
+   1. umount merged  ✓                   1. umount merged  ✗ EBUSY（無視した）
+   2. rm -rf merged upper work           2. rm -rf merged upper work
+                                                     │
+   merged は空のディレクトリに戻って                 │ merged はまだ overlay のまま
+   いるので、消えるのは入れ物だけ                    ▼
+                                          rm が merged の中を歩く
+   layers/sha256_…/  ← 無傷 ✓             = overlay 越しに **lowerdir の中身** を消しにいく
+                                                     ▼
+                                          layers/sha256_55afa1ecc21d…/ が空になる ✗✗✗
+                                          = **イメージのキャッシュが破壊される**
+                                          他のコンテナも、次の pull も、全部道連れ</div>
+
+    <p><code>rm -rf merged</code> は、<code>merged</code> が「重ね合わせの窓」であることを知りません。ただディレクトリを歩いて、見えるファイルを消していきます。<strong>その窓の向こうにあるのは <code>lowerdir</code> の実体、つまり全コンテナが共有しているイメージです。</strong></p>
+
+    <p>しかも overlayfs のルール上、<code>merged</code> 越しの削除は本来なら「上層にホワイトアウトを作る」だけのはずです。しかし <code>upper</code> と <code>work</code> も同時に <code>rm -rf</code> の対象になっているので、削除の途中で <code>upper</code> が消え、overlayfs の整合性が崩れ、その先で何が起きるかは<strong>順序次第</strong>になります。運が悪ければ下層まで届きます。<strong>「たぶん大丈夫」で済ませてよい種類の話ではありません。</strong></p>
+
+    <p>そして厄介なのは、<strong><code>umount</code> は日常的に失敗する</strong>ということです。特別な異常事態ではありません。</p>
+
+    <ul>
+      <li>コンテナのプロセスがまだ生きている（<code>merged</code> を根にしているので当然使用中）</li>
+      <li>自分のシェルの作業ディレクトリが <code>merged</code> の中にある（<code>cd</code> したまま忘れた）</li>
+      <li>そのファイルシステム上のファイルを誰かが開いたままにしている</li>
+      <li><code>merged</code> の下にさらに別のマウント（<code>/proc</code> など）が残っている</li>
+    </ul>
+
+    <p>どれも普通に起きます。返ってくるのは <code>EBUSY</code>（device or resource busy）。<strong>この <code>EBUSY</code> を握りつぶすと、イメージが消えます。</strong></p>
+
+    <p><code>Unmount</code> の全文です。コメントに、今の話がそのまま書いてあります。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go</div>
+<pre><code><span class="cm">// Unmount は重ね合わせを外す。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ umount は EBUSY（デバイスが使用中）で日常的に失敗する。</span>
+<span class="cm">// コンテナのプロセスが残っていたり、シェルの作業ディレクトリがその中だったりするだけで起きる。</span>
+<span class="cm">// ここでエラーを握りつぶして呼び出し元が rm -rf に進むと、</span>
+<span class="cm">// **マウント越しに lowerdir の実体（＝イメージの中身）まで消える。**</span>
+<span class="cm">// だから失敗は必ずエラーとして返す。呼び出し元は削除に進んではいけない。</span>
+<span class="kw">func</span> (m *<span class="ty">Mount</span>) <span class="ty">Unmount</span>() <span class="kw">error</span> {
+	<span class="kw">if</span> err := syscall.<span class="ty">Unmount</span>(m.<span class="ty">Merged</span>, <span class="st">0</span>); err != <span class="kw">nil</span> {
+		<span class="cm">// MNT_DETACH は「今すぐ切り離し、参照が切れたら実際に外す」遅延アンマウント。</span>
+		<span class="cm">// EBUSY のときの最後の手段として一度だけ試す。</span>
+		<span class="kw">if</span> err2 := syscall.<span class="ty">Unmount</span>(m.<span class="ty">Merged</span>, syscall.<span class="ty">MNT_DETACH</span>); err2 != <span class="kw">nil</span> {
+			<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"overlay を外せませんでした (%s): %w"</span>, m.<span class="ty">Merged</span>, err)
+		}
+	}
+	<span class="cm">// ★本当に外れたかを確認してからでなければ、呼び出し元は削除に進んではいけない。</span>
+	<span class="kw">if</span> <span class="ty">IsMountPoint</span>(m.<span class="ty">Merged</span>) {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"overlay がまだマウントされたままです: %s"</span>, m.<span class="ty">Merged</span>)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>3段構えになっています。</p>
+
+    <p><strong>1段目: 普通の <code>umount</code>。</strong> <code>syscall.Unmount(m.Merged, 0)</code>。うまくいけばこれで終わりです。</p>
+
+    <p><strong>2段目: <code>MNT_DETACH</code> で遅延アンマウント。</strong> これは「<strong>今すぐ名前空間のツリーから切り離す。実際の解除は、最後の参照が消えたときに行う</strong>」という指定です（<code>umount -l</code> と同じ）。使用中でも切り離せます。</p>
+
+    <p>これを<strong>1回だけ</strong>試すのがミソです。<code>MNT_DETACH</code> は便利ですが、<strong>問題を先送りするだけ</strong>でもあります。切り離しても、プロセスがまだファイルを掴んでいれば実体は残り続けます。だから「最後の手段として一度だけ」。無限にリトライしたり、常用したりはしません。</p>
+
+    <p><strong>返すエラーは <code>err</code>（1回目のもの）で、<code>err2</code> ではない</strong>のも意図的です。人間が知りたいのは「<code>EBUSY</code> だった」という<strong>元の原因</strong>であって、「<code>MNT_DETACH</code> も駄目だった」という後始末の失敗ではありません。</p>
+
+    <p><strong>3段目: 本当に外れたかを確認する。</strong> ここが <code>Unmount</code> の一番大事な行です。</p>
+
+    <p><code>syscall.Unmount</code> が <code>nil</code> を返した——それでも <strong><code>IsMountPoint</code> で確かめます</strong>。「成功したと言っているのだから外れているはずだ」と信じません。<code>MNT_DETACH</code> で切り離した場合、システムコールは成功しますが<strong>実体はまだそこにある</strong>ことがあります。そのまま <code>rm -rf</code> に進めば、最初のシナリオに一直線です。</p>
+
+    <p>ここでエラーを返せば、呼び出し元は削除に進みません。<strong>コンテナのディレクトリは残りますが、イメージは無事です。</strong> ディスクに残骸が残るのと、全コンテナ共有のイメージが壊れるのとでは、被害の桁が違います。<strong>迷ったら、消さない側に倒す。</strong></p>
+
+    <p>その確認をする <code>IsMountPoint</code> は、驚くほど単純です。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go</div>
+<pre><code><span class="cm">// IsMountPoint はパスがマウントポイントかを返す。</span>
+<span class="cm">// 自分の st_dev と親ディレクトリの st_dev を比べる（mountpoint(1) と同じ考え方）。</span>
+<span class="kw">func</span> <span class="ty">IsMountPoint</span>(path <span class="kw">string</span>) <span class="kw">bool</span> {
+	<span class="kw">var</span> st, parent syscall.<span class="ty">Stat_t</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Lstat</span>(path, &amp;st); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	<span class="kw">if</span> err := syscall.<span class="ty">Lstat</span>(filepath.<span class="ty">Dir</span>(path), &amp;parent); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	<span class="kw">return</span> st.<span class="ty">Dev</span> != parent.<span class="ty">Dev</span>
+}</code></pre>
+
+    <p>原理はこうです。<code>stat</code> の結果には <code>st_dev</code>（そのファイルが乗っているデバイスの番号）が入っています。<strong>同じファイルシステムの中にあるものは、必ず同じ <code>st_dev</code> を持ちます。</strong></p>
+
+    <div class="ascii">st_dev の比較でマウントポイントを見分ける
+
+  【マウント中】                        【アンマウント後】
+
+   containers/a10f…/     st_dev = 8:1     containers/a10f…/     st_dev = 8:1
+     └ merged/           st_dev = 0:47      └ merged/           st_dev = 8:1
+                              ▲                                      ▲
+        親と違う → マウントポイント ✓        親と同じ → ただのディレクトリ ✓
+
+  ※ merged の中身が overlay になった瞬間、merged 自身の st_dev が
+     overlay の匿名デバイス番号に変わる。だから親と比べるだけで分かる。</div>
+
+    <p>ディレクトリに別のファイルシステムがマウントされると、<strong>そのディレクトリを <code>stat</code> したときに返るのはマウントされた側の情報</strong>になります。だから <code>merged</code> の <code>st_dev</code> は overlay のものになり、親ディレクトリ（普通のディスク上のディレクトリ）と違う値になる。アンマウントすれば元のディレクトリが見えるようになり、親と同じ値に戻ります。<strong>親子で <code>st_dev</code> を比べるだけでマウントポイントかどうかが分かる</strong>——これは <code>mountpoint(1)</code> コマンドがやっているのとまったく同じ判定です。</p>
+
+    <p><code>Stat</code> ではなく <code>Lstat</code> を使っているのは、パスがシンボリックリンクだった場合に<strong>辿らずにリンク自身</strong>を見るためです。リンクを辿ってしまうと、まったく別の場所のマウント状態を見て「外れている」と誤答しかねません。</p>
+
+    <p>エラー時に <code>false</code> を返す点は、少し議論の余地があります。<code>Lstat</code> が失敗するのはパスが存在しないときなので、「存在しない＝マウントポイントではない」は妥当です。ただし <code>Unmount</code> の文脈では、<strong><code>false</code> は「削除に進んでよい」という意味になります</strong>。そこは <code>Unmount</code> 側が <code>syscall.Unmount</code> の成否も見ているので、二重の関所として機能しています。</p>
+
+    <p>もう1つ、数えるための関数があります。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go</div>
+<pre><code><span class="cm">// CountMounts は /proc/mounts に現れる、指定の種類のマウント数を数える。</span>
+<span class="cm">// 「10回起動して10個残っていないか」を数えて確かめるために使う。</span>
+<span class="kw">func</span> <span class="ty">CountMounts</span>(fstype <span class="kw">string</span>) (<span class="kw">int</span>, <span class="kw">error</span>) {
+	b, err := os.<span class="ty">ReadFile</span>(<span class="st">"/proc/mounts"</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>, err
+	}
+	n := <span class="st">0</span>
+	<span class="kw">for</span> _, line := <span class="kw">range</span> strings.<span class="ty">Split</span>(<span class="kw">string</span>(b), <span class="st">"\n"</span>) {
+		f := strings.<span class="ty">Fields</span>(line)
+		<span class="kw">if</span> <span class="kw">len</span>(f) &gt;= <span class="st">3</span> &amp;&amp; f[<span class="st">2</span>] == fstype {
+			n++
+		}
+	}
+	<span class="kw">return</span> n, <span class="kw">nil</span>
+}</code></pre>
+
+    <p><code>/proc/mounts</code> の各行は空白区切りで「デバイス マウント先 種別 オプション dump pass」の6欄です。3欄目（<code>f[2]</code>）が種別なので、そこが <code>"overlay"</code> の行を数えれば張られている overlay の数が分かります。<code>len(f) &gt;= 3</code> の確認は、空行やちぎれた行で index out of range にならないためです。</p>
+
+    <p>この関数がなぜ大事か。<strong>リークは、静かに起きるからです。</strong> アンマウント漏れがあっても、その場では誰も困りません。<code>mydocker run</code> は普通に成功します。ただ <code>/proc/mounts</code> の行が1つずつ増えていく。100 回動かして初めて「なんか重い」と気付く。</p>
+
+    <p>だから<strong>「増えていないこと」を数で確かめる</strong>。<code>mydocker info</code> の「overlay 数」も、E2E の「前 0 件 → 後 0 件」も、この関数の戻り値です。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>umount</code> の失敗を無視して <code>rm -rf</code> に進む</div>
+      <p>この章で唯一、<strong>取り返しのつかない</strong>落とし穴です。他の間違いは動かないか変な挙動になるだけですが、これは<strong>データを消します</strong>。しかも消えるのは自分のコンテナのデータではなく、<strong>全コンテナが共有しているイメージのキャッシュ</strong>です。</p>
+      <p>典型的なコードはこう書かれます。「後片付けはベストエフォートでいいや」という気持ちで。</p>
+      <p><code>_ = m.Unmount()</code> の次の行に <code>os.RemoveAll(base)</code>。これだけです。<strong><code>_ =</code> が付いた瞬間に地雷になります。</strong></p>
+      <p>規律は3つ。①<code>Unmount</code> は必ずエラーを返す。②呼び出し元はエラーなら<strong>削除に進まずそこで戻る</strong>。状態ファイルも残して人間が調べられるようにする。③削除の直前に<strong>もう一度</strong>マウント状態を確認する（<code>RemoveRecord</code> がやっています）。</p>
+      <p>「残骸が残るのは格好悪い」と思うかもしれません。<strong>残骸は人間が消せます。消えたイメージは戻りません。</strong></p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>実行中のコンテナに <code>rm</code> をかけると、削除の前に止まります。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker rm 0c1be9ad663a
+<span class="out">mydocker: コンテナ 0c1be9ad663a はまだ実行中です。先に終了させてください</span></code></pre>
+      <p>逆に、mydocker 自身を <code>SIGKILL</code> して<strong>後片付けが走らなかった</strong>状況を作ると、overlay が1つ残ります。<code>mydocker ps</code> は 0 件と言っているのに、<code>mount</code> には残っている——これが「リーク」の見え方です。そして <code>rm</code> で回収できます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker ps
+<span class="out">CONTAINER ID   IMAGE   COMMAND   PID   STATUS   CREATED
+合計 0 件</span>
+<span class="ps">$</span> mount | grep -c overlay
+<span class="out">1</span>
+<span class="ps">$</span> mydocker rm f280be2460e3
+<span class="out">f280be2460e3</span>
+<span class="ps">$</span> mount | grep -c overlay
+<span class="out">0</span>
+</code></pre>
+      <p><code>1</code> → <code>0</code>。この数字が戻ることを、目で確かめられるようにしておくのが大事です。<strong>数えられないものは、漏れていても気付けません。</strong></p>
+    </div>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary><code>mount -t overlay</code> が invalid argument で失敗します。どこから見ればいいですか?</summary>
+      <div class="qa-body">
+        <p>overlayfs のマウント失敗はほぼ <code>EINVAL</code> で、<strong>カーネルは理由を教えてくれません</strong>。当たる順番を決めておくと速いです。</p>
+        <p><strong>①<code>workdir</code> は空か。</strong> 前回の残骸、特に <code>work/work/</code> が残っていると落ちます。<code>emptyDir</code> を通しているか確かめてください。<strong>②<code>workdir</code> と <code>upperdir</code> は同じファイルシステムか。</strong> <code>stat -fc %T</code> を両方に打って、種別が一致するか見ます。<strong>③<code>lowerdir</code> のパスは全部存在するディレクトリか。</strong> 綴り違い、digest の桁落ち、シンボリックリンク。<strong>④パスに <code>:</code> や <code>,</code> が混ざっていないか。</strong></p>
+        <p>それでも分からなければ <code>dmesg</code> の末尾を見てください。overlayfs はカーネルログに理由を書くことがあります。ユーザー空間には返ってこない情報がそこにだけ出ます。</p>
+        <p>あと一つ。<code>New</code> が返すエラーメッセージには <code>opts</code> 文字列がそのまま入っています。それをコピーして <code>mount -t overlay overlay -o &lt;その文字列&gt; /tmp/試し</code> と手で打つのが、結局いちばん速い切り分けです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>コンテナの中で作ったファイルは、ホストのどこにありますか? 直接見てもいいんですか?</summary>
+      <div class="qa-body">
+        <p><code>/var/lib/mydocker/containers/&lt;ID&gt;/upper/</code> の下に、コンテナから見たのと同じパス構造でそのままあります。コンテナが <code>/etc/foo</code> を作ったら <code>upper/etc/foo</code> です。<strong>普通のファイルなので、ホストから <code>cat</code> できます。</strong></p>
+        <p>見るだけなら問題ありません。デバッグでは非常に役に立ちます。「このコンテナは結局どのファイルを触ったのか」が <code>find upper -type f</code> で一望できます。</p>
+        <p><strong>書き換えるのは避けてください。</strong> overlayfs は「<code>upperdir</code> と <code>lowerdir</code> はマウント中に外部から変更されない」ことを前提にしています。マウント中に <code>upper</code> を横から書き換えると、カーネルのキャッシュと実体がずれて、コンテナから見える内容が不定になります。<strong>読むのは自由、書くのはアンマウント後。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>lowerdir</code> の順序が逆だと「更新が反映されない」とのことですが、どうやって気付けばいいですか?</summary>
+      <div class="qa-body">
+        <p>症状からは気付けません。<strong>見に行くしかない</strong>です。</p>
+        <p><code>grep overlay /proc/mounts</code> で自分のマウント行を出し、<code>lowerdir=</code> の値を <code>:</code> で分解してください。<strong>一番左に来ているのが、イメージの一番最後のレイヤ（＝最新の変更が入っている層）かどうか</strong>。ここが合っていれば順序は正しいです。</p>
+        <p>もう1つ確実な方法があります。<strong>同じファイルを2つのレイヤに置いて、中身を変えておく</strong>こと。E2E がやっているのがまさにこれで、下の層に <code>version.txt</code>（中身 <code>v1</code>）、上の層に <code>version.txt</code>（中身 <code>v2</code>）を置きます。重ねて <code>v2</code> が見えれば正しい。<code>v1</code> が見えたら逆さまです。この「対照」を1つ用意しておくだけで、順序のバグは一生踏まなくなります。</p>
+        <p>ちなみに alpine のようにレイヤが<strong>1枚</strong>のイメージでは、逆順にしても同じ文字列になるので<strong>バグが表に出ません</strong>。1枚のイメージだけでテストしていると、この地雷は必ず後で踏みます。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>レイヤを展開したディレクトリの中に <code>.wh.</code> で始まるファイルがありました。これは正常ですか?</summary>
+      <div class="qa-body">
+        <p><strong>異常です。</strong> ホワイトアウトの翻訳が働いていない証拠です。</p>
+        <p>正しく翻訳されていれば、そこにあるのは <code>.wh.</code> という名前のファイルではなく、<strong>接頭辞を外した名前のキャラクタデバイス</strong>です。<code>ls -l</code> して行頭が <code>c</code>、サイズの欄が <code>0, 0</code> になっていれば正解。</p>
+        <p><code>.wh.foo</code> という 0 バイトの通常ファイルが見えているなら、①<code>ExtractLayer</code> のホワイトアウト判定を通っていない（<code>switch hdr.Typeflag</code> より後ろに置いてしまった、など）か、②そもそも他のツールで展開したディレクトリを使っている、のどちらかです。</p>
+        <p>opaque のほうは<strong>目に見えません</strong>。xattr なので <code>ls</code> には出ない。確かめるには <code>getfattr -n trusted.overlay.opaque -m - &lt;ディレクトリ&gt;</code> のように明示的に問い合わせる必要があります（<code>trusted.*</code> なので root で）。付いていないのに付いているつもりでいると「下層が透けて見える」不具合になるので、<code>ExtractLayer</code> は付けられなかったときに標準エラーへ警告を出します。<strong>その警告を見逃さないこと。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>シンボリックリンクのリンク先を検証しないのは、本当に安全なんですか? 怖いのですが。</summary>
+      <div class="qa-body">
+        <p>怖いのは正しい感覚です。ただ、この設計には理由があります。</p>
+        <p>まず、<strong>リンク先が展開先の外を指すこと自体は正常</strong>です。コンテナの中の <code>/bin/sh -&gt; /bin/busybox</code> は、展開先ディレクトリを基準にすれば「絶対パスで外」を指しています。コンテナが <code>pivot_root</code> した後の世界では正しく解決される。ここで弾いたら、まともなイメージがほぼ展開できません。</p>
+        <p>次に、<strong>リンクは「作られた」だけでは何も起こしません。</strong> 危険なのは、そのリンクを<strong>通り抜けて書き込む</strong>ときです。そして <code>safeJoin</code> の3段目が、書き込む直前に <code>EvalSymlinks</code> で親の実体を確かめる。<strong>危険が実現するその一点に、防御を集中させている</strong>わけです。</p>
+        <p>対照的に、ハードリンク（<code>TypeLink</code>）は<strong>作った瞬間に相手の inode を掴みます</strong>。後から止める機会がないので、作る前に <code>safeJoin</code> にかけています。この非対称は、2つのリンクの性質の違いから来ています。</p>
+        <p>限界も正直に書いておきます。<code>EvalSymlinks</code> による検査は TOCTOU に対して完璧ではありません。厳密にやるなら <code>openat2(2)</code> の <code>RESOLVE_BENEATH</code> です。<strong>限界を知って使っているかどうか</strong>が、この種のコードでは大きな差になります。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>MNT_DETACH</code> があるなら、最初からそれを使えばよくないですか?</summary>
+      <div class="qa-body">
+        <p>楽なのですが、<strong>問題を隠すだけ</strong>になります。</p>
+        <p><code>MNT_DETACH</code>（<code>umount -l</code>）は「名前空間のツリーからは今すぐ外す。実際の解除は最後の参照が消えたとき」という指定です。<strong>システムコールは成功します。</strong> でも、ファイルを掴んでいるプロセスが生きている限り、実体は残り続けます。</p>
+        <p>これを常用すると何が起きるか。「アンマウントは常に成功する」ので、<strong>後片付けが漏れていることに永久に気付けません</strong>。<code>mount</code> の出力からは消えるので、数えても分かりません。裏でファイルシステムが積み上がっていきます。</p>
+        <p>だから mydocker では、<strong>普通の <code>umount</code> を先に試し、失敗したときの最後の手段として1回だけ</strong> <code>MNT_DETACH</code> を使います。そして<strong>どちらの経路を通っても最後に <code>IsMountPoint</code> で確認する</strong>。「成功した」と「外れた」を別のこととして扱うのがこの関数の設計です。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>copy-up されたファイルは、コンテナを消したら本当に全部消えますか? 一部残ったりしませんか?</summary>
+      <div class="qa-body">
+        <p>全部消えます。<strong>overlayfs は、書き込みを <code>upperdir</code> の外に漏らしません。</strong> これは実装の丁寧さではなく、構造からの帰結です。<code>lowerdir</code> は読み取り専用としてマウントされているので、書き込む経路が存在しません。</p>
+        <p>ただし<strong>overlay の外に出た書き込みは別</strong>です。コンテナが <code>/proc</code> や <code>/sys</code> や <code>/dev</code>（tmpfs）に書いたものは <code>upperdir</code> に入りません。それらは別のマウントだからです。<code>-v</code> でホストのディレクトリをバインドマウントしたら、当然その先に直接書かれます。</p>
+        <p>つまり正確に言えば、「<strong>overlay 越しの書き込みは全部 <code>upperdir</code> に溜まる</strong>」です。この境界を意識しておくと、「消したはずのデータがどこかに残っている」という事故を防げます。</p>
+      </div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。答えを読んで「知っていた」と思ったら、<strong>もう一度、口に出して説明できるか</strong>を試してみてください。</p>
+
+    <details class="qa"><summary>Q1. <code>lowerdir=A:B:C</code> と書いたとき、A・B・C のどれが「上」ですか? そしてイメージのレイヤ配列をそのまま繋いではいけないのはなぜですか?</summary>
+      <div class="qa-body">
+        <p><strong>A が一番上（最優先）</strong>です。<code>lowerdir</code> は<strong>左が上</strong>。</p>
+        <p>一方、イメージのマニフェストの <code>layers</code> 配列は「<strong>後のものほど上</strong>」です。<code>layers[0]</code> がベースで、その上に順に積まれる。つまり<strong>両者は逆向き</strong>なので、配列をそのまま <code>:</code> で繋ぐと上下が引っくり返ります。</p>
+        <p><code>New</code> はこれを <code>rev</code> のループで反転してから <code>strings.Join</code> します。呼び出し元は人間の直感どおり「下から上の順」で渡せばよく、逆転の知識は <code>New</code> の中に閉じ込められています。</p>
+        <p>間違えたときの症状が<strong>エラーではなく「更新が反映されていないように見える」</strong>ことも、セットで覚えてください。これが一番怖いところです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q2. <code>workdir</code> の2つの制約は何ですか? それぞれ破るとどうなり、mydocker はそれをどう満たしていますか?</summary>
+      <div class="qa-body">
+        <p><strong>制約1: <code>upperdir</code> と同じファイルシステム上にあること。</strong> copy-up の実装が <code>workdir</code> 内の一時ファイルを <code>upperdir</code> へ <code>rename</code> で移すからで、<code>rename(2)</code> はファイルシステムをまたげません（<code>EXDEV</code>）。破ると <code>mount</code> が <code>EXDEV</code> / <code>EINVAL</code> で失敗します。</p>
+        <p><strong>制約2: 空であること。</strong> 前回の残骸があると <code>EINVAL</code> で失敗します。</p>
+        <p>mydocker は、制約1を<strong>配置で</strong>満たしています。<code>filepath.Join(base, "upper")</code> と <code>filepath.Join(base, "work")</code> と、必ず同じ <code>base</code> の下に並べるので、どんな <code>base</code> でも自動的に同居します。制約2は<strong>コードで</strong>——<code>emptyDir(m.Work)</code> を <code>syscall.Mount</code> の直前に必ず通します。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q3. 「コンテナを消す」とは、具体的にどのディレクトリに何をすることですか? そのときイメージには何が起きますか?</summary>
+      <div class="qa-body">
+        <p><strong>①<code>merged</code> をアンマウントする。②<code>upper</code> と <code>work</code> を削除する。</strong> これだけです。</p>
+        <p>イメージには<strong>何も起きません。指一本触れていません。</strong> <code>lowerdir</code> は読み取り専用としてマウントされていたので、そもそも一度も書かれていない。ロールバックもトランザクションも要らないのは、<strong>元に戻す必要がないから</strong>です。</p>
+        <p>コンテナが書いたものは、copy-up されたファイルも新規作成したファイルも削除の印も、<strong>すべて <code>upperdir</code> の下</strong>にあります。だからそこを1つ消せば、コンテナは跡形もなく消える。<strong>これが「使い捨て」の実装です。</strong></p>
+        <p>順序が①→②である理由も一緒に言えたら完璧です（Q6 で扱います）。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q4. tar の中の <code>.wh.foo</code> を普通のファイルとして展開すると、何が2つ起きますか? 正しくはどう翻訳しますか?</summary>
+      <div class="qa-body">
+        <p><strong>①消えるべき <code>foo</code> が残ります。</strong> 下層の <code>foo</code> はそのままなので、重ね合わせると見えてしまいます。<strong>②変な名前のファイルが増えます。</strong> <code>.wh.foo</code> という 0 バイトのファイルがコンテナの中に見えます。</p>
+        <p>正しくは、<strong><code>foo</code> の位置にキャラクタデバイス 0:0 を作ります</strong>（<code>syscall.Mknod(victim, syscall.S_IFCHR|0o000, 0)</code>）。overlayfs はこれを「削除された」印として扱い、下層の同名ファイルを隠します。</p>
+        <p>ディレクトリ丸ごとの <code>.wh..wh..opq</code> は、<strong>その親ディレクトリに xattr <code>trusted.overlay.opaque="y"</code> を付けます</strong>。ディレクトリ自体は残したまま、下層の中身だけを隠したいので、実体ではなくメタデータに印を置きます。</p>
+        <p>そして「なぜ削除ではなく翻訳なのか」——<strong>レイヤは独立したキャッシュでなければならないから</strong>。展開している時点で下層は手元に無いかもしれないし、あっても触ってはいけません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q5. エントリ名に <code>/</code> も <code>..</code> も含まないのに、展開先の外にファイルを作らせる手口を説明してください。どう防ぎますか?</summary>
+      <div class="qa-body">
+        <p><strong>2手に分けます。</strong></p>
+        <p>1手目に <code>foo -&gt; /</code> というシンボリックリンクを置く。名前は <code>foo</code> だけなので、絶対パス検査も <code>..</code> 検査も通ります。2手目に <code>foo/etc/passwd</code> を書く。この名前も絶対パスでも <code>..</code> でもない。しかし <code>dest/foo</code> は <code>/</code> を指しているので、<strong>実際の書き込み先は本物の <code>/etc/passwd</code></strong> です。</p>
+        <p>どちらの手も単体では完全に無害で、<strong>組み合わせだけが有害</strong>。だからエントリ名を1つずつ眺めていても永遠に見つかりません。</p>
+        <p>防ぎ方は<strong>3段目の検査</strong>——書き込む直前に <code>filepath.EvalSymlinks(parent)</code> で<strong>親ディレクトリの実体</strong>を求め、それが <code>realDest</code> の内側かを確かめます。文字列ではなく<strong>ファイルシステムに聞く</strong>のがポイントです。</p>
+        <p>加えて、書き込みそのものでも <code>O_TRUNC</code> を使わず<strong>必ず一度 <code>os.Remove</code> してから <code>O_EXCL</code> で作ります</strong>。<code>target</code> 自身がリンクだった場合、<code>O_TRUNC</code> で開くとリンク先に書いてしまうからです。<code>os.Remove</code> はリンクを辿らずリンク自身を消します。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q6. <code>umount</code> の失敗を握りつぶして <code>rm -rf</code> に進むと、なぜイメージが消えるのですか?</summary>
+      <div class="qa-body">
+        <p><code>merged</code> がまだマウントされたままなので、<code>rm -rf merged</code> は<strong>重ね合わせの窓の中を歩きます</strong>。その窓の向こうにあるのは <code>lowerdir</code> の実体、つまり<strong>全コンテナが共有しているイメージのキャッシュ</strong>です。<code>rm</code> は自分がどこを消しているか知りません。</p>
+        <p>しかも <code>upper</code> と <code>work</code> も同時に消えていくので、削除の途中で overlayfs の整合性が崩れ、その先は順序次第になります。<strong>運が悪ければ下層まで届きます。</strong></p>
+        <p>そして <code>umount</code> は<strong>日常的に失敗します</strong>。コンテナのプロセスが残っている、シェルの作業ディレクトリがその中にある、誰かがファイルを開いたまま——どれも <code>EBUSY</code> です。特別な異常事態ではありません。</p>
+        <p>だから <code>Unmount</code> は、失敗を必ずエラーとして返し、<strong>成功した場合でも <code>IsMountPoint</code> で本当に外れたかを確認します</strong>（<code>MNT_DETACH</code> はシステムコールとしては成功しても実体が残ることがあるため）。呼び出し元はエラーなら削除に進まずそこで戻る。<strong>残骸は人間が消せますが、消えたイメージは戻りません。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q7. <code>IsMountPoint</code> は、どうやってマウントポイントかどうかを見分けていますか?</summary>
+      <div class="qa-body">
+        <p><strong>自分の <code>st_dev</code> と、親ディレクトリの <code>st_dev</code> を比べています。</strong> 違えばマウントポイント、同じならただのディレクトリ。</p>
+        <p>原理はこうです。<code>st_dev</code> は「そのファイルが乗っているファイルシステムの識別子」で、<strong>同じファイルシステムの中では必ず同じ値</strong>になります。ディレクトリに別のファイルシステムがマウントされると、そのディレクトリを <code>stat</code> したときに返るのは<strong>マウントされた側</strong>の情報になるので、親と値が食い違います。アンマウントすれば元に戻り、親と一致します。</p>
+        <p>これは <code>mountpoint(1)</code> コマンドとまったく同じ考え方です。<code>/proc/mounts</code> を文字列で検索するより、<strong>2回の <code>stat</code> で済むぶん確実</strong>です（パスの表記ゆれやエスケープに悩まされません）。</p>
+        <p><code>Stat</code> ではなく <code>Lstat</code> なのは、パスがシンボリックリンクだったときに辿らずリンク自身を見るためです。</p>
+      </div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>4つのディレクトリを作って、手で1回 overlay を張れればこの章は完了です。<code>mount</code> の出力に <code>lowerdir</code> / <code>upperdir</code> / <code>workdir</code> の3つが並び、その意味と制約を自分の言葉で説明できること。</p>
+      <pre class="term"><code><span class="ps">$</span> mount -t overlay overlay -o lowerdir=/tmp/ovl/lower,upperdir=/tmp/ovl/upper,workdir=/tmp/ovl/work /tmp/ovl/merged
+<span class="ps">$</span> mount | grep overlay
+<span class="out">overlay on /tmp/ovl/merged type overlay (rw,relatime,lowerdir=/tmp/ovl/lower,upperdir=/tmp/ovl/upper,workdir=/tmp/ovl/work,uuid=on)</span></code></pre>
+      <p>そして mydocker 側では、コンテナを起動して <code>/proc/mounts</code> に同じ形の行が現れ、終了すると<strong>消えていること</strong>を確かめてください。<code>mydocker info</code> の「overlay 数」が起動前と終了後で同じ値に戻れば、後片付けは効いています。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker info
+<span class="out">状態の置き場: /var/lib/mydocker
+資源制限:     cgroup v1 (/sys/fs/cgroup, 利用可能: memory cpu pids)
+overlayfs:    利用可能
+overlay 数:   0 件
+実行中:       0 件</span></code></pre>
+      <p>最後に、遊びを1つ。<code>/tmp/ovl/merged</code> の中でファイルを作ったり、<code>lower</code> にあるファイルを書き換えたりしてから、<code>/tmp/ovl/upper</code> を覗いてみてください。<strong>触ったものだけがそこに現れている</strong>のが見えます。それが copy-up です。</p>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>この章で、コンテナの<strong>「使い捨て」の正体</strong>を手に入れました。読み取り専用のレイヤを何枚も重ね、その上に書き込み用の板を1枚だけ載せる。読むときは上から探し、書くときは copy-up して上の板に置く。だから<strong>コンテナを消すというのは、<code>upperdir</code> を捨てるだけのこと</strong>で、イメージには最初から一度も書いていない。素朴案の「起動のたびに 8.7 MB コピー」が、「書いたぶんだけ」に変わりました。あわせて、この重ね合わせを成立させるための地味な作法も全部見ました。<code>lowerdir</code> は左が上だから並べる順を逆にすること。<code>workdir</code> は <code>upperdir</code> と同じファイルシステム上で、かつ空であること。tar の中の <code>.wh.</code> は普通に展開せず、キャラクタデバイス 0:0 と <code>trusted.overlay.opaque</code> に翻訳すること。他人が作った tar は3段で検証し、書き込みは必ず <code>Remove</code> してから <code>O_EXCL</code> で作ること。そして——<code>umount</code> の失敗は絶対に握りつぶさないこと。</p>
+
+    <p>ところが、いま私たちが持っているのは<strong>まだ <code>run</code> だけ</strong>です。コンテナは起動します。隔離されます。上限もかかります。イメージも取ってきて重ねられます。……それだけです。<strong>いま何が動いているのかを一覧できません。</strong> 起動したコンテナに後から入って様子を見ることもできません。プロセスを走らせたまま別の作業をしたいのに、それを管理する仕組みがない。そして何より、<strong>後片付けが漏れれば静かにホストが埋まっていきます</strong>。この章で <code>CountMounts</code> を書いて「数えられるようにした」のは、まさにその予感があったからです。マウントが1つ残り、ディレクトリが1つ残り、cgroup が1つ残る。どれもその場では誰も困らない。100 回動かして初めて気付く。<strong>道具として使うには、状態を持ち、それを見せ、確実に片付ける仕組みが要ります。</strong></p>
+
+    <p>次章で、これを<strong>道具にします</strong>。コンテナ1つにつき状態ファイルを1つ持ち、<code>mydocker ps</code> で一覧し、<code>mydocker exec</code> で動いているコンテナの中に入り、<code>mydocker rm</code> で確実に回収する。CLI の設計と状態管理、そして<strong>後片付けを正面から</strong>扱います。「アンマウントが失敗したら削除に進まない」というこの章の規律が、そこで呼び出し元の側からもう一度出てきます。ばらばらに作った部品が、ここで1つのコマンドラインツールになります。</p>
+
+    <div class="chap-foot">
+      <a class="pager" href="05-registry.html"><span class="dir">← 前へ</span>第05章 · イメージを取ってくる</a>
+      <a class="pager next" href="07-cli.html"><span class="dir">次へ →</span>第07章 · 道具にする</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
