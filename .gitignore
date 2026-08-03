@@ -1,0 +1,2 @@
+# ビルド成果物（src/ の中で go build した実行ファイル）
+/src/mydocker

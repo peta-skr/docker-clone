@@ -1,0 +1,48 @@
+# mydocker の開発環境 — 「Docker を作るために Docker を使う」
+#
+# コンテナランタイムは Linux カーネルの機能（namespace / cgroup / overlayfs / pivot_root）
+# そのものなので、Windows でも macOS でもネイティブには一行も動かない。
+# そこで特権付きの Linux コンテナを1つ立て、その中で開発・ビルド・実行・テストを行う。
+#
+#   docker compose -f src/devcontainer/docker-compose.yml run --rm dev
+#
+# で開発シェルに入る。以降の作業はすべてこのシェルの中で行うこと。
+
+services:
+  dev:
+    image: golang:1.24-bookworm
+
+    # ★ここが要。これが無いと mount も pivot_root も cgroup の書き込みも EPERM で落ちる。
+    #   privileged は「ホストとほぼ同じ権限」を意味する。開発用途に限って使うこと。
+    privileged: true
+
+    # cgroup の階層をホストと共有し、書き込み可能にする。
+    # 読み取り専用でマウントされると /sys/fs/cgroup 配下にディレクトリを作れない。
+    cgroup: host
+
+    # pivot_root は「新しい root がマウントポイントであること」を要求する。
+    # コンテナの / が overlay のままでも動くが、実験中に何度もマウントするので
+    # /var/lib/mydocker は名前付きボリュームに逃がしておくと後片付けが楽になる。
+    volumes:
+      - ../..:/work            # リポジトリ全体をマウント（src/ も docs/ も見える）
+      - mydocker-state:/var/lib/mydocker
+
+    working_dir: /work/src
+
+    # マウントの伝播を private にしておく。
+    # 既定の shared のままだと、コンテナ内のマウントがホストへ漏れることがある。
+    tmpfs:
+      - /run
+
+    environment:
+      # Go のビルドキャッシュをボリュームに置かないと、毎回フルビルドになる
+      - GOCACHE=/var/lib/mydocker/.gocache
+      - GOFLAGS=-buildvcs=false
+
+    # 何もしないで待つのではなく、シェルを開く
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+
+volumes:
+  mydocker-state:
