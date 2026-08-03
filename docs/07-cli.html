@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第07章 道具にする — コンテナをつくる</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Noto+Serif+JP:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="spine">
+    <a class="wordmark" href="index.html">MYDOCKER · from scratch</a>
+    <div class="book-title">コンテナを<br>つくる</div>
+    <div class="book-sub">Go と Linux カーネルで Docker を再発明する</div>
+
+    <div class="legend"><span>読む <b>↓</b></span><span>組む <b>↑</b></span></div>
+
+    <nav aria-label="目次">
+      <ul class="toc">
+        <li><a class="nav-item" href="index.html"><span class="nav-num">序</span><span class="nav-label">はじめに・準備<span class="nav-tag">Setup</span></span></a></li>
+        <li><a class="nav-item" href="00-env.html"><span class="nav-num">00</span><span class="nav-label">Linux の中に入る<span class="nav-tag">Env</span></span></a></li>
+        <li><a class="nav-item" href="01-reexec.html"><span class="nav-num">01</span><span class="nav-label">自分をもう一度起動する<span class="nav-tag">Reexec</span></span></a></li>
+        <li><a class="nav-item" href="02-namespace.html"><span class="nav-num">02</span><span class="nav-label">見える世界を区切る<span class="nav-tag">Namespace</span></span></a></li>
+        <li><a class="nav-item" href="03-pivotroot.html"><span class="nav-num">03</span><span class="nav-label">根を挿げ替える<span class="nav-tag">Root</span></span></a></li>
+        <li><a class="nav-item" href="04-cgroup.html"><span class="nav-num">04</span><span class="nav-label">資源に上限をかける<span class="nav-tag">Cgroup</span></span></a></li>
+        <li><a class="nav-item" href="05-registry.html"><span class="nav-num">05</span><span class="nav-label">イメージを取ってくる<span class="nav-tag">Registry</span></span></a></li>
+        <li><a class="nav-item" href="06-overlay.html"><span class="nav-num">06</span><span class="nav-label">層を重ねる<span class="nav-tag">Layer</span></span></a></li>
+        <li><a class="nav-item current" aria-current="page" href="07-cli.html"><span class="nav-num">07</span><span class="nav-label">道具にする<span class="nav-tag">CLI</span></span></a></li>
+        <li><a class="nav-item" href="08-network.html"><span class="nav-num">08</span><span class="nav-label">外とつながる<span class="nav-tag">Network</span></span></a></li>
+        <li><a class="nav-item" href="09-beyond.html"><span class="nav-num">09</span><span class="nav-label">さらに先へ<span class="nav-tag">Beyond</span></span></a></li>
+      </ul>
+    </nav>
+
+    <div class="spine-foot">
+      各章は一つの層。<br>隔離する → 根を替える → 締める<br>→ 取ってくる → 重ねる、の順に積む。
+    </div>
+  </aside>
+
+  <main class="reading">
+    <div class="progress-tag">第07章 / 全10章 · 層: CLI · 読了目安 3〜4時間</div>
+    <div class="eyebrow"><span>CLI</span><span class="depth">— 後片付けまでが仕事</span></div>
+    <h1>道具にする</h1>
+    <p class="lede">ここまでの 6 章で、コンテナは「起動して、終わる」ところまで来ました。けれど今できるのは <code>run</code> だけです。今いくつ動いているのかも分からず、動いているものの中を覗くこともできず、そして——これが本当の問題なのですが——<strong>片付け損ねたマウントが、誰にも気づかれないままホストに溜まっていきます</strong>。この章で <code>run</code> を「道具」に変えます。</p>
+
+    <div class="box goal"><div class="box-k">◈ この章のゴール</div>
+      <p><code>cmd/mydocker/main.go</code>・<code>internal/cli/cli.go</code>・<code>internal/container/state.go</code> を読み切り、<strong>実行中のコンテナをどこに、何を、なぜ記録するのか</strong>を自分の言葉で説明できるようになる。そのうえで <code>internal/container/run.go</code> の <code>Cleanup</code> を読み、<strong>「アンマウント → 削除」の順序を崩すと何が消えるのか</strong>を理解する。仕上げに、<strong>コンテナを 10 回起動しても overlay のマウント数が増えていないことを、数えて確かめる</strong>。</p>
+    </div>
+
+    <div class="box map"><div class="box-k">☰ この章のステップ</div>
+      <ol>
+        <li><a href="#step-1">入り口を薄く保つ</a></li>
+        <li><a href="#step-2">サブコマンドの振り分け</a></li>
+        <li><a href="#step-3">実行中コンテナをどこに記録するか</a></li>
+        <li><a href="#step-4">PID は再利用される</a></li>
+        <li><a href="#step-5"><code>ps</code> を作る</a></li>
+        <li><a href="#step-6"><code>exec</code> を作る</a></li>
+        <li><a href="#step-7">★後片付け — この章の本番</a></li>
+        <li><a href="#step-8">リークを数えて確かめる</a></li>
+        <li><a href="#step-9">強制終了された場合</a></li>
+        <li><a href="#step-10">終了コードの翻訳</a></li>
+        <li><a href="#step-11">dead code の検査</a></li>
+      </ol>
+    </div>
+
+    <h2>「動く」と「道具になっている」の間</h2>
+
+    <p>前章の終わりで、私たちはこう打てるようになりました。</p>
+
+<pre class="term"><code><span class="ps">$</span> mydocker run alpine /bin/sh</code></pre>
+
+    <p>これは確かに動きます。動きますが、道具ではありません。試しに、こういう場面を想像してみてください。あなたはこのコンテナを起動したまま、別の端末を開きました。さて——<strong>今どのコンテナが動いていますか?</strong> 答えられません。どこにも書いていないからです。</p>
+
+    <p>コンテナの中でファイルがおかしいので中を覗きたい。<strong>覗けません。</strong>そのコンテナの名前空間に入る手段がないからです。</p>
+
+    <p>さらに悪いことがあります。コンテナを起動するたびに、ホストのマウント表に overlay のマウントが 1 行増えます。正常に終われば消えます。けれど <strong>ホストを再起動せずに 100 回起動して 3 回だけ片付けに失敗していたら、そのことに誰も気づきません</strong>。マウントは目に見えないところに積み上がり、ある日ディスクが埋まるか、アンマウントできないディレクトリの山になって現れます。</p>
+
+    <div class="ascii">「動く」と「道具になっている」の距離
+
+  ここまで（第01〜06章）            この章で足すもの
+  ─────────────────────         ──────────────────────────
+  run できる                        run に加えて
+                                     ps    … 今何が動いているか
+  終わったら消える（はず）           exec  … 動いているものの中に入る
+     ↑                               rm    … 残骸を安全に回収する
+     └ 「はず」を確かめる手段が       info  … この環境で何が使えるか
+        1つも無かった                        ＋ overlay の件数を実数で
+
+  つまり足すのは「機能」ではなく
+  ★状態を持つこと と ★状態を後始末すること</div>
+
+    <p>この章で足すものの正体は、突き詰めると 2 つだけです。<strong>実行中のコンテナの記録を持つこと</strong>と、<strong>その記録と実体を安全に消すこと</strong>。<code>ps</code> も <code>exec</code> も <code>rm</code> も、この 2 つの上に乗った薄い皮にすぎません。</p>
+
+    <p>そして厄介なのは後者です。「消す」というのは、プログラムが行う操作のなかで<strong>いちばん取り返しがつかない</strong>ものだからです。この章の後半では、順序をひとつ間違えるだけで <em>イメージの実体が丸ごと消える</em> という実話を扱います。</p>
+
+    <h2>状態はどこに置くのか</h2>
+
+    <p>「実行中のコンテナを記録する」と言ったとき、置き場所の候補はいくつかあります。メモリの中（＝プロセスが死んだら消える）、データベース、ファイル。<code>mydocker</code> はいちばん素朴な<strong>ファイル</strong>を選びました。理由は 2 つあります。</p>
+
+    <p>1 つ目。<code>mydocker ps</code> は <code>mydocker run</code> とは<strong>別のプロセス</strong>です。別の端末から打たれます。メモリの中に持っていては、そもそも読めません。プロセスをまたいで残るものが要ります。</p>
+
+    <p>2 つ目。<strong>人間が読めるほうがいい</strong>からです。何かがおかしくなったとき、<code>cat</code> で開いて中身を確かめられることには実用上とても大きな価値があります。実際、この章の後半で出てくる E2E テストは、整形された <code>mydocker ps</code> の出力ではなく <strong>この JSON を直接読んで</strong> PID を取り出しています。</p>
+
+    <div class="ascii">/var/lib/mydocker/ の中身
+
+  /var/lib/mydocker/
+  ├ layers/&lt;digest&gt;/            展開済みレイヤ（読み取り専用・コンテナ間で共有）
+  ├ layers/&lt;digest&gt;.complete    ★展開が最後まで終わった印
+  ├ manifests/&lt;参照&gt;.json       マニフェストのキャッシュ（2回目は通信しない）
+  ├ configs/&lt;digest&gt;.json       イメージ設定（Env / Cmd / WorkingDir）
+  └ containers/&lt;ID&gt;/
+      ├ state.json               ★実行中コンテナの記録 ← この章の主役
+      ├ merged/                  overlay の結果 ＝ コンテナの /
+      ├ upper/                   書き込みはここに溜まる（捨てれば元通り）
+      └ work/                    overlayfs の作業場所
+
+  ★ 上の3つ（layers / manifests / configs）は「イメージ」の置き場で、
+    コンテナ間で共有される。消してはいけない。
+  ★ containers/&lt;ID&gt;/ は「そのコンテナ1つ分」。片付けるのはここだけ。
+    この境界を踏み越えると、イメージの実体まで消える。</div>
+
+    <p>この図の最後の 2 行を覚えておいてください。この章の Step 7 は、まるごとこの境界線を守るための話です。</p>
+
+    <h2>この章で出てくる言葉</h2>
+
+    <p>先に並べておきます。今は眺めるだけで構いません。</p>
+
+    <table>
+      <tr><th>言葉</th><th>意味</th><th>この章での役どころ</th></tr>
+      <tr><td><code>state.json</code></td><td>コンテナ 1 つ分の記録。ID・イメージ名・コマンド・PID・起動時刻など</td><td><code>ps</code> / <code>exec</code> / <code>rm</code> の全員がこれだけを頼りに動く</td></tr>
+      <tr><td>PID の再利用</td><td>プロセスが終わると、その番号は将来また別のプロセスに配られる</td><td>Step 4。「生きているか」の判定が壊れる原因</td></tr>
+      <tr><td><code>/proc/&lt;pid&gt;/stat</code></td><td>そのプロセスの状態が 1 行に詰まったファイル。22 番目が起動時刻</td><td>Step 4。PID の再利用を見破る鍵</td></tr>
+      <tr><td><code>setns(2)</code></td><td>既にある名前空間に、あとから参加するシステムコール</td><td>Step 6。<code>exec</code> の心臓</td></tr>
+      <tr><td><code>EBUSY</code></td><td>「使用中」を表すエラー番号。<code>umount</code> が日常的にこれで失敗する</td><td>Step 7。ここを握りつぶすと事故が起きる</td></tr>
+      <tr><td>リーク</td><td>片付けたつもりで残り続ける資源（ここではマウントと cgroup）</td><td>Step 8。静かに進行するのが恐ろしい</td></tr>
+      <tr><td>dead code</td><td>書かれているが、どこからも呼ばれていないコード</td><td>Step 11。「実装済み」に見えて要件未達</td></tr>
+    </table>
+
+    <h2 class="step" id="step-1"><span class="step-no">Step 1</span>入り口を薄く保つ</h2>
+
+    <p>まず <code>main</code> 関数から見ます。ここは驚くほど短くしてあります。短くしてあることに意味があるので、先に全文を貼ります。</p>
+
+    <div class="file-tag">cmd/mydocker/main.go（全文）</div>
+<pre><code><span class="cm">// mydocker — 自作コンテナランタイム（学習用）の入り口。</span>
+<span class="cm">//</span>
+<span class="cm">// ここは薄く保つ。引数を internal/cli に渡し、終了コードを整えるだけ。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ このプログラムは自分自身を再実行する（/proc/self/exe を "init" という顔で起動する）。</span>
+<span class="cm">// 詳しくは internal/container/run.go の Run を読むこと。</span>
+<span class="kw">package</span> main
+
+<span class="kw">import</span> (
+	<span class="st">"errors"</span>
+	<span class="st">"fmt"</span>
+	<span class="st">"os"</span>
+
+	<span class="st">"mydocker/internal/cli"</span>
+)
+
+<span class="kw">func</span> main() {
+	err := cli.<span class="ty">Run</span>(os.<span class="ty">Args</span>[<span class="st">1</span>:])
+	<span class="kw">if</span> err == <span class="kw">nil</span> {
+		<span class="kw">return</span>
+	}
+
+	<span class="cm">// 「メッセージは出し終わっているので、この終了コードで終われ」という合図。</span>
+	<span class="cm">// コンテナの中のコマンドの終了コードを、そのまま利用者に返すために使う。</span>
+	<span class="kw">var</span> ee *cli.<span class="ty">ExitError</span>
+	<span class="kw">if</span> errors.<span class="ty">As</span>(err, &amp;ee) {
+		os.<span class="ty">Exit</span>(ee.<span class="ty">Code</span>)
+	}
+
+	fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"mydocker: %v\n"</span>, err)
+	os.<span class="ty">Exit</span>(<span class="st">1</span>)
+}</code></pre>
+
+    <p>やっていることは 3 つです。<code>cli.Run</code> に引数を丸投げする。エラーが無ければ黙って終わる。エラーがあれば、その<strong>種類によって振る舞いを変える</strong>。</p>
+
+    <p>最後の「種類によって」が肝心なところです。ここには 2 種類のエラーが流れてきます。</p>
+
+    <ol>
+      <li><strong>普通のエラー</strong> — 「イメージ名を指定してください」「コンテナが見つかりません」のような、<em>まだ利用者に何も伝えていない</em>失敗。これは <code>mydocker: ...</code> という形で標準エラーに出してから、終了コード 1 で終わる</li>
+      <li><strong><code>ExitError</code></strong> — 「メッセージはもう出し終わった。あとはこの終了コードで終わってくれ」という合図。<em>何も表示せずに</em>、指定された番号で終わる</li>
+    </ol>
+
+    <p>2 つ目が要る理由は、<code>mydocker run</code> の役目を考えると分かります。</p>
+
+<pre class="term"><code><span class="ps">$</span> mydocker run --quiet --memory 10m alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="ps">$</span> echo $?
+<span class="out">137</span></code></pre>
+
+    <p>この <code>137</code> は <strong>コンテナの中で走ったコマンドの終了コード</strong>です（第04章でメモリ上限に当たって殺されたときの値でした）。<code>mydocker</code> 自身は失敗していません。<code>mydocker</code> は正しく仕事をして、その結果として中のコマンドが 137 で終わった、という事実を伝えているだけです。</p>
+
+    <p>だからここで <code>mydocker: exit status 137</code> などと余計なメッセージを出してはいけません。<code>docker run</code> も出しません。<strong>透明であること</strong>——シェルスクリプトの中に <code>mydocker run</code> を書いたとき、それが素の <code>dd</code> と同じように振る舞うこと——が、道具としての最低条件です。</p>
+
+    <p>その「メッセージを出さずに、この番号で終わりたい」を Go の型で表したのが <code>ExitError</code> です。定義は <code>cli</code> パッケージの冒頭にあります。</p>
+
+    <div class="file-tag">internal/cli/cli.go（冒頭）</div>
+<pre><code><span class="cm">// ExitError は「メッセージは既に出したので、この終了コードで終わってほしい」を表す。</span>
+<span class="kw">type</span> <span class="ty">ExitError</span> <span class="kw">struct</span>{ Code <span class="kw">int</span> }
+
+<span class="kw">func</span> (e *<span class="ty">ExitError</span>) <span class="ty">Error</span>() <span class="kw">string</span> { <span class="kw">return</span> fmt.<span class="ty">Sprintf</span>(<span class="st">"exit status %d"</span>, e.<span class="ty">Code</span>) }</code></pre>
+
+    <p><code>Error() string</code> メソッドを持っているので、これは Go の <code>error</code> インタフェースを満たします。つまり普通のエラーと同じ経路（<code>return err</code>）で運べる。運ばれた先の <code>main</code> で、<strong>型を見て</strong>「あ、これは特別な合図だ」と気づく。エラーを「文字列」ではなく「値」として設計する、というのが Go の作法です。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · errors.As でエラーの型を見る</div>
+      <p><code>errors.As(err, &amp;ee)</code> は、「<code>err</code>、またはそれに包まれている元のエラーのどれかが <code>*cli.ExitError</code> 型なら、それを <code>ee</code> に入れて <code>true</code> を返す」という関数です。</p>
+      <p>なぜ単純な型アサーション（<code>ee, ok := err.(*cli.ExitError)</code>）ではないのでしょうか。Go では <code>fmt.Errorf("... : %w", err)</code> という書き方でエラーを<strong>包む</strong>ことができます。包まれると外側の型は変わってしまうので、素朴な型アサーションは中身を見逃します。<code>errors.As</code> は <code>%w</code> で包まれた層を順にほどきながら探してくれます。</p>
+      <p>兄弟に <code>errors.Is</code> があります。こちらは「特定の<strong>値</strong>と等しいか」（<code>errors.Is(err, os.ErrNotExist)</code> など）を見るもの。<strong>型で分岐したいときは <code>As</code>、値で分岐したいときは <code>Is</code></strong> と覚えてください。この <code>mydocker</code> では、<code>ExitError</code> が <em>付随データ（終了コード）を持つ</em>ので <code>As</code> のほうを使っています。</p>
+      <p>もうひとつ細かい話を。<code>var ee *cli.ExitError</code> は「<code>*cli.ExitError</code> 型のポインタ変数」を <code>nil</code> で宣言しています。<code>errors.As</code> にはその<strong>アドレス</strong>（<code>&amp;ee</code>、つまり <code>**cli.ExitError</code>）を渡します。「見つかったらここに入れてくれ」という受け皿を渡しているわけです。ポインタのポインタが出てくるとぎょっとしますが、やっていることは <code>json.Unmarshal(b, &amp;s)</code> と同じ「書き込み先を渡す」だけです。</p>
+    </div>
+
+    <p>入り口が薄いことにはもうひとつ効用があります。<strong>テストしやすい</strong>のです。<code>cli.Run</code> は <code>[]string</code> を受け取って <code>error</code> を返すただの関数なので、<code>os.Exit</code> を呼ばずに何度でも呼べます。<code>os.Exit</code> はプロセスを即座に終わらせてしまう乱暴な関数で、<code>defer</code> も走りません。これを <code>main</code> の中だけに閉じ込めておくと、残り全部が普通の Go のコードになります。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>まず、この環境で何が使えるかを <code>mydocker</code> 自身に聞いてみましょう。<code>info</code> は「今の環境で mydocker が何をできるか」を 5 行で答えるサブコマンドです。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker info
+<span class="out">状態の置き場: /var/lib/mydocker
+資源制限:     cgroup v1 (/sys/fs/cgroup, 利用可能: memory cpu pids)
+overlayfs:    利用可能
+overlay 数:   0 件
+実行中:       0 件</span></code></pre>
+      <p>この 5 行のうち、下の 2 行はこの章で作るものです。<strong>「overlay 数」と「実行中」が実数で出ている</strong>ことに注目してください。なぜ実数で出すのかは Step 8 で扱います。</p>
+    </div>
+
+    <h2 class="step" id="step-2"><span class="step-no">Step 2</span>サブコマンドの振り分け</h2>
+
+    <p>次は <code>cli.Run</code>。<code>mydocker</code> がどんなコマンドを持っているかは、この関数を読めば全部分かります。</p>
+
+    <div class="file-tag">internal/cli/cli.go — usage と Run</div>
+<pre><code><span class="kw">const</span> usage = `mydocker — 自作コンテナランタイム（学習用）
+
+使い方:
+  mydocker run [オプション] &lt;イメージ&gt; [コマンド...]   コンテナを起動する
+  mydocker ps                                          実行中のコンテナを一覧する
+  mydocker exec &lt;ID&gt; &lt;コマンド...&gt;                     実行中のコンテナでコマンドを実行する
+  mydocker rm &lt;ID&gt;                                     終了したコンテナの痕跡を片付ける
+  mydocker pull &lt;イメージ&gt;                             イメージを取得だけする
+  mydocker info                                        この環境で何が使えるかを表示する
+
+run のオプション:
+  --memory &lt;量&gt;     メモリ上限（例: 10m, 512k, 1g）
+  --cpus &lt;数&gt;       CPU の上限（例: 0.5 で 0.5 コア分）
+  --pids &lt;数&gt;       プロセス数の上限
+  --hostname &lt;名&gt;   コンテナのホスト名（既定: mydocker）
+  --rootfs &lt;パス&gt;   イメージの代わりにローカルのディレクトリを根として使う
+  --layer &lt;パス&gt;    重ねるレイヤを直接指定する（下から順に複数回指定できる）
+  --quiet           起動時のメッセージを出さない
+
+例:
+  mydocker run alpine /bin/sh
+  mydocker run --memory 10m alpine sh -c 'echo hello'
+  mydocker run --rootfs /var/lib/mydocker/layers/xxxx /bin/sh
+`
+
+<span class="cm">// Run はコマンドラインを処理する。</span>
+<span class="kw">func</span> <span class="ty">Run</span>(args []<span class="kw">string</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> <span class="kw">len</span>(args) == <span class="st">0</span> {
+		fmt.<span class="ty">Print</span>(usage)
+		<span class="kw">return</span> &amp;<span class="ty">ExitError</span>{Code: <span class="st">2</span>}
+	}
+	<span class="kw">switch</span> args[<span class="st">0</span>] {
+	<span class="kw">case</span> <span class="st">"run"</span>:
+		<span class="kw">return</span> cmdRun(args[<span class="st">1</span>:])
+	<span class="kw">case</span> <span class="st">"init"</span>:
+		<span class="cm">// ★内部用。利用者が直接叩くものではないので --help には出さない。</span>
+		<span class="cm">//   親プロセスが /proc/self/exe を使って自分自身を再実行するための入口である。</span>
+		<span class="kw">return</span> cmdInit(args[<span class="st">1</span>:])
+	<span class="kw">case</span> <span class="st">"ps"</span>:
+		<span class="kw">return</span> cmdPS(args[<span class="st">1</span>:])
+	<span class="kw">case</span> <span class="st">"exec"</span>:
+		<span class="kw">return</span> cmdExec(args[<span class="st">1</span>:])
+	<span class="kw">case</span> <span class="st">"rm"</span>:
+		<span class="kw">return</span> cmdRM(args[<span class="st">1</span>:])
+	<span class="kw">case</span> <span class="st">"pull"</span>:
+		<span class="kw">return</span> cmdPull(args[<span class="st">1</span>:])
+	<span class="kw">case</span> <span class="st">"unpack"</span>:
+		<span class="cm">// 内部用（検査用）。tar の展開だけを単体で走らせる。</span>
+		<span class="kw">return</span> cmdUnpack(args[<span class="st">1</span>:])
+	<span class="kw">case</span> <span class="st">"info"</span>:
+		<span class="kw">return</span> cmdInfo(args[<span class="st">1</span>:])
+	<span class="kw">case</span> <span class="st">"help"</span>, <span class="st">"-h"</span>, <span class="st">"--help"</span>:
+		fmt.<span class="ty">Print</span>(usage)
+		<span class="kw">return</span> <span class="kw">nil</span>
+	<span class="kw">default</span>:
+		fmt.<span class="ty">Fprintf</span>(os.<span class="ty">Stderr</span>, <span class="st">"知らないコマンドです: %s\n\n"</span>, args[<span class="st">0</span>])
+		fmt.<span class="ty">Fprint</span>(os.<span class="ty">Stderr</span>, usage)
+		<span class="kw">return</span> &amp;<span class="ty">ExitError</span>{Code: <span class="st">2</span>}
+	}
+}</code></pre>
+
+    <p>ただの <code>switch</code> です。それ以上のことは何もしていません。パッケージのコメントにもそう書いてあります——「<em>ここは薄く保つ。実際の仕事は internal/container・internal/cgroup・internal/image が持つ</em>」。</p>
+
+    <p>この薄さは意図したものです。CLI の層に仕事をさせ始めると、<code>run</code> と <code>exec</code> で微妙に違う後片付けが書かれ、片方だけ直して片方を忘れる、というのが必ず起きます。<strong>後片付けのような「絶対に間違えてはいけない処理」は、1 か所にしか書かない。</strong>この方針は Step 7 でもう一度出てきます。</p>
+
+    <div class="ascii">サブコマンドの振り分け（cli.Run の switch）
+
+  利用者が打つもの                    内部用（--help に出さない）
+  ─────────────────────────       ──────────────────────────────
+  run    → cmdRun                    init   → cmdInit
+  ps     → cmdPS                        └ 親が /proc/self/exe を
+  exec   → cmdExec                        再実行するときの入口
+  rm     → cmdRM                     unpack → cmdUnpack
+  pull   → cmdPull                      └ tar の展開だけを単体で走らせる
+  info   → cmdInfo                        （E2E が細工した tar を投入する）
+  help / -h / --help → usage を表示
+
+  知らないコマンド → usage を標準エラーに出して ExitError{2}</div>
+
+    <h3>なぜ <code>init</code> を <code>--help</code> に出さないのか</h3>
+
+    <p>上の <code>usage</code> 文字列をもう一度見てください。<code>init</code> の行が<strong>ありません</strong>。<code>unpack</code> もありません。<code>switch</code> にはちゃんと <code>case</code> があるのに、です。</p>
+
+    <p><code>init</code> は第01章で作った re-exec パターンの受け口でした。<code>mydocker run</code> の親プロセスが <code>/proc/self/exe</code> を <code>init</code> という顔で起動する。そのための入口です。<strong>利用者が直接叩くものではありません。</strong></p>
+
+    <p>ところが CLI というのは「並んでいるものは打たれる」ものです。<code>--help</code> に <code>init</code> と書いてあれば、必ず誰かが「初期化コマンドかな」と思って打ちます。打たれた結果が「よく分からないエラー」であれば、その人はバグを報告してくるでしょう。<strong>設計上あり得ない使い方を、道具の側が誘発している</strong>わけです。</p>
+
+    <p>そこで <code>mydocker</code> は 3 段構えにしています。</p>
+
+    <ol>
+      <li><strong><code>usage</code> に載せない。</strong>目に触れさせない</li>
+      <li><strong><code>src/README.md</code> のコマンド表では別の節に分ける。</strong>「内部用サブコマンド（<code>--help</code> に出していない）」という見出しを立て、<code>init</code> には「<em>利用者が直接叩くものではない</em>」と太字で書いてある。隠すのではなく、<strong>役割が違うことを明示する</strong></li>
+      <li><strong>それでも叩かれたときに、意味の分かるメッセージで止まる。</strong></li>
+    </ol>
+
+    <p>3 番目がこれです。</p>
+
+    <div class="file-tag">internal/cli/cli.go — cmdInit</div>
+<pre><code><span class="kw">func</span> cmdInit(args []<span class="kw">string</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> <span class="kw">len</span>(args) &lt; <span class="st">4</span> {
+		<span class="kw">return</span> errors.<span class="ty">New</span>(<span class="st">"init は mydocker が内部で使うサブコマンドです。直接実行しないでください"</span>)
+	}
+	<span class="kw">return</span> container.<span class="ty">Init</span>(container.<span class="ty">InitArgs</span>{
+		Rootfs:   args[<span class="st">0</span>],
+		Hostname: args[<span class="st">1</span>],
+		Workdir:  args[<span class="st">2</span>],
+		Argv:     args[<span class="st">3</span>:],
+		Env:      os.<span class="ty">Environ</span>(),
+	})
+}</code></pre>
+
+    <p>引数が 4 つ未満なら、はっきりと「直接実行しないでください」と言って止まります。仮に引数を 4 つ揃えて叩いたとしても、第01章で見た<strong>親との同期用ディスクリプタ（fd 3）</strong>が無いので、そこで安全に止まります。<strong>隠すだけでなく、踏まれても壊れないようにしておく。</strong>これが「内部用」の正しい扱い方です。</p>
+
+    <p><code>unpack</code> のほうも同じ考え方ですが、こちらは存在理由が少し違います。</p>
+
+    <div class="file-tag">internal/cli/cli.go — cmdUnpack</div>
+<pre><code><span class="kw">func</span> cmdUnpack(args []<span class="kw">string</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> <span class="kw">len</span>(args) != <span class="st">2</span> {
+		<span class="kw">return</span> errors.<span class="ty">New</span>(<span class="st">"使い方: mydocker unpack &lt;tar または tar.gz&gt; &lt;展開先&gt;（内部用）"</span>)
+	}
+	f, err := os.<span class="ty">Open</span>(args[<span class="st">0</span>])
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">defer</span> f.<span class="ty">Close</span>()
+	n, err := image.<span class="ty">ExtractLayer</span>(f, args[<span class="st">1</span>])
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	fmt.<span class="ty">Printf</span>(<span class="st">"%d 件のエントリを展開しました\n"</span>, n)
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>これは<strong>検査のための入口</strong>です。第06章で <code>ExtractLayer</code> は「展開先の外にファイルを作らせない」検証（<code>safeJoin</code>）を持っていました。この検証が本当に効いているかを確かめるには、<strong>悪意のある tar を自分で作って投入する</strong>しかありません。<code>..</code> を含むパスや絶対パスを仕込んだ tar を用意し、それを展開させて、外にファイルができないことを確認する。</p>
+
+    <p>そのとき、レジストリから本物のイメージを取ってきていては話になりません。tar の展開<strong>だけ</strong>を単体で走らせる口が要る。それがこの <code>unpack</code> です。E2E テストの「<code>== 5. 取得したイメージの安全な展開 (FR-6) ==</code>」の節は、この口から細工した tar を投入しています。</p>
+
+    <p><strong>テストのためだけに存在する入口を持つのは、悪いことではありません。</strong>悪いのは、それを利用者向けの機能のような顔で <code>--help</code> に並べることです。</p>
+
+    <h3><code>run</code> のオプションはどう受けるか</h3>
+
+    <p>ついでに <code>cmdRun</code> のオプション処理も見ておきます。<code>--layer</code> だけ他と作りが違うので、そこが読みどころです。</p>
+
+    <div class="file-tag">internal/cli/cli.go — stringList と cmdRun の冒頭</div>
+<pre><code><span class="kw">type</span> stringList []<span class="kw">string</span>
+
+<span class="kw">func</span> (s *stringList) <span class="ty">String</span>() <span class="kw">string</span>     { <span class="kw">return</span> strings.<span class="ty">Join</span>(*s, <span class="st">","</span>) }
+<span class="kw">func</span> (s *stringList) <span class="ty">Set</span>(v <span class="kw">string</span>) <span class="kw">error</span> { *s = <span class="kw">append</span>(*s, v); <span class="kw">return</span> <span class="kw">nil</span> }
+
+<span class="kw">func</span> cmdRun(args []<span class="kw">string</span>) <span class="kw">error</span> {
+	fs := flag.<span class="ty">NewFlagSet</span>(<span class="st">"run"</span>, flag.<span class="ty">ContinueOnError</span>)
+	fs.<span class="ty">SetOutput</span>(os.<span class="ty">Stderr</span>)
+	<span class="kw">var</span> (
+		memory   = fs.<span class="ty">String</span>(<span class="st">"memory"</span>, <span class="st">""</span>, <span class="st">"メモリ上限（例: 10m）"</span>)
+		cpus     = fs.<span class="ty">Float64</span>(<span class="st">"cpus"</span>, <span class="st">0</span>, <span class="st">"CPU 上限（例: 0.5）"</span>)
+		pids     = fs.<span class="ty">Int64</span>(<span class="st">"pids"</span>, <span class="st">0</span>, <span class="st">"プロセス数の上限"</span>)
+		hostname = fs.<span class="ty">String</span>(<span class="st">"hostname"</span>, <span class="st">"mydocker"</span>, <span class="st">"コンテナのホスト名"</span>)
+		rootfs   = fs.<span class="ty">String</span>(<span class="st">"rootfs"</span>, <span class="st">""</span>, <span class="st">"ローカルのディレクトリを根として使う"</span>)
+		layers   stringList
+		quiet    = fs.<span class="ty">Bool</span>(<span class="st">"quiet"</span>, <span class="kw">false</span>, <span class="st">"起動メッセージを出さない"</span>)
+	)
+	fs.<span class="ty">Var</span>(&amp;layers, <span class="st">"layer"</span>, <span class="st">"重ねるレイヤ（下から順に複数回指定できる）"</span>)
+	fs.<span class="ty">Usage</span> = <span class="kw">func</span>() { fmt.<span class="ty">Fprint</span>(os.<span class="ty">Stderr</span>, usage) }
+	<span class="kw">if</span> err := fs.<span class="ty">Parse</span>(args); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> &amp;<span class="ty">ExitError</span>{Code: <span class="st">2</span>}
+	}
+	rest := fs.<span class="ty">Args</span>()
+	<span class="cm">// …（以降はイメージの解決とコンテナ設定の組み立て。第05・06章で見た通り）</span>
+}</code></pre>
+
+    <div class="gonote"><div class="box-k">GO メモ · flag パッケージと繰り返し指定できるオプション</div>
+      <p>Go の標準ライブラリ <code>flag</code> は、<code>fs.String("memory", "", "...")</code> のように書くと <code>*string</code> を返します。ポインタなのは、<strong>パースは後から起きる</strong>からです。宣言した時点では値がまだ決まっておらず、<code>fs.Parse(args)</code> が走ったあとで中身が埋まる。だから使うときは <code>*memory</code> とデリファレンスします。</p>
+      <p>問題は <code>--layer</code> です。これは <code>--layer /a --layer /b --layer /c</code> のように<strong>何度も指定できる</strong>ようにしたい。ところが <code>fs.String</code> は最後の 1 個で上書きされてしまいます。</p>
+      <p>そこで <code>flag.Value</code> インタフェースの出番です。定義はたった 2 メソッド。</p>
+      <pre><code><span class="kw">type</span> <span class="ty">Value</span> <span class="kw">interface</span> {
+	<span class="ty">String</span>() <span class="kw">string</span>
+	<span class="ty">Set</span>(<span class="kw">string</span>) <span class="kw">error</span>
+}</code></pre>
+      <p><code>Set</code> は<strong>オプションが現れるたびに 1 回ずつ呼ばれます</strong>。だから <code>Set</code> の中で <code>append</code> すれば、指定された順に全部溜まる。それが <code>stringList</code> の正体です。<code>String()</code> のほうは <code>--help</code> に既定値を表示するために使われるもので、ここでは中身をカンマでつないで返しています。</p>
+      <p>登録は <code>fs.Var(&amp;layers, "layer", "...")</code>。<code>fs.String</code> のように値を返すのではなく、<strong>自分で用意した受け皿のアドレスを渡す</strong>形になります。メソッドがポインタレシーバ（<code>func (s *stringList) Set(...)</code>）なのは、<code>append</code> の結果を元のスライスに書き戻す必要があるからです。値レシーバにすると、追加したものがどこにも残りません。</p>
+      <p>もうひとつ。<code>flag.ContinueOnError</code> を指定しているのは、パース失敗時に <code>flag</code> が勝手に <code>os.Exit</code> することを避けるためです（既定は <code>flag.ExitOnError</code>）。ここで勝手に終わられると、この章の主題である<strong>後片付け</strong>が走らなくなります。<code>mydocker</code> では失敗を <code>&amp;ExitError{Code: 2}</code> に変換して、いつもの経路で返しています。</p>
+    </div>
+
+    <p>ちなみに <code>fs.Args()</code> はオプションを取り除いた残りの引数です。<code>mydocker run --memory 10m alpine /bin/sh</code> なら <code>["alpine", "/bin/sh"]</code>。先頭がイメージ名で、その後ろがコンテナの中で走らせるコマンドになります。</p>
+
+<!--PART2-->

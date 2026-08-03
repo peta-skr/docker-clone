@@ -771,10 +771,9 @@ PID   USER     TIME  COMMAND
 
     <p>このとき最初に書いたテストがこれでした。</p>
 
-    <div class="file-tag">最初に書いた（間違っていた）テスト</div>
-<pre><code>mydocker run --memory 10m alpine sh -c <span class="st">'head -c 100000000 /dev/zero | wc -c'</span></code></pre>
+    <pre class="term"><code><span class="ps">$</span> mydocker run --memory 10m alpine sh -c 'head -c 100000000 /dev/zero | wc -c'</code></pre>
 
-    <p>結果は <code>100000000</code> が表示されて終了コード 0。「上限が効いていない」と思いかけました。<strong>しかし間違っていたのはテストのほうです。</strong> <code>head | wc</code> は<strong>ストリームを流すだけでメモリを溜めません</strong>。1 億バイトを読みますが、一度に持っているのはバッファ 1 個分です。10 MB の上限には決して当たりません。</p>
+    <p>これが素通りで成功してしまい、「上限が効いていない」と思いかけました。<strong>しかし間違っていたのはテストのほうです。</strong> <code>head | wc</code> は<strong>ストリームを流すだけでメモリを溜めません</strong>。大量のバイトを読みはしますが、一度に持っているのはバッファ 1 個分です。10 MB の上限には決して当たりません。</p>
 
     <p>確かめ方を変えました。<code>dd</code> に大きな <code>bs</code> を与えて、<strong>1 回で 100 MB のバッファを確保させます</strong>。しかも<strong>上限あり・上限なしの両方で走らせて差を見ます</strong>。</p>
 
