@@ -415,4 +415,1406 @@ run のオプション:
 
     <p>ちなみに <code>fs.Args()</code> はオプションを取り除いた残りの引数です。<code>mydocker run --memory 10m alpine /bin/sh</code> なら <code>["alpine", "/bin/sh"]</code>。先頭がイメージ名で、その後ろがコンテナの中で走らせるコマンドになります。</p>
 
-<!--PART2-->
+    <h2 class="step" id="step-3"><span class="step-no">Step 3</span>実行中コンテナをどこに記録するか</h2>
+
+    <p>ここからが本題です。<code>mydocker ps</code> を作るには、まず「今動いているコンテナ」を<strong>知っている</strong>必要があります。知るためには、起動したときに<strong>書き残して</strong>おかなければなりません。</p>
+
+    <p>置き場所とファイル名を決めます。<code>internal/container/state.go</code> の冒頭がそれです。</p>
+
+    <div class="file-tag">internal/container/state.go（1）— 置き場所</div>
+<pre><code><span class="cm">// Root は mydocker が状態を置く場所。</span>
+<span class="cm">//</span>
+<span class="cm">//	&lt;Root&gt;/containers/&lt;ID&gt;/state.json … 実行中コンテナの記録</span>
+<span class="cm">//	&lt;Root&gt;/containers/&lt;ID&gt;/merged     … overlay の結果（＝コンテナの /）</span>
+<span class="cm">//	&lt;Root&gt;/containers/&lt;ID&gt;/upper      … 書き込みはここに溜まる</span>
+<span class="cm">//	&lt;Root&gt;/layers/&lt;digest&gt;/           … 展開済みのイメージレイヤ（共有・読み取り専用）</span>
+<span class="kw">const</span> Root = <span class="st">"/var/lib/mydocker"</span></code></pre>
+
+    <p><code>/var/lib/&lt;アプリ名&gt;/</code> は Linux の慣習で「アプリケーションが持つ、再起動をまたいで残る状態」の置き場です（FHS という取り決めに沿っています）。Docker 自身も <code>/var/lib/docker/</code> を使っています。<code>/tmp</code> にしなかったのは、再起動で消えられては困るからです。</p>
+
+    <p>そして記録の中身。これがこの章でいちばん大事な構造体です。</p>
+
+    <div class="file-tag">internal/container/state.go（2）— State</div>
+<pre><code><span class="cm">// State は1つのコンテナの記録。ps と exec と後片付けが、これだけを頼りに動く。</span>
+<span class="kw">type</span> <span class="ty">State</span> <span class="kw">struct</span> {
+	ID        <span class="kw">string</span>    `json:"id"`
+	Image     <span class="kw">string</span>    `json:"image"`
+	Command   []<span class="kw">string</span>  `json:"command"`
+	PID       <span class="kw">int</span>       `json:"pid"`
+	Hostname  <span class="kw">string</span>    `json:"hostname"`
+	Workdir   <span class="kw">string</span>    `json:"workdir"`
+	CreatedAt time.<span class="ty">Time</span> `json:"created_at"`
+
+	Merged        <span class="kw">string</span>   `json:"merged"`         <span class="cm">// overlay の merged（空なら overlay を使っていない）</span>
+	CgroupDirs    []<span class="kw">string</span> `json:"cgroup_dirs"`    <span class="cm">// 後片付けの対象</span>
+	CgroupVersion <span class="kw">string</span>   `json:"cgroup_version"` <span class="cm">// "v2" / "v1" / ""</span>
+
+	<span class="cm">// ⚠ PID は再利用される。終了したコンテナの PID が別のプロセスに割り当てられると、</span>
+	<span class="cm">//    「まだ生きている」と誤判定する。そこで起動時刻（/proc/&lt;pid&gt;/stat の 22 番目）を</span>
+	<span class="cm">//    一緒に記録し、両方が一致したときだけ生存とみなす。</span>
+	StartTime <span class="kw">uint64</span> `json:"start_time"`
+}</code></pre>
+
+    <p>フィールドを、<strong>誰がそれを読むのか</strong>という観点で 3 組に分けて見ていきます。</p>
+
+    <table>
+      <tr><th>組</th><th>フィールド</th><th>誰が読むか</th></tr>
+      <tr><td>表示のため</td><td><code>ID</code> / <code>Image</code> / <code>Command</code> / <code>CreatedAt</code></td><td><code>mydocker ps</code> の 6 列</td></tr>
+      <tr><td>中に入るため</td><td><code>PID</code> / <code>Hostname</code> / <code>Workdir</code> / <code>Merged</code></td><td><code>mydocker exec</code>（Step 6）</td></tr>
+      <tr><td>片付けるため</td><td><code>Merged</code> / <code>CgroupDirs</code> / <code>CgroupVersion</code></td><td><code>Cleanup</code>（Step 7）</td></tr>
+      <tr><td>生死の判定</td><td><code>PID</code> + <code>StartTime</code></td><td><code>IsAlive</code>（Step 4）</td></tr>
+    </table>
+
+    <p>ここで<strong>何を記録していないか</strong>にも目を向けてください。</p>
+
+    <ul>
+      <li><strong>レイヤのパス（<code>Lowers</code>）を記録していない。</strong>あれはイメージ側の資産で、コンテナが所有しているものではないからです。記録すると「コンテナを消すときにこれも消すのか?」という迷いが生まれます。<strong>持っていないものは消せない</strong>——これは事故を防ぐ設計です</li>
+      <li><strong><code>upper</code> と <code>work</code> のパスを記録していない。</strong>どちらも <code>containers/&lt;ID&gt;/</code> の下にあるので、<code>ID</code> から導けます。導けるものを二重に持つと、片方だけ書き換わったときに壊れます</li>
+      <li><strong>終了コードや終了時刻を記録していない。</strong><code>mydocker</code> は「終わったコンテナ」を <code>docker ps -a</code> のように保持しません。終わったら片付ける、が原則です</li>
+    </ul>
+
+    <p>逆に <code>CgroupDirs</code> を「複数」持っているのは、第04章の cgroup v1 の事情です。v1 ではコントローラごとにディレクトリが分かれる（<code>memory/</code>・<code>cpu/</code>・<code>pids/</code>）ので、片付ける対象が複数になります。v2 なら 1 つ。<strong>環境によって数が変わるものは、数を決め打ちせずスライスで持つ</strong>のが安全です。</p>
+
+    <p>ID の作り方と、パスの組み立て。</p>
+
+    <div class="file-tag">internal/container/state.go（3）— ID とパス</div>
+<pre><code><span class="cm">// NewID は 12 桁のコンテナ ID を作る。docker の短い ID と同じ見た目にしてある。</span>
+<span class="kw">func</span> <span class="ty">NewID</span>() <span class="kw">string</span> {
+	b := <span class="kw">make</span>([]<span class="kw">byte</span>, <span class="st">6</span>)
+	<span class="kw">if</span> _, err := rand.<span class="ty">Read</span>(b); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> strconv.<span class="ty">FormatInt</span>(time.<span class="ty">Now</span>().<span class="ty">UnixNano</span>(), <span class="st">16</span>)
+	}
+	<span class="kw">return</span> hex.<span class="ty">EncodeToString</span>(b)
+}
+
+<span class="kw">func</span> containersDir() <span class="kw">string</span>      { <span class="kw">return</span> filepath.<span class="ty">Join</span>(Root, <span class="st">"containers"</span>) }
+<span class="kw">func</span> stateDir(id <span class="kw">string</span>) <span class="kw">string</span>  { <span class="kw">return</span> filepath.<span class="ty">Join</span>(containersDir(), id) }
+<span class="kw">func</span> statePath(id <span class="kw">string</span>) <span class="kw">string</span> { <span class="kw">return</span> filepath.<span class="ty">Join</span>(stateDir(id), <span class="st">"state.json"</span>) }</code></pre>
+
+    <p>6 バイトの乱数を 16 進にすると 12 文字。<code>a10f2703bb37</code> のような、見覚えのある形になります。<code>crypto/rand</code> を使っているのは、<code>math/rand</code> だと <strong>プログラムを起動するたびに同じ列が出る</strong>（種を明示しないと固定されていた時代の名残）という事故があり得るからです。ID の衝突は「別のコンテナの記録を上書きする」という最悪の形で現れるので、ここはけちらないほうがいい。</p>
+
+    <p>もし乱数の取得に失敗したら、現在時刻のナノ秒を 16 進にしたものを返します。<strong>ID を作れずに起動を諦めるより、少し弱い ID で動くほうがまし</strong>という判断です。</p>
+
+    <p>パス組み立ての 3 関数が小文字始まり（＝パッケージ外から見えない）なのも意図的です。<strong>「<code>/var/lib/mydocker/containers/xxx</code> という文字列を組み立ててよいのはこのファイルだけ」</strong>という縄張りを作っている。他の場所で <code>filepath.Join(Root, "containers", id)</code> と書けてしまうと、置き場所を変えたいときに探し漏らします。</p>
+
+    <p>書き出しと読み込み。</p>
+
+    <div class="file-tag">internal/container/state.go（4）— Save と Load</div>
+<pre><code><span class="cm">// Save は状態を書き出す。</span>
+<span class="kw">func</span> (s *<span class="ty">State</span>) <span class="ty">Save</span>() <span class="kw">error</span> {
+	<span class="kw">if</span> err := os.<span class="ty">MkdirAll</span>(stateDir(s.<span class="ty">ID</span>), <span class="st">0o755</span>); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	b, err := json.<span class="ty">MarshalIndent</span>(s, <span class="st">""</span>, <span class="st">"  "</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">return</span> os.<span class="ty">WriteFile</span>(statePath(s.<span class="ty">ID</span>), b, <span class="st">0o644</span>)
+}
+
+<span class="cm">// Load は ID から状態を読む。前方一致でも引ける（docker と同じ使い勝手）。</span>
+<span class="kw">func</span> <span class="ty">Load</span>(id <span class="kw">string</span>) (*<span class="ty">State</span>, <span class="kw">error</span>) {
+	<span class="kw">if</span> s, err := loadExact(id); err == <span class="kw">nil</span> {
+		<span class="kw">return</span> s, <span class="kw">nil</span>
+	}
+	<span class="cm">// 前方一致</span>
+	entries, err := os.<span class="ty">ReadDir</span>(containersDir())
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"コンテナが見つかりません: %s"</span>, id)
+	}
+	<span class="kw">var</span> hit []<span class="kw">string</span>
+	<span class="kw">for</span> _, e := <span class="kw">range</span> entries {
+		<span class="kw">if</span> e.<span class="ty">IsDir</span>() &amp;&amp; strings.<span class="ty">HasPrefix</span>(e.<span class="ty">Name</span>(), id) {
+			hit = <span class="kw">append</span>(hit, e.<span class="ty">Name</span>())
+		}
+	}
+	<span class="kw">switch</span> <span class="kw">len</span>(hit) {
+	<span class="kw">case</span> <span class="st">0</span>:
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"コンテナが見つかりません: %s"</span>, id)
+	<span class="kw">case</span> <span class="st">1</span>:
+		<span class="kw">return</span> loadExact(hit[<span class="st">0</span>])
+	<span class="kw">default</span>:
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"ID %s は %d 件に一致します。もう少し長く指定してください"</span>, id, <span class="kw">len</span>(hit))
+	}
+}
+
+<span class="kw">func</span> loadExact(id <span class="kw">string</span>) (*<span class="ty">State</span>, <span class="kw">error</span>) {
+	b, err := os.<span class="ty">ReadFile</span>(statePath(id))
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+	<span class="kw">var</span> s <span class="ty">State</span>
+	<span class="kw">if</span> err := json.<span class="ty">Unmarshal</span>(b, &amp;s); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">nil</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"%s の状態ファイルが壊れています: %w"</span>, id, err)
+	}
+	<span class="kw">return</span> &amp;s, <span class="kw">nil</span>
+}</code></pre>
+
+    <p><code>Load</code> の<strong>前方一致</strong>は、道具としての使い勝手のために入れてあります。<code>docker</code> でも <code>docker stop 0c1b</code> のように頭数文字だけで指定できますね。あれと同じです。12 文字を毎回タイプするのは苦痛ですから。</p>
+
+    <p>ただし、曖昧なときに<strong>勝手にどれかを選ばない</strong>ことが重要です。2 件以上に一致したら「もう少し長く指定してください」と言って止まる。<code>rm</code> の対象が「たぶんこれだろう」で決まってしまうのは危険すぎます。<strong>削除に関わる操作では、曖昧さは必ずエラーにする。</strong></p>
+
+    <p><code>MarshalIndent</code> で整形して書いているのも、人間が <code>cat</code> したときに読めるようにするためです。実務のサーバなら 1 行にまとめて書くところですが、ここは教材であり、そして <em>デバッグのときに読めること</em> が最優先です。</p>
+
+    <h2 class="step" id="step-4"><span class="step-no">Step 4</span>PID は再利用される</h2>
+
+    <p>さて。<code>state.json</code> に <code>PID</code> を書きました。<code>mydocker ps</code> は「そのコンテナが生きているか」を知りたい。素直に考えるとこうです。</p>
+
+    <div class="ascii">素朴案（これは間違い）
+
+  state.json に書いてある PID = 16144
+
+  /proc/16144 が存在する？
+      ├ はい → 生きている
+      └ いいえ → 死んでいる</div>
+
+    <p>実際、これで<strong>ほとんどの場合はうまくいきます</strong>。うまくいってしまうところが厄介です。ではどこで壊れるのか。</p>
+
+    <p>Linux の PID は<strong>使い回されます</strong>。プロセスが終わると、その番号はいずれ別のプロセスに配られます。番号は 1 から順に増えていき、上限（多くの環境で 4194304 か 32768）に達したら 1 に戻ってまた配り直す。<strong>有限の資源なので、必ずぐるりと回ってきます。</strong></p>
+
+    <p>だから、こういうことが起こり得ます。</p>
+
+    <div class="ascii">PID の再利用が起こす誤判定
+
+  時刻 →
+
+  ①  mydocker run …            PID 16144 でコンテナ起動
+      state.json に pid: 16144 と記録
+
+  ②  コンテナ終了               PID 16144 は空き番号に戻る
+      （このとき mydocker が SIGKILL されて記録が消せなかったとする）
+
+  ③  …しばらく時間が経つ…      番号が一周する
+
+  ④  誰かが cron ジョブを起動    たまたま PID 16144 を割り当てられる
+
+  ⑤  mydocker ps               /proc/16144 は「ある」
+                                → ★死んだコンテナが Up と表示される
+                                → ★mydocker rm は「まだ実行中です」と拒否する
+                                → ★片付けたくても永久に片付けられない</div>
+
+    <p>⑤ の 3 行目が本当に効きます。<strong>後片付けができなくなる</strong>のです。この章の主題は後片付けですから、生死判定の誤りは直接その足を折ります。</p>
+
+    <p>では、どうすれば「同じプロセスだ」と確信できるのか。答えは<strong>起動時刻を一緒に見る</strong>ことです。</p>
+
+    <p>PID は再利用されますが、<strong>PID と起動時刻の組は事実上一意</strong>です。同じ番号が同じ時刻（システム起動からのクロック数）に生まれることは、番号が一周する時間を考えればまず起こりません。Linux は各プロセスの起動時刻を <code>/proc/&lt;pid&gt;/stat</code> に持っています。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · PID は再利用される</div>
+      <p><strong><code>/proc/&lt;pid&gt;</code> の存在だけでは「同じプロセスがまだ生きている」ことの証明になりません。</strong>終了したコンテナの PID が別のプロセスに割り当てられると、「まだ生きている」と誤判定します。</p>
+      <p>この誤りは、<em>ほとんどの場合に正しく動く</em>という形で現れるので、テストでも本番でもなかなか表に出ません。出るときは、たいてい「なぜか <code>rm</code> できないコンテナがある」「<code>ps</code> に幽霊が出る」という、原因の見当がつかない不具合として現れます。</p>
+      <p>対策は、<strong>PID と一緒に起動時刻を記録し、両方が一致したときだけ生存とみなす</strong>こと。この 1 手で問題は消えます。<code>docker</code> や <code>systemd</code> のような本物のツールも、同じ理由で同じことをしています。</p>
+      <p>ついでに言うと、これは PID に限った話ではありません。<strong>「再利用される識別子だけで同一性を判定してはいけない」</strong>は、ファイルディスクリプタでも inode 番号でもデータベースの ID でも同じように現れる、一般的な落とし穴です。</p>
+    </div>
+
+    <p>実装がこれです。</p>
+
+    <div class="file-tag">internal/container/state.go（5）— IsAlive</div>
+<pre><code><span class="cm">// IsAlive はそのコンテナの PID 1 がまだ生きているかを返す。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ /proc/&lt;pid&gt; の存在だけでは足りない。PID は再利用されるので、</span>
+<span class="cm">//</span>
+<span class="cm">//	起動時刻まで一致してはじめて「同じプロセス」と言える。</span>
+<span class="kw">func</span> (s *<span class="ty">State</span>) <span class="ty">IsAlive</span>() <span class="kw">bool</span> {
+	<span class="kw">if</span> s.<span class="ty">PID</span> &lt;= <span class="st">0</span> {
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	st, err := readProcStat(s.<span class="ty">PID</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	<span class="kw">if</span> st.state == <span class="st">"Z"</span> { <span class="cm">// ゾンビは死んでいる扱い</span>
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	<span class="kw">if</span> s.<span class="ty">StartTime</span> != <span class="st">0</span> &amp;&amp; st.startTime != s.<span class="ty">StartTime</span> {
+		<span class="kw">return</span> <span class="kw">false</span> <span class="cm">// PID が再利用された別のプロセス</span>
+	}
+	<span class="kw">return</span> <span class="kw">true</span>
+}</code></pre>
+
+    <p>4 つの関門を順に通ります。</p>
+
+    <ol>
+      <li><strong><code>PID &lt;= 0</code> なら死んでいる。</strong>記録が壊れている場合の保険です。<code>0</code> のまま <code>/proc/0</code> を見に行っても意味がありません</li>
+      <li><strong><code>/proc/&lt;pid&gt;/stat</code> が読めなければ死んでいる。</strong>プロセスが存在しなければこのファイルもありません</li>
+      <li><strong>状態が <code>Z</code>（ゾンビ）なら死んでいる扱い。</strong>ゾンビは「もう終わっているが、親がまだ <code>wait</code> していないので番号だけ残っている」状態です。中でコマンドを走らせることはできませんから、生きているとは呼べません</li>
+      <li><strong>起動時刻が違えば別人。</strong>これが今回の追加分です</li>
+    </ol>
+
+    <p>4 番目の条件に <code>s.StartTime != 0 &amp;&amp;</code> が付いているのに注目してください。<strong>起動時刻が記録できなかった場合（＝ <code>0</code>）は、この検査を飛ばす</strong>という意味です。起動時刻の取得に失敗することはまずありませんが、失敗したときに「すべてのコンテナが死んでいることになる」よりは、「PID だけで判定する昔ながらの挙動に落ちる」ほうが安全だ、という判断です。</p>
+
+    <p>そして <code>/proc/&lt;pid&gt;/stat</code> の読み取り。ここに<strong>もう 1 つの落とし穴</strong>が待っています。</p>
+
+    <div class="file-tag">internal/container/state.go（6）— readProcStat</div>
+<pre><code><span class="kw">type</span> procStat <span class="kw">struct</span> {
+	state     <span class="kw">string</span>
+	startTime <span class="kw">uint64</span>
+}
+
+<span class="cm">// readProcStat は /proc/&lt;pid&gt;/stat から状態と起動時刻を読む。</span>
+<span class="cm">//</span>
+<span class="cm">// この行の 2 番目のフィールドはコマンド名で、括弧に包まれている。</span>
+<span class="cm">// ⚠ コマンド名に空白や括弧が入りうるので、素朴に空白で split すると位置がずれる。</span>
+<span class="cm">// 最後の ")" を探してからその先を切るのが定石。</span>
+<span class="kw">func</span> readProcStat(pid <span class="kw">int</span>) (procStat, <span class="kw">error</span>) {
+	b, err := os.<span class="ty">ReadFile</span>(filepath.<span class="ty">Join</span>(<span class="st">"/proc"</span>, strconv.<span class="ty">Itoa</span>(pid), <span class="st">"stat"</span>))
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> procStat{}, err
+	}
+	line := <span class="kw">string</span>(b)
+	i := strings.<span class="ty">LastIndex</span>(line, <span class="st">")"</span>)
+	<span class="kw">if</span> i &lt; <span class="st">0</span> || i+<span class="st">2</span> &gt;= <span class="kw">len</span>(line) {
+		<span class="kw">return</span> procStat{}, fmt.<span class="ty">Errorf</span>(<span class="st">"/proc/%d/stat を解釈できません"</span>, pid)
+	}
+	fields := strings.<span class="ty">Fields</span>(line[i+<span class="st">2</span>:])
+	<span class="cm">// ここでの fields[0] は元の 3 番目のフィールド（state）に当たる。</span>
+	<span class="cm">// 起動時刻は元の 22 番目なので fields[19]。</span>
+	<span class="kw">if</span> <span class="kw">len</span>(fields) &lt; <span class="st">20</span> {
+		<span class="kw">return</span> procStat{}, fmt.<span class="ty">Errorf</span>(<span class="st">"/proc/%d/stat の項目が足りません"</span>, pid)
+	}
+	start, err := strconv.<span class="ty">ParseUint</span>(fields[<span class="st">19</span>], <span class="st">10</span>, <span class="st">64</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> procStat{}, err
+	}
+	<span class="kw">return</span> procStat{state: fields[<span class="st">0</span>], startTime: start}, <span class="kw">nil</span>
+}
+
+<span class="cm">// ReadStartTime は起動直後の子プロセスの起動時刻を読む（State に記録するため）。</span>
+<span class="kw">func</span> <span class="ty">ReadStartTime</span>(pid <span class="kw">int</span>) <span class="kw">uint64</span> {
+	st, err := readProcStat(pid)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>
+	}
+	<span class="kw">return</span> st.startTime
+}</code></pre>
+
+    <p><code>strings.LastIndex(line, ")")</code> という、一見なんだかよく分からない行があります。これが今回の要です。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · /proc/&lt;pid&gt;/stat の読み方</div>
+      <p><code>/proc/&lt;pid&gt;/stat</code> は、そのプロセスの情報を<strong>空白区切りの 1 行</strong>にまとめたファイルです。50 個以上のフィールドが並んでいます。先頭のほうはこうなっています。</p>
+      <table>
+        <tr><th>番号</th><th>名前</th><th>意味</th></tr>
+        <tr><td>1</td><td>pid</td><td>プロセス番号</td></tr>
+        <tr><td>2</td><td>comm</td><td><strong>コマンド名。丸括弧で包まれている</strong></td></tr>
+        <tr><td>3</td><td>state</td><td>状態を表す 1 文字（<code>R</code> 実行中 / <code>S</code> 待機 / <code>Z</code> ゾンビ など）</td></tr>
+        <tr><td>4</td><td>ppid</td><td>親のプロセス番号</td></tr>
+        <tr><td>…</td><td>…</td><td>…</td></tr>
+        <tr><td><strong>22</strong></td><td><strong>starttime</strong></td><td><strong>システム起動からの経過時間（クロックチック単位）で表した起動時刻</strong></td></tr>
+      </table>
+      <p>ここで問題になるのが 2 番目の <code>comm</code> です。<strong>コマンド名には空白も丸括弧も入り得ます。</strong>たとえば <code>(my prog)</code> や <code>(foo) bar)</code> のような行が普通にあり得る。すると、素朴に空白で分割したときに<strong>フィールドの位置が後ろへずれます</strong>。</p>
+      <pre><code><span class="cm">// 正常な場合（コマンド名に空白なし）</span>
+<span class="cm">// 16144 (sleep) S 16143 … ← 空白で切ると starttime は 22 番目</span>
+
+<span class="cm">// コマンド名に空白がある場合</span>
+<span class="cm">// 16144 (my prog) S 16143 … ← 空白で切ると 1 つずれて 23 番目になる</span></code></pre>
+      <p>ずれた位置から読んだ数値は<strong>まったく別の意味の数</strong>です。エラーにならず、静かに間違った値が返ります。生死判定がでたらめになります。</p>
+      <p>定石は、<strong>最後の <code>)</code> を探して、その先だけを空白で分割する</strong>ことです。コマンド名の中に <code>)</code> があっても、行の最後の <code>)</code> は必ず <code>comm</code> の閉じ括弧だからです（3 番目以降のフィールドは数値と 1 文字の状態だけで、括弧は出てきません）。</p>
+      <p>切った先を数え直すと、<code>fields[0]</code> が元の 3 番目（<code>state</code>）になります。したがって元の 22 番目は <code>fields[22-3] = fields[19]</code>。コード中のコメントに書いてあるのは、この対応関係です。<strong>「なぜ 19 なのか」が読者に伝わらない <code>19</code> はマジックナンバー</strong>なので、必ずコメントを添えます。</p>
+      <p>ちなみに <code>i+2</code> で切っているのは、<code>)</code> の次が空白で、その次から <code>state</code> が始まるからです。<code>strings.Fields</code> は連続する空白をまとめて扱ってくれるので、実は <code>i+1</code> でも動きます。<code>i+2</code> にしてあるのは「閉じ括弧と空白を確かに越えた」という意図を示すためです。<code>i+2 &gt;= len(line)</code> のチェックは、その先に本当に中身があるかの確認になります。</p>
+    </div>
+
+    <p><code>ReadStartTime</code> のほうは、コンテナを起動した直後に呼ばれます。第01章で見た <code>container.Run</code> の中に、この 2 行がありました。</p>
+
+    <div class="file-tag">internal/container/run.go — Run の一部（再掲）</div>
+<pre><code>	pid := cmd.<span class="ty">Process</span>.<span class="ty">Pid</span>
+	st.<span class="ty">PID</span> = pid
+	st.<span class="ty">StartTime</span> = <span class="ty">ReadStartTime</span>(pid)</code></pre>
+
+    <p>子プロセスを起動した直後、まだ生きているうちに起動時刻を読んで記録しておく。これが後の生死判定の基準になります。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>/proc/&lt;pid&gt;/stat</code> がどんな行なのか、自分のシェルで覗いてみてください（<code>$$</code> は今のシェルの PID です）。</p>
+      <pre class="term"><code><span class="ps">$</span> cat /proc/$$/stat</code></pre>
+      <p>出力はあなたの環境ごとに違うので、ここには貼りません（この教材が貼る出力は実測したものだけ、という決まりです）。見てほしいのは形です。<strong>2 番目が括弧で包まれていること</strong>、そして<strong>その先にずらりと数値が並んでいること</strong>。左から数えて 22 番目の数が起動時刻です。手で数えてみると、「素朴に <code>awk '{print $22}'</code> と書いてはいけない」理由が体で分かります。</p>
+    </div>
+
+    <h2 class="step" id="step-5"><span class="step-no">Step 5</span><code>ps</code> を作る</h2>
+
+    <p>道具が揃いました。<code>ps</code> は「<code>containers/</code> の下を全部読んで、生きているものだけ並べる」だけです。まず一覧を作る側から。</p>
+
+    <div class="file-tag">internal/container/state.go（7）— List</div>
+<pre><code><span class="cm">// List は実行中のコンテナだけを返す。</span>
+<span class="cm">//</span>
+<span class="cm">// 死んだのに記録が残っているもの（mydocker 自身が強制終了された場合など）は</span>
+<span class="cm">// 一覧には出さないが、**勝手に消しもしない**。マウントが残っている可能性があり、</span>
+<span class="cm">// 確認せずに消すのが最も危険だからである。片付けは mydocker rm で明示的に行う。</span>
+<span class="kw">func</span> <span class="ty">List</span>() ([]*<span class="ty">State</span>, <span class="kw">error</span>) {
+	entries, err := os.<span class="ty">ReadDir</span>(containersDir())
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">if</span> os.<span class="ty">IsNotExist</span>(err) {
+			<span class="kw">return</span> <span class="kw">nil</span>, <span class="kw">nil</span>
+		}
+		<span class="kw">return</span> <span class="kw">nil</span>, err
+	}
+	<span class="kw">var</span> alive []*<span class="ty">State</span>
+	<span class="kw">for</span> _, e := <span class="kw">range</span> entries {
+		<span class="kw">if</span> !e.<span class="ty">IsDir</span>() {
+			<span class="kw">continue</span>
+		}
+		s, err := loadExact(e.<span class="ty">Name</span>())
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">continue</span>
+		}
+		<span class="kw">if</span> s.<span class="ty">IsAlive</span>() {
+			alive = <span class="kw">append</span>(alive, s)
+		}
+	}
+	sort.<span class="ty">Slice</span>(alive, <span class="kw">func</span>(i, j <span class="kw">int</span>) <span class="kw">bool</span> { <span class="kw">return</span> alive[i].<span class="ty">CreatedAt</span>.<span class="ty">Before</span>(alive[j].<span class="ty">CreatedAt</span>) })
+	<span class="kw">return</span> alive, <span class="kw">nil</span>
+}</code></pre>
+
+    <p>読みどころが 3 つあります。</p>
+
+    <p><strong>1. ディレクトリが無いのはエラーではない。</strong><code>os.IsNotExist(err)</code> のときは <code>nil, nil</code> を返します。<code>mydocker</code> をインストールして最初に <code>mydocker ps</code> を打ったとき、<code>/var/lib/mydocker/containers/</code> はまだ存在しません。それは「コンテナが 0 件」であって「失敗」ではない。<strong>「まだ何もない」と「壊れている」を区別する</strong>のは、道具として当たり前の礼儀です。</p>
+
+    <p><strong>2. 壊れた記録は黙って飛ばす。</strong><code>loadExact</code> が失敗したら <code>continue</code>。1 つの壊れた <code>state.json</code> のせいで <code>ps</code> 全体が失敗すると、<em>まさに調べたいときに調べられない</em> という最悪の状況になります。</p>
+
+    <p><strong>3. 作成順に並べる。</strong><code>sort.Slice</code> で <code>CreatedAt</code> の昇順。<code>os.ReadDir</code> はファイル名順（＝ランダムな 16 進文字列の順）で返してくるので、そのままだと打つたびに順番が変わって見えます。<strong>同じ状態なら同じ表示になる</strong>ことは、目視で差分を見るときに効きます。</p>
+
+    <p>そして表示する側。</p>
+
+    <div class="file-tag">internal/cli/cli.go — cmdPS</div>
+<pre><code><span class="kw">func</span> cmdPS(args []<span class="kw">string</span>) <span class="kw">error</span> {
+	list, err := container.<span class="ty">List</span>()
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	w := tabwriter.<span class="ty">NewWriter</span>(os.<span class="ty">Stdout</span>, <span class="st">0</span>, <span class="st">0</span>, <span class="st">3</span>, <span class="st">' '</span>, <span class="st">0</span>)
+	fmt.<span class="ty">Fprintln</span>(w, <span class="st">"CONTAINER ID\tIMAGE\tCOMMAND\tPID\tSTATUS\tCREATED"</span>)
+	<span class="kw">for</span> _, s := <span class="kw">range</span> list {
+		fmt.<span class="ty">Fprintf</span>(w, <span class="st">"%s\t%s\t%s\t%d\t%s\t%s\n"</span>,
+			s.<span class="ty">ID</span>, s.<span class="ty">Image</span>, strings.<span class="ty">Join</span>(s.<span class="ty">Command</span>, <span class="st">" "</span>), s.<span class="ty">PID</span>, <span class="st">"Up"</span>,
+			time.<span class="ty">Since</span>(s.<span class="ty">CreatedAt</span>).<span class="ty">Truncate</span>(time.<span class="ty">Second</span>))
+	}
+	<span class="kw">if</span> err := w.<span class="ty">Flush</span>(); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="cm">// ★件数を実数で出す。「0件でも緑」を防ぐため、テストはこの行を数える。</span>
+	fmt.<span class="ty">Printf</span>(<span class="st">"合計 %d 件\n"</span>, <span class="kw">len</span>(list))
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <div class="gonote"><div class="box-k">GO メモ · text/tabwriter</div>
+      <p>表を整形するとき、素朴には <code>fmt.Printf("%-14s %-38s ...")</code> のように<strong>桁数を決め打ち</strong>します。これは動きますが、イメージ名が長いと崩れ、短いとスカスカになります。しかも桁数はコードの中に何度も書かれるので、1 か所直し忘れると列がずれます。</p>
+      <p>標準ライブラリの <code>text/tabwriter</code> はこれを解決します。使い方は 3 手です。</p>
+      <ol>
+        <li><code>w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)</code> でライタを作る</li>
+        <li>各列を<strong>タブ文字 <code>\t</code> で区切って</strong> <code>w</code> に書く</li>
+        <li>最後に <code>w.Flush()</code> を呼ぶ</li>
+      </ol>
+      <p><code>Flush</code> を呼ぶまで <code>tabwriter</code> は出力を溜め込みます。全部の行が揃ってはじめて<strong>各列の最大幅が決まる</strong>からです。決まってから、幅を揃えて一気に吐き出す。だから <code>Flush</code> を忘れると<strong>何も表示されません</strong>。これは <code>tabwriter</code> でいちばんよくある事故です。</p>
+      <p><code>NewWriter</code> の引数は順に、出力先・最小セル幅（<code>0</code>）・タブ幅（<code>0</code>）・<strong>パディング（<code>3</code>）</strong>・埋める文字（<code>' '</code>）・フラグ（<code>0</code>）です。4 番目の <code>3</code> が「列と列の間に最低 3 文字あける」という指定で、<code>mydocker ps</code> の出力で列間が 3 スペース空いているのはこれです。</p>
+      <p>そして最後の <code>fmt.Printf("合計 %d 件\n", ...)</code> は <strong><code>w</code> ではなく <code>os.Stdout</code> に直接</strong>書いていることに注意してください。<code>w.Flush()</code> を先に呼んでいるので順番は崩れません。この行はタブを含まないので、表の列揃えに巻き込みたくないのです。</p>
+    </div>
+
+    <h3>なぜ「合計 N 件」を出すのか</h3>
+
+    <p>コードのコメントに <strong>「★件数を実数で出す。「0件でも緑」を防ぐため、テストはこの行を数える」</strong> とあります。これは見た目の親切心ではなく、<strong>テストが空振りしないための仕掛け</strong>です。</p>
+
+    <p>こういうテストを書いたとします。</p>
+
+    <pre><code><span class="cm"># コンテナを起動して、ps に出ることを確かめたい（この書き方は駄目）</span>
+mydocker run --quiet alpine sleep 20 &amp;
+mydocker ps | grep -q alpine &amp;&amp; echo OK</code></pre>
+
+    <p>一見よさそうです。しかし <code>grep</code> が失敗したときも、<code>&amp;&amp;</code> の左が偽になるだけで、<strong>スクリプト全体は成功で終わる</strong>かもしれません。あるいは <code>ps</code> の実装が壊れて 1 行も出さなくなっても、テストの側に「何件出るはずか」という期待値が書かれていなければ、<strong>0 件でも「失敗 0 件」で緑になります</strong>。</p>
+
+    <p>これは私が第04章の cgroup でも踏んだ罠と同じ形です（「上限が効いていることを確かめたつもりが、テストのほうが間違っていた」）。<strong>「何も起きなかった」と「正しく動いた」を、テストが区別できていない</strong>のです。</p>
+
+    <p>そこで <code>ps</code> は必ず末尾に <code>合計 N 件</code> を出します。テストはこの <code>N</code> を読んで、期待値と突き合わせる。<strong>0 件なら 0 件だと明示的に主張させる</strong>ことで、空振りが空振りとして検出されるようになります。E2E テストの実際の行はこうです。</p>
+
+<pre class="term"><code><span class="ps">$</span> python3 e2e_test.py
+<span class="out">  OK   10 回連続で起動・終了してもすべて成功する（実数で確認: 10/10 件成功）</span></code></pre>
+
+    <p><strong>「実数で確認」</strong>という言葉が入っているのは、この方針を自分に課している印です。この考え方は <code>mydocker info</code> の <code>overlay 数: 0 件</code> にも同じように効いています（Step 8）。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · 整形出力を機械が解析する</div>
+      <p><code>ps</code> の出力を作ったので、次に自然にやりたくなるのがこれです。</p>
+      <pre><code><span class="cm"># コンテナの PID を取りたい（実際に書いて、実際に壊れた）</span>
+pid=$(mydocker ps | awk '{print $4}')</code></pre>
+      <p>PID は 4 列目（CONTAINER ID / IMAGE / COMMAND / PID）だから <code>$4</code>。理屈は通っています。<strong>そして壊れました。</strong>実際に取れたのは <code>sleep 40</code> の <code>40</code> でした。</p>
+      <p>理由は明白です。<strong>COMMAND 列に空白が入る</strong>から。<code>awk</code> は空白で列を切るので、<code>sleep 40</code> は 2 列に見えます。列がずれる。</p>
+      <p>これは Step 4 の <code>/proc/&lt;pid&gt;/stat</code> とまったく同じ形の失敗です。<strong>「空白区切りの整形出力は、値の中に空白が入った瞬間に壊れる」</strong>——ここまでで 2 回踏みました。</p>
+      <p>教訓は 2 つ。</p>
+      <ul>
+        <li><strong>整形出力は人間のためのもの。</strong>列幅も列順も、読みやすさのために将来変わり得ます。機械がそれを解析する前提にしてはいけません</li>
+        <li><strong>機械が読むときは構造化されたものを読む。</strong><code>mydocker</code> の E2E テストは、<code>ps</code> の出力ではなく <code>/var/lib/mydocker/containers/&lt;ID&gt;/state.json</code> を直接読んで PID を取り出すように直しました。JSON なら空白が入っても壊れません</li>
+      </ul>
+      <p>ついでに言えば、これが Step 3 で「状態をファイルに、しかも JSON で置く」ことに価値があったもうひとつの理由です。<strong>人間向けの表示と、機械向けの真実を、別々に持っておく。</strong></p>
+    </div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>sleep 20</code> を走らせるコンテナを起動してから、別の端末で <code>ps</code> を打ちます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker ps
+<span class="out">CONTAINER ID   IMAGE                                 COMMAND    PID     STATUS   CREATED
+0c1be9ad663a   mirror.gcr.io/library/alpine:latest   sleep 20   16144   Up       0s
+合計 1 件</span></code></pre>
+      <p>6 列が揃い、末尾に <code>合計 1 件</code>。<code>CREATED</code> の <code>0s</code> は <code>time.Since(s.CreatedAt).Truncate(time.Second)</code> の結果です（起動直後なので 0 秒）。</p>
+      <p>20 秒待ってからもう一度打つと、こうなります。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker ps
+<span class="out">CONTAINER ID   IMAGE   COMMAND   PID   STATUS   CREATED
+合計 0 件</span></code></pre>
+      <p>ヘッダだけが残り、<code>合計 0 件</code>。<code>sleep 20</code> が終わってコンテナが片付いた、ということが<strong>数字で</strong>分かります。ヘッダの列幅が縮んでいるのは <code>tabwriter</code> が中身に合わせて幅を決めているからで、これも「整形出力を機械が解析してはいけない」ことの証拠のひとつです。</p>
+    </div>
+
+    <h2 class="step" id="step-6"><span class="step-no">Step 6</span><code>exec</code> を作る</h2>
+
+    <p>次は <code>mydocker exec</code>。動いているコンテナの中で、もう 1 つコマンドを走らせる機能です。<code>docker exec -it &lt;ID&gt; sh</code> でお世話になったことがあるはずです。</p>
+
+    <p>やりたいことは明確です。<strong>既にあるコンテナの名前空間に、あとから参加する。</strong>第01章では <code>clone(2)</code> で「新しい名前空間と一緒に子を生む」ことをしました。今度は逆で、既存の名前空間に入りたい。そのためのシステムコールが <code>setns(2)</code> です。</p>
+
+    <div class="gonote"><div class="box-k">LINUX メモ · setns(2) の制約</div>
+      <p><code>setns(fd, nstype)</code> は「<code>fd</code> が指している名前空間に、呼び出し元を参加させる」システムコールです。<code>fd</code> はどこから取るのか——<code>/proc/&lt;pid&gt;/ns/</code> の下にあるファイルを開いて得ます。</p>
+      <pre><code>/proc/&lt;pid&gt;/ns/
+  ├ pid     ← そのプロセスが属する PID 名前空間
+  ├ mnt     ← マウント名前空間
+  ├ uts     ← ホスト名の名前空間
+  ├ ipc     ← プロセス間通信の名前空間
+  ├ net     ← ネットワーク名前空間
+  └ user    ← ユーザー名前空間</code></pre>
+      <p>これらは普通のファイルではなく、<strong>名前空間そのものへの参照</strong>です。開いて <code>setns</code> に渡すと、その名前空間に入れます。</p>
+      <p>ところが、名前空間の種類ごとに<strong>制約が違います</strong>。この章に関係するのは次の 2 つです。</p>
+      <ul>
+        <li><strong>PID 名前空間の <code>setns</code> は、呼び出し元自身には効かない。</strong>効くのは<strong>そのあとに作る子プロセス</strong>から。第01章で <code>unshare(CLONE_NEWPID)</code> について見たのと同じ理屈です（走っている最中に自分の番号が変わったら困るから）</li>
+        <li><strong>マウント名前空間の <code>setns</code> は、呼び出し元がシングルスレッドでなければならない。</strong>スレッドが 2 本以上あると <code>EINVAL</code> で失敗します</li>
+      </ul>
+      <p>2 つ目が厄介です。マウント名前空間は「どのファイルシステムがどこに見えるか」という、<strong>プロセス全体の世界観</strong>を決めるもの。スレッドごとに違う世界に住んでいる状態は意味が通らないので、カーネルは「全スレッドまとめて移す」か「そもそも許さない」かを選び、後者を選びました。</p>
+      <p>そして——<strong>Go のランタイムは常にマルチスレッドです。</strong>あなたが goroutine を 1 つも作らなくても、ガベージコレクタとスケジューラのために裏で複数の OS スレッドが走っています。<strong>つまり、素の Go からマウント名前空間へ <code>setns</code> することはできません。</strong></p>
+      <p>本物の <code>runc</code> はこの一点のために、<strong>cgo で C のコンストラクタ</strong>を書いています。C の <code>__attribute__((constructor))</code> を使うと、Go のランタイムが起動して<strong>スレッドを増やす前</strong>にコードを走らせられる。その一瞬（＝まだシングルスレッドの瞬間）に <code>setns</code> を済ませてしまう、という荒業です（<code>nsexec</code> という名前で知られています）。</p>
+    </div>
+
+    <p>さあ、判断のときです。<code>mydocker</code> は「Go の標準ライブラリだけで書く」を前提にしています。cgo を持ち込むとその前提が崩れ、読者にとっても難度が跳ね上がる。選択肢を並べてみます。</p>
+
+    <table>
+      <tr><th>案</th><th>内容</th><th>評価</th></tr>
+      <tr><td>A</td><td>cgo で C の初期化コードを書く（<code>runc</code> と同じ手）</td><td>標準ライブラリのみという前提を崩す。読者にとっても難度が跳ね上がる。<strong>却下</strong></td></tr>
+      <tr><td>B</td><td>マウント名前空間には入らず、ホストから <code>/proc/&lt;pid&gt;/root</code> を覗く</td><td><code>chroot</code> 相当に戻ってしまう。第03章で退けたものと同じ。<strong>却下</strong></td></tr>
+      <tr><td><strong>C</strong></td><td><strong>PID / UTS / IPC には <code>setns</code> で参加し、マウントだけ新しく作って同じ <code>merged</code> を根にする</strong></td><td><strong>採用</strong></td></tr>
+    </table>
+
+    <p>C を選びました。<strong>これは「できたふり」ではありませんが、完全でもありません。</strong>その割り切りの中身を、ごまかさずに書きます。</p>
+
+    <div class="ascii">exec の名前空間の参加関係
+
+  コンテナ本体（PID 1）                   mydocker exec が作る子
+  ────────────────────────           ────────────────────────────
+   PID  名前空間 ───── setns ──────→   同じものに参加 ✔
+   UTS  名前空間 ───── setns ──────→   同じものに参加 ✔
+   IPC  名前空間 ───── setns ──────→   同じものに参加 ✔
+
+   MNT  名前空間        ✗ 入れない       CLONE_NEWNS で新しく作る
+     │  （Go はマルチスレッドなので            │
+     │    setns が EINVAL）                    │
+     └ 根: containers/&lt;ID&gt;/merged ───────────→ 根: 同じ merged を pivot_root
+
+  結果:
+    ・ps でコンテナ本体の PID 1 が見える     ← 本物の PID 名前空間にいる
+    ・hostname がコンテナのもの               ← 本物の UTS 名前空間にいる
+    ・見えるファイルは完全に同一              ← 同じ overlay の merged が根
+    ・ただし「マウント表」は別物              ← ここだけが割り切り</div>
+
+    <p>最後の 1 行が割り切りです。<code>exec</code> したプロセスは、コンテナ本体とは<strong>別の</strong>マウント名前空間にいます。だから、もし <code>exec</code> の中で新しくマウントをしても、それはコンテナ本体からは見えません。逆も同じです。</p>
+
+    <p>しかし<strong>根にしているのは同一の overlay の <code>merged</code></strong> なので、<strong>見えるファイルは完全に同一</strong>です。同じディレクトリを 2 つの名前空間から見ているだけですから、片方で書いたファイルはもう片方からも見えます。日常的な使い方——中を覗く、ログを見る、プロセスを確認する——では、違いはまったく現れません。</p>
+
+    <p>では実装を見ます。</p>
+
+    <div class="file-tag">internal/container/run.go — Exec</div>
+<pre><code><span class="cm">// Exec は実行中のコンテナの中でもう1つコマンドを走らせる。</span>
+<span class="cm">//</span>
+<span class="cm">// 実現の仕方:</span>
+<span class="cm">//   - PID / UTS / IPC 名前空間は setns で **既存のコンテナのものに参加する**</span>
+<span class="cm">//   - マウント名前空間だけは新しく作り、同じ merged ディレクトリを根にする</span>
+<span class="cm">//</span>
+<span class="cm">// なぜマウントだけ別扱いなのか: setns でマウント名前空間に入るには</span>
+<span class="cm">// **呼び出し元がシングルスレッドでなければならない**（多スレッドだと EINVAL）。</span>
+<span class="cm">// Go のランタイムは常にマルチスレッドなので、cgo を使わずにこれは満たせない。</span>
+<span class="cm">// 同じ overlay の merged を根にすれば、見えるファイルは完全に同一なので実害は無い。</span>
+<span class="cm">// （この割り切りは 03_implementation.md に判断として記録してある）</span>
+<span class="kw">func</span> <span class="ty">Exec</span>(st *<span class="ty">State</span>, argv []<span class="kw">string</span>, env []<span class="kw">string</span>) (<span class="kw">int</span>, <span class="kw">error</span>) {
+	<span class="kw">if</span> !st.<span class="ty">IsAlive</span>() {
+		<span class="kw">return</span> <span class="st">1</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"コンテナ %s は実行中ではありません"</span>, st.<span class="ty">ID</span>)
+	}
+
+	<span class="cm">// ⚠ setns はスレッド単位の操作である。fork もこのスレッドから行われる必要があるので、</span>
+	<span class="cm">//    goroutine を OS スレッドに固定してから触る。</span>
+	runtime.<span class="ty">LockOSThread</span>()
+	<span class="kw">defer</span> runtime.<span class="ty">UnlockOSThread</span>()
+
+	<span class="cm">// pid 名前空間への setns は「呼び出し元自身」ではなく「これから作る子」に効く。</span>
+	<span class="cm">// つまりこの後の cmd.Start() で生まれる子が、コンテナの PID 名前空間に入る。</span>
+	<span class="kw">for</span> _, ns := <span class="kw">range</span> []<span class="kw">struct</span> {
+		name <span class="kw">string</span>
+		flag <span class="kw">int</span>
+	}{
+		{<span class="st">"uts"</span>, syscall.<span class="ty">CLONE_NEWUTS</span>},
+		{<span class="st">"ipc"</span>, syscall.<span class="ty">CLONE_NEWIPC</span>},
+		{<span class="st">"pid"</span>, syscall.<span class="ty">CLONE_NEWPID</span>},
+	} {
+		path := filepath.<span class="ty">Join</span>(<span class="st">"/proc"</span>, fmt.<span class="ty">Sprint</span>(st.<span class="ty">PID</span>), <span class="st">"ns"</span>, ns.name)
+		f, err := os.<span class="ty">Open</span>(path)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> <span class="st">1</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"%s を開けませんでした: %w"</span>, path, err)
+		}
+		_, _, errno := syscall.<span class="ty">Syscall</span>(sysSetns, f.<span class="ty">Fd</span>(), <span class="kw">uintptr</span>(ns.flag), <span class="st">0</span>)
+		f.<span class="ty">Close</span>()
+		<span class="kw">if</span> errno != <span class="st">0</span> {
+			<span class="kw">return</span> <span class="st">1</span>, fmt.<span class="ty">Errorf</span>(<span class="st">"%s 名前空間に参加できませんでした: %v"</span>, ns.name, errno)
+		}
+	}
+
+	syncR, syncW, err := os.<span class="ty">Pipe</span>()
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">1</span>, err
+	}
+	args := <span class="kw">append</span>([]<span class="kw">string</span>{<span class="st">"init"</span>, st.<span class="ty">Merged</span>, st.<span class="ty">Hostname</span>, orSlash(st.<span class="ty">Workdir</span>)}, argv...)
+	cmd := exec.<span class="ty">Command</span>(<span class="st">"/proc/self/exe"</span>, args...)
+	cmd.<span class="ty">SysProcAttr</span> = &amp;syscall.<span class="ty">SysProcAttr</span>{
+		Cloneflags:   syscall.<span class="ty">CLONE_NEWNS</span>,
+		Unshareflags: syscall.<span class="ty">CLONE_NEWNS</span>,
+	}
+	cmd.<span class="ty">Stdin</span>, cmd.<span class="ty">Stdout</span>, cmd.<span class="ty">Stderr</span> = os.<span class="ty">Stdin</span>, os.<span class="ty">Stdout</span>, os.<span class="ty">Stderr</span>
+	cmd.<span class="ty">Env</span> = env
+	cmd.<span class="ty">ExtraFiles</span> = []*os.<span class="ty">File</span>{syncR}
+
+	<span class="kw">if</span> err := cmd.<span class="ty">Start</span>(); err != <span class="kw">nil</span> {
+		syncR.<span class="ty">Close</span>()
+		syncW.<span class="ty">Close</span>()
+		<span class="kw">return</span> <span class="st">1</span>, err
+	}
+	syncR.<span class="ty">Close</span>()
+	<span class="cm">// exec では cgroup を触らないので、すぐに合図を送ってよい。</span>
+	_, _ = syncW.<span class="ty">WriteString</span>(syncReady)
+	syncW.<span class="ty">Close</span>()
+
+	<span class="kw">return</span> exitCode(cmd.<span class="ty">Wait</span>()), <span class="kw">nil</span>
+}</code></pre>
+
+    <p>上から順に読みます。</p>
+
+    <p><strong>まず生死の確認。</strong><code>st.IsAlive()</code> が偽なら即エラー。Step 4 で作った判定がここで効きます。死んだコンテナの PID に <code>setns</code> しようとすると、運が悪ければ<strong>まったく無関係のプロセスの名前空間に入ってしまう</strong>ので、この関門は必須です。</p>
+
+    <p><strong>次に <code>runtime.LockOSThread()</code>。</strong>これが要る理由は次のメモで詳しく扱います。</p>
+
+    <p><strong>そして <code>setns</code> を 3 回。</strong>UTS・IPC・PID の順です。<code>/proc/&lt;PID&gt;/ns/uts</code> のようなパスを組み立てて開き、そのファイルディスクリプタを <code>setns</code> に渡す。ループを匿名構造体のスライスで回しているのは、「名前」と「フラグ」を対にして並べたかったからです。3 回同じことを書くより、対応表として読めます。</p>
+
+    <p><strong>最後に <code>init</code> を起動。</strong>第01章とまったく同じ re-exec です。ただし <code>Cloneflags</code> が <code>CLONE_NEWNS</code> だけ。PID も UTS も IPC も、もう参加済みだからです。生まれた子は <code>init</code> として <code>pivot_root</code> を行い、<code>st.Merged</code>（＝コンテナ本体と同じ overlay）を自分の <code>/</code> にします。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · runtime.LockOSThread</div>
+      <p>Go の goroutine は、OS スレッドの上を<strong>移動します</strong>。ランタイムのスケジューラが、空いているスレッドに goroutine を割り当てて走らせる。ある行はスレッド A で、次の行はスレッド B で実行される、ということが普通に起こります（システムコールで一度ブロックした後などが典型です）。</p>
+      <p>普段はこれで何も困りません。ところが <code>setns</code> のような<strong>スレッド単位で効くシステムコール</strong>を使うと、話が変わります。</p>
+      <pre><code>	setns(pid 名前空間)   ← スレッド A で実行。効果はスレッド A に付く
+	（ここで goroutine がスレッド B に移動したら…）
+	cmd.<span class="ty">Start</span>()            ← スレッド B で fork。★名前空間に入っていない子が生まれる</code></pre>
+      <p><strong>効果を付けたスレッドと、実際に子を作るスレッドが違ってしまう。</strong>しかも、いつ移動するかはこちらから制御できません。テストでは動いて本番で稀に壊れる、という最悪の形のバグになります。</p>
+      <p><code>runtime.LockOSThread()</code> は「この goroutine を、今走っている OS スレッドに固定する」という宣言です。以後 <code>runtime.UnlockOSThread()</code> を呼ぶまで、この goroutine は他のスレッドに移りません。逆に、そのスレッドで他の goroutine が走ることもありません。</p>
+      <p>これで「<code>setns</code> したスレッドから <code>fork</code> する」が保証されます。<code>defer runtime.UnlockOSThread()</code> で関数を抜けるときに解除するのも忘れずに。解除しないままにすると、そのスレッドが専有されたままになります。</p>
+      <p>この関数が必要になる場面は、実は決まっています。<strong>スレッドに紐づく OS の状態を触るとき</strong>です。<code>setns</code>・<code>unshare</code>・<code>setuid</code> 系、そして OpenGL のようにスレッドローカルな文脈を持つライブラリを呼ぶとき。Go の日常のコードでは一生使いませんが、カーネルの近くまで降りると必ず出会います。</p>
+    </div>
+
+    <p>もうひとつ、標準ライブラリの穴を埋めている箇所があります。<code>syscall.Syscall(sysSetns, ...)</code> の <code>sysSetns</code> です。</p>
+
+    <div class="file-tag">internal/container/setns_linux_amd64.go（全文）</div>
+<pre><code><span class="kw">package</span> container
+
+<span class="cm">// setns(2) のシステムコール番号。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ Go の標準ライブラリ syscall パッケージには SYS_SETNS が入っていない。</span>
+<span class="cm">// golang.org/x/sys/unix には Setns があるが、この教材は標準ライブラリだけで書く決まりなので、</span>
+<span class="cm">// 番号を自分で持ち、syscall.Syscall で直接呼ぶ。</span>
+<span class="cm">//</span>
+<span class="cm">// 番号は CPU アーキテクチャごとに違う。ファイル名の _amd64 で自動的に切り替わる。</span>
+<span class="cm">// 出典: Linux カーネルの arch/x86/entry/syscalls/syscall_64.tbl</span>
+<span class="kw">const</span> sysSetns = <span class="st">308</span></code></pre>
+
+    <div class="file-tag">internal/container/setns_linux_arm64.go（全文）</div>
+<pre><code><span class="kw">package</span> container
+
+<span class="cm">// setns(2) のシステムコール番号（arm64）。</span>
+<span class="cm">// 出典: Linux カーネルの include/uapi/asm-generic/unistd.h（__NR_setns）</span>
+<span class="kw">const</span> sysSetns = <span class="st">268</span></code></pre>
+
+    <p>Go の <code>syscall</code> パッケージには <code>SYS_SETNS</code> が<strong>定義されていません</strong>。あの中身は Go 1 の互換性保証に縛られていて、新しいシステムコールは <code>golang.org/x/sys/unix</code> のほうに足されていく、という運用になっているためです。</p>
+
+    <p>この教材は外部ライブラリを使わない決まりなので、<strong>番号を自分で持ちます</strong>。システムコールは結局のところ「番号を指定してカーネルに飛び込む」だけの仕組みなので、番号さえ分かれば <code>syscall.Syscall</code> で直接呼べます。</p>
+
+    <p>番号は CPU アーキテクチャごとに違います。amd64 なら 308、arm64 なら 268。ここで Go のビルド機構が効いてきます。<strong>ファイル名の末尾が <code>_linux_amd64.go</code> なら、Linux の amd64 でビルドするときだけこのファイルがコンパイルされる。</strong><code>_linux_arm64.go</code> も同じ。だから両方に同じ名前の定数を書いておけば、ビルドするアーキテクチャに応じて<strong>自動的に正しいほうが選ばれます</strong>。<code>#ifdef</code> のような仕掛けを書かずに済む、地味に気持ちのいい仕組みです。</p>
+
+    <p>CLI 側は、いつものように薄いだけです。</p>
+
+    <div class="file-tag">internal/cli/cli.go — cmdExec</div>
+<pre><code><span class="kw">func</span> cmdExec(args []<span class="kw">string</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> <span class="kw">len</span>(args) &lt; <span class="st">2</span> {
+		<span class="kw">return</span> errors.<span class="ty">New</span>(<span class="st">"使い方: mydocker exec &lt;ID&gt; &lt;コマンド...&gt;"</span>)
+	}
+	st, err := container.<span class="ty">Load</span>(args[<span class="st">0</span>])
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	env := []<span class="kw">string</span>{
+		<span class="st">"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"</span>,
+		<span class="st">"HOME=/root"</span>,
+		<span class="st">"TERM="</span> + os.<span class="ty">Getenv</span>(<span class="st">"TERM"</span>),
+	}
+	code, err := container.<span class="ty">Exec</span>(st, args[<span class="st">1</span>:], env)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> err
+	}
+	<span class="kw">if</span> code != <span class="st">0</span> {
+		<span class="kw">return</span> &amp;<span class="ty">ExitError</span>{Code: code}
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p><code>Load</code> → <code>Exec</code> → 終了コードを <code>ExitError</code> に包む。それだけ。Step 1 で見た「入り口は薄く」がここでも効いています。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>sleep 20</code> のコンテナが動いている間に、その中で <code>hostname</code> と <code>ps</code> を打ってみます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker exec 0c1be9ad663a /bin/sh -c 'hostname; ps'
+<span class="out">mydocker
+PID   USER     TIME  COMMAND
+    1 root      0:00 sleep 20
+    8 root      0:00 /bin/sh -c hostname; ps
+   15 root      0:00 ps</span></code></pre>
+      <p>この 5 行に、割り切りの成果が全部出ています。</p>
+      <ul>
+        <li><code>hostname</code> が <code>mydocker</code> — <strong>本物の UTS 名前空間に参加できている</strong>証拠です。ホストの名前は <code>vm</code> でした</li>
+        <li><code>PID 1</code> に <code>sleep 20</code> が見えている — <strong>本物の PID 名前空間に参加できている</strong>証拠です。<code>exec</code> で入った <code>/bin/sh</code> はコンテナ本体の PID 1 を見ています</li>
+        <li>自分が <code>PID 8</code> — ホストの PID（16144 台）ではなく、コンテナの台帳の番号で呼ばれています</li>
+      </ul>
+      <p>マウント名前空間だけが別物なのですが、<strong>この出力からは一切それが分かりません</strong>。それが「実害は無い」の意味です。</p>
+    </div>
+
+    <p>正直に書いておきます。<strong>これは完全な <code>exec</code> ではありません。</strong>もしコンテナ本体が起動後に自分でマウントを足していたら、<code>exec</code> で入ったプロセスからはそれが見えません（根は同じですが、その上に重ねられたマウントは別の名前空間の出来事だからです）。<code>docker exec</code> はこれを正しく扱います。</p>
+
+    <p>そのことを <code>src/README.md</code> の「⚠ 既知の割り切り」に明記しました。<strong>できていないことを、できているかのように書かない。</strong>教材としても、道具としても、これは譲れない一線です。何ができて何ができないかがはっきり書いてある道具は信用できますが、境界を曖昧にした道具は、いつどこで裏切るか分かりません。</p>
+
+    <h2 class="step" id="step-7"><span class="step-no">Step 7</span>★後片付け — この章の本番</h2>
+
+    <p>ここからが、この章でいちばん大事な話です。</p>
+
+    <p>コンテナが終わったとき、片付けるものが 3 つあります。</p>
+
+    <ol>
+      <li><strong>cgroup ディレクトリ</strong>（<code>/sys/fs/cgroup/.../mydocker/&lt;ID&gt;/</code>）</li>
+      <li><strong>overlay のマウント</strong>（<code>containers/&lt;ID&gt;/merged</code>）</li>
+      <li><strong>コンテナ用ディレクトリ</strong>（<code>containers/&lt;ID&gt;/</code> 丸ごと。<code>state.json</code>・<code>upper</code>・<code>work</code> を含む）</li>
+    </ol>
+
+    <p>素朴に書くとこうなります。</p>
+
+    <pre><code><span class="cm">// 素朴案（これは危険）</span>
+os.<span class="ty">Remove</span>(cgroupDir)
+syscall.<span class="ty">Unmount</span>(merged, <span class="st">0</span>)
+os.<span class="ty">RemoveAll</span>(containerDir)</code></pre>
+
+    <p>3 行。何も難しくないように見えます。<strong>この 3 行が、条件が揃うとイメージを丸ごと消します。</strong></p>
+
+    <h3>なぜ消えるのか</h3>
+
+    <p><code>umount</code> は <strong><code>EBUSY</code>（デバイスが使用中）で日常的に失敗します</strong>。珍しい状況ではありません。</p>
+
+    <ul>
+      <li>コンテナのプロセスがまだ完全には終わっていない</li>
+      <li>誰かのシェルの作業ディレクトリがそのマウントの中にある</li>
+      <li>そのマウントの中のファイルを誰かが開いたままにしている</li>
+      <li><code>exec</code> で入ったプロセスが残っている</li>
+    </ul>
+
+    <p>これだけで <code>EBUSY</code> です。そして上の素朴案は<strong>戻り値を見ていません</strong>。<code>Unmount</code> が失敗しても、次の行の <code>os.RemoveAll(containerDir)</code> に進みます。</p>
+
+    <p>ここで何が起きるか。<code>containerDir</code> の下には <code>merged/</code> があります。<code>merged/</code> は<strong>マウントされたまま</strong>です。マウントされたディレクトリの中身は、下層（<code>lowerdir</code>）＝<strong>展開済みのイメージレイヤそのもの</strong>です。</p>
+
+    <div class="ascii">アンマウント失敗を無視して削除に進むと何が起きるか
+
+  containers/&lt;ID&gt;/
+    ├ state.json
+    ├ upper/          ← 消えてよい（このコンテナの書き込み）
+    ├ work/           ← 消えてよい
+    └ merged/         ← ★まだマウントされている
+         │
+         │ overlay 越しに見えているのは…
+         ↓
+      layers/sha256_55afa1ecc21d…/     ← ★イメージの実体
+        ├ bin/                            （他のコンテナも使う共有資産）
+        ├ etc/
+        └ …
+
+  os.RemoveAll(containers/&lt;ID&gt;/) は
+  merged/ の中を再帰的に辿って削除しようとする
+        ↓
+  ★マウント越しに layers/ の実体まで消える
+        ↓
+  次に mydocker run すると「レイヤのディレクトリがありません」
+  もう一度 pull し直すしかない。他のコンテナも巻き添え。</div>
+
+    <p><code>rm -rf</code> はマウントポイントを特別扱いしません。<strong>そこにあるファイルを、あるがままに消します。</strong>overlay 越しに見えているファイルを消せば、消えるのは下層の実体です。</p>
+
+    <p>この事故が恐ろしいのは、<strong>エラーが出ないこと</strong>です。<code>umount</code> の失敗は無視され、<code>RemoveAll</code> は成功します。プログラムは正常終了します。壊れたことに気づくのは、次にコンテナを起動しようとしたときです。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · <code>umount</code> 失敗を無視して削除に進む</div>
+      <p><strong>アンマウントの成否を確かめずに削除へ進んではいけません。</strong>これは「気をつけましょう」という話ではなく、<strong>コードの構造で防ぐ</strong>べきものです。</p>
+      <p><code>mydocker</code> では 3 つの関所を置いています。</p>
+      <ol>
+        <li><strong><code>overlay.Mount.Unmount()</code> は、成功したように見えても <code>IsMountPoint</code> で本当に外れたかを確認する。</strong>外れていなければエラーを返す</li>
+        <li><strong>呼び出し元（<code>Run</code> の <code>cleanup</code> と <code>Cleanup</code>）は、アンマウントが失敗したらそこで <code>return</code> する。</strong>削除の行に到達しない</li>
+        <li><strong><code>RemoveRecord</code> は、削除の直前にもう一度 <code>isMounted</code> で確認する。</strong>マウントされていれば削除せずエラーを返す</li>
+      </ol>
+      <p>3 番目は一見むだです。呼び出し元が既に確認しているのだから。<strong>むだではありません。</strong>これは「将来、誰かが順序を間違えて <code>RemoveRecord</code> を直接呼んだとき」の最後の砦です。<em>取り返しのつかない操作には、二重の関所を置く。</em></p>
+      <p>もうひとつ。アンマウントに失敗したとき、<code>mydocker</code> は<strong>状態ファイルも残します</strong>。中途半端に消して「何が残っているか分からない」状態を作るより、全部残して人間が調べられるようにするほうが安全だからです。片付け損ねたものは <code>mydocker rm</code> であとから回収できます（Step 9）。</p>
+    </div>
+
+    <p>では実装を見ます。</p>
+
+    <div class="file-tag">internal/container/run.go — Cleanup（全文）</div>
+<pre><code><span class="cm">// Cleanup は1つのコンテナの痕跡を片付ける。rm コマンドと、異常終了の後始末に使う。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ 順序が命。「アンマウント → 削除」であり、**前者が失敗したら後者に進まない**。</span>
+<span class="kw">func</span> <span class="ty">Cleanup</span>(st *<span class="ty">State</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> st.<span class="ty">IsAlive</span>() {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"コンテナ %s はまだ実行中です。先に終了させてください"</span>, st.<span class="ty">ID</span>)
+	}
+	<span class="kw">var</span> firstErr <span class="kw">error</span>
+
+	<span class="kw">for</span> _, dir := <span class="kw">range</span> st.<span class="ty">CgroupDirs</span> {
+		<span class="kw">if</span> err := os.<span class="ty">Remove</span>(dir); err != <span class="kw">nil</span> &amp;&amp; !os.<span class="ty">IsNotExist</span>(err) {
+			firstErr = fmt.<span class="ty">Errorf</span>(<span class="st">"cgroup ディレクトリを削除できませんでした (%s): %w"</span>, dir, err)
+		}
+	}
+	<span class="kw">if</span> st.<span class="ty">Merged</span> != <span class="st">""</span> &amp;&amp; overlay.<span class="ty">IsMountPoint</span>(st.<span class="ty">Merged</span>) {
+		m := &amp;overlay.<span class="ty">Mount</span>{Merged: st.<span class="ty">Merged</span>}
+		<span class="kw">if</span> err := m.<span class="ty">Unmount</span>(); err != <span class="kw">nil</span> {
+			<span class="cm">// ★アンマウントに失敗したら絶対に削除へ進まない</span>
+			<span class="kw">if</span> firstErr == <span class="kw">nil</span> {
+				firstErr = err
+			}
+			<span class="kw">return</span> firstErr
+		}
+	}
+	<span class="kw">if</span> err := <span class="ty">RemoveRecord</span>(st); err != <span class="kw">nil</span> &amp;&amp; firstErr == <span class="kw">nil</span> {
+		firstErr = err
+	}
+	<span class="kw">return</span> firstErr
+}</code></pre>
+
+    <div class="ascii">後片付けの順序（Cleanup の分岐）
+
+  Cleanup(st)
+     │
+     ├ まだ生きている？ ──はい──→ ★エラーで即座に戻る
+     │                              「まだ実行中です。先に終了させてください」
+     ↓ いいえ
+  ① cgroup ディレクトリを rmdir（複数あり得る）
+     │  失敗しても firstErr に控えて続行
+     ↓
+  ② merged はマウントされている？
+     │
+     ├─いいえ──────────────────────────────┐
+     ↓ はい                                   │
+     umount(merged)                           │
+     │  失敗（EBUSY 等）→ MNT_DETACH を1度試す │
+     ↓                                        │
+     本当に外れたか？（IsMountPoint で確認）   │
+     │                                        │
+     ├─いいえ──→ ★ここで return。            │
+     │              削除に進まない。            │
+     │              状態ファイルも残す。        │
+     ↓ はい                                   │
+     └────────────────────────────────────────┘
+     ↓
+  ③ RemoveRecord(st)
+       └ ★もう一度 isMounted で確認（二重の関所）
+            ├ マウント中 → 削除せずエラー
+            └ 外れている → os.RemoveAll(containers/&lt;ID&gt;)</div>
+
+    <p>順に読みます。</p>
+
+    <p><strong>まず生死の確認。</strong>生きているコンテナを片付けるのは論外です。<code>mydocker rm</code> で実行中のものを指定すると、ここで止まります。</p>
+
+    <p><strong>次に cgroup。</strong>ここで <code>os.Remove</code>（＝ <code>rmdir</code>）を使っているのが重要です。</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · cgroup は <code>rm -rf</code> では消えない</div>
+      <p>cgroup のディレクトリを片付けようとして <code>os.RemoveAll</code>（＝ <code>rm -rf</code> 相当）を書くと、失敗します。<strong>cgroupfs は通常のファイルシステムではない</strong>からです。</p>
+      <p>あの中に見える <code>memory.limit_in_bytes</code> や <code>cgroup.procs</code> は、ディスク上のファイルではなく<strong>カーネルが見せている窓</strong>です。個別に <code>unlink</code> することはできません。<code>rm -rf</code> は中身を 1 つずつ消そうとして、そこで失敗します。</p>
+      <p>正しいのは <strong>ディレクトリそのものを <code>rmdir</code> する</strong>ことです。中の「ファイル」はディレクトリと一緒に消えます。<code>mydocker</code> が <code>os.RemoveAll</code> ではなく <code>os.Remove</code> を使っているのはこのためです。</p>
+      <p>そして <code>rmdir</code> は、<strong>その cgroup の中にまだプロセスが残っていれば失敗します</strong>。これは正しい挙動です。プロセスが残っているのに上限の枠を消してしまったら、そのプロセスは上限のない世界に放り出されます。だから <code>mydocker</code> はこの失敗を握りつぶさず、エラーとして返します。</p>
+      <p><code>os.IsNotExist(err)</code> のときだけは無視しています。「もう無い」は「片付いている」ということなので、エラーにする理由がありません。<strong>片付け処理は何度呼んでも同じ結果になる（冪等である）べき</strong>です。</p>
+    </div>
+
+    <p><strong>そして overlay。</strong>ここが本番です。<code>st.Merged != ""</code> と <code>overlay.IsMountPoint(st.Merged)</code> の両方を確認してから <code>Unmount</code> を呼びます。<code>Unmount</code> の中身は第06章で見たとおりです。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go — Unmount（再掲）</div>
+<pre><code><span class="kw">func</span> (m *<span class="ty">Mount</span>) <span class="ty">Unmount</span>() <span class="kw">error</span> {
+	<span class="kw">if</span> err := syscall.<span class="ty">Unmount</span>(m.<span class="ty">Merged</span>, <span class="st">0</span>); err != <span class="kw">nil</span> {
+		<span class="cm">// MNT_DETACH は「今すぐ切り離し、参照が切れたら実際に外す」遅延アンマウント。</span>
+		<span class="cm">// EBUSY のときの最後の手段として一度だけ試す。</span>
+		<span class="kw">if</span> err2 := syscall.<span class="ty">Unmount</span>(m.<span class="ty">Merged</span>, syscall.<span class="ty">MNT_DETACH</span>); err2 != <span class="kw">nil</span> {
+			<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"overlay を外せませんでした (%s): %w"</span>, m.<span class="ty">Merged</span>, err)
+		}
+	}
+	<span class="cm">// ★本当に外れたかを確認してからでなければ、呼び出し元は削除に進んではいけない。</span>
+	<span class="kw">if</span> <span class="ty">IsMountPoint</span>(m.<span class="ty">Merged</span>) {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"overlay がまだマウントされたままです: %s"</span>, m.<span class="ty">Merged</span>)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>普通の <code>umount</code> が失敗したら <code>MNT_DETACH</code> を一度だけ試す。それでも駄目ならエラー。<strong>そして成功したように見えても、<code>IsMountPoint</code> でもう一度確かめる。</strong>「システムコールがエラーを返さなかった」と「目的が達成された」は別のことです。</p>
+
+    <p><strong>最後に <code>RemoveRecord</code>。</strong>これが二重の関所の 3 つ目です。</p>
+
+    <div class="file-tag">internal/container/state.go（8）— RemoveRecord と isMounted</div>
+<pre><code><span class="cm">// RemoveRecord は状態ファイルとコンテナ用ディレクトリを消す。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ 呼び出す前に必ずアンマウントを済ませ、**成功を確認してから**呼ぶこと。</span>
+<span class="cm">//</span>
+<span class="cm">//	マウントされたまま消すと、マウント越しに lowerdir（＝イメージの実体）まで消える。</span>
+<span class="kw">func</span> <span class="ty">RemoveRecord</span>(s *<span class="ty">State</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> s.<span class="ty">Merged</span> != <span class="st">""</span> &amp;&amp; isMounted(s.<span class="ty">Merged</span>) {
+		<span class="kw">return</span> fmt.<span class="ty">Errorf</span>(<span class="st">"まだマウントされているため削除しません: %s"</span>, s.<span class="ty">Merged</span>)
+	}
+	<span class="kw">return</span> os.<span class="ty">RemoveAll</span>(stateDir(s.<span class="ty">ID</span>))
+}
+
+<span class="cm">// isMounted はマウントポイントかどうかを親との st_dev 比較で判定する。</span>
+<span class="cm">// 別のファイルシステムが被さっていれば、自分と親でデバイス番号が変わる。</span>
+<span class="kw">func</span> isMounted(path <span class="kw">string</span>) <span class="kw">bool</span> {
+	<span class="kw">var</span> st, parent syscall.<span class="ty">Stat_t</span>
+	<span class="kw">if</span> err := syscall.<span class="ty">Lstat</span>(path, &amp;st); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	<span class="kw">if</span> err := syscall.<span class="ty">Lstat</span>(filepath.<span class="ty">Dir</span>(path), &amp;parent); err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="kw">false</span>
+	}
+	<span class="kw">return</span> st.<span class="ty">Dev</span> != parent.<span class="ty">Dev</span>
+}</code></pre>
+
+    <p><code>isMounted</code> の判定方法が面白いところです。<strong>自分の <code>st_dev</code>（デバイス番号）と、親ディレクトリの <code>st_dev</code> を比べる。</strong>違えば、別のファイルシステムが被さっているということ——つまりマウントポイントです。<code>mountpoint(1)</code> コマンドと同じ考え方で、<code>/proc/mounts</code> を文字列で解析するより確実です（パスにエスケープが入る問題も避けられます）。</p>
+
+    <p>そして CLI 側。</p>
+
+    <div class="file-tag">internal/cli/cli.go — cmdRM</div>
+<pre><code><span class="kw">func</span> cmdRM(args []<span class="kw">string</span>) <span class="kw">error</span> {
+	<span class="kw">if</span> <span class="kw">len</span>(args) &lt; <span class="st">1</span> {
+		<span class="kw">return</span> errors.<span class="ty">New</span>(<span class="st">"使い方: mydocker rm &lt;ID&gt;"</span>)
+	}
+	<span class="kw">for</span> _, id := <span class="kw">range</span> args {
+		st, err := container.<span class="ty">Load</span>(id)
+		<span class="kw">if</span> err != <span class="kw">nil</span> {
+			<span class="kw">return</span> err
+		}
+		<span class="kw">if</span> err := container.<span class="ty">Cleanup</span>(st); err != <span class="kw">nil</span> {
+			<span class="kw">return</span> err
+		}
+		fmt.<span class="ty">Println</span>(st.<span class="ty">ID</span>)
+	}
+	<span class="kw">return</span> <span class="kw">nil</span>
+}</code></pre>
+
+    <p>複数の ID を並べて渡せます。片付けた ID を 1 行ずつ出力するのは <code>docker rm</code> と同じ作法で、シェルスクリプトから <code>mydocker rm $(...)</code> と繋げるときに効きます。</p>
+
+    <p>そして——<strong>同じ <code>Cleanup</code> が、正常終了のときにも呼ばれています。</strong>第01章で見た <code>container.Run</code> の中の <code>cleanup</code> クロージャは、この <code>Cleanup</code> とまったく同じ順序を守っています。</p>
+
+    <div class="file-tag">internal/container/run.go — Run の中の cleanup（再掲）</div>
+<pre><code>	<span class="cm">// 後片付けは1か所にまとめる。途中でどこで失敗しても必ずここを通す。</span>
+	cleanup := <span class="kw">func</span>(cg *cgroup.<span class="ty">Cgroup</span>) <span class="kw">error</span> {
+		<span class="kw">var</span> firstErr <span class="kw">error</span>
+		<span class="kw">if</span> cg != <span class="kw">nil</span> {
+			<span class="kw">if</span> err := cg.<span class="ty">Destroy</span>(); err != <span class="kw">nil</span> {
+				firstErr = err
+			}
+		}
+		<span class="cm">// ⚠ アンマウントの成否を確かめずに削除へ進んではいけない。</span>
+		<span class="cm">//    失敗したまま RemoveAll すると、マウント越しに lowerdir（＝イメージの実体）まで消える。</span>
+		<span class="kw">if</span> err := mnt.<span class="ty">Unmount</span>(); err != <span class="kw">nil</span> {
+			<span class="kw">if</span> firstErr == <span class="kw">nil</span> {
+				firstErr = err
+			}
+			<span class="cm">// ★削除には進まない。状態ファイルも残して、人間が調べられるようにする。</span>
+			<span class="kw">return</span> firstErr
+		}
+		<span class="kw">if</span> err := <span class="ty">RemoveRecord</span>(st); err != <span class="kw">nil</span> &amp;&amp; firstErr == <span class="kw">nil</span> {
+			firstErr = err
+		}
+		<span class="kw">return</span> firstErr
+	}</code></pre>
+
+    <p>「後片付けは 1 か所にまとめる。途中でどこで失敗しても必ずここを通す」というコメントのとおり、<code>Run</code> の中では起動処理のどの段階で失敗しても、このクロージャを通ってから戻ります。<strong>エラーの経路が増えるほど、片付け漏れは起きやすくなる。</strong>だから出口を 1 つに絞ります。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>実行中のコンテナを <code>rm</code> しようとすると、拒否されます。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker rm 0c1be9ad663a
+<span class="out">mydocker: コンテナ 0c1be9ad663a はまだ実行中です。先に終了させてください</span></code></pre>
+      <p><code>Cleanup</code> の 1 行目の <code>if st.IsAlive()</code> がここで効いています。そして先頭に <code>mydocker:</code> が付いているのは、Step 1 で見た <code>main</code> の「普通のエラー」の経路を通ったからです（<code>ExitError</code> ではないので、メッセージが表示され、終了コードは 1 になります）。</p>
+      <p>この検査があるおかげで、<strong>実行中のコンテナに対して <code>rm</code> が走り、<code>umount</code> が <code>EBUSY</code> で失敗し、それでも削除に進んでイメージが消える</strong>——という最悪の連鎖が、いちばん手前で止まります。E2E テストは、この拒否のあとに<strong>イメージの実体が無事であること</strong>まで確認しています。</p>
+    </div>
+
+    <h2 class="step" id="step-8"><span class="step-no">Step 8</span>リークを数えて確かめる</h2>
+
+    <p>後片付けのコードを書きました。<strong>では、それが本当に効いていることを、どうやって確かめますか?</strong></p>
+
+    <p>これは真面目な問いです。片付けのコードは、正常系では「何も起きない」ことが正解です。何も起きないものをテストするのは難しい。しかも——</p>
+
+    <div class="box hazard"><div class="box-k">⚠ 落とし穴 · マウントのリークは静かに進行する</div>
+      <p>コンテナを 1 回起動して、1 個マウントが残った。これに気づく人はいません。<strong>何も壊れないから</strong>です。ディスクも減りません（overlay のマウント自体は容量を食わない）。エラーメッセージも出ません。<code>mydocker ps</code> にも出ません。</p>
+      <p>10 回起動して 10 個残っても、まだ何も起きません。100 回でも動きます。</p>
+      <p>症状が出るのは、ずっと後です。<code>/proc/mounts</code> が肥大してマウント操作が遅くなる。ディレクトリが削除できなくなる。<code>upper</code> に溜まった書き込みが解放されずディスクが埋まる。そのとき初めて「何かおかしい」となりますが、<strong>原因が「3 週間前から少しずつ漏れていたマウント」だと突き止めるのは、ほぼ不可能です。</strong></p>
+      <p>だから、<strong>症状が出るのを待ってはいけません。数えるのです。</strong>「10 回起動して 10 個残っていないか」を、コードを書いた直後に、実数で確かめる。これが唯一まともな検査方法です。</p>
+      <p>同じ理屈が cgroup ディレクトリにも当てはまります。実際、この実装では「葉（<code>.../mydocker/&lt;ID&gt;</code>）は消えているのに、親の <code>.../mydocker/</code> が残り続けていた」というリークを、数えることで発見しました。「配下にディレクトリが残っていない」というテストは通っていたのに、です。</p>
+    </div>
+
+    <p>数えるための道具は、第06章で作ってありました。<code>overlay.CountMounts</code> です。</p>
+
+    <div class="file-tag">internal/overlay/overlay.go — CountMounts（再掲）</div>
+<pre><code><span class="cm">// CountMounts は /proc/mounts に現れる、指定の種類のマウント数を数える。</span>
+<span class="cm">// 「10回起動して10個残っていないか」を数えて確かめるために使う。</span>
+<span class="kw">func</span> <span class="ty">CountMounts</span>(fstype <span class="kw">string</span>) (<span class="kw">int</span>, <span class="kw">error</span>) {
+	b, err := os.<span class="ty">ReadFile</span>(<span class="st">"/proc/mounts"</span>)
+	<span class="kw">if</span> err != <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>, err
+	}
+	n := <span class="st">0</span>
+	<span class="kw">for</span> _, line := <span class="kw">range</span> strings.<span class="ty">Split</span>(<span class="kw">string</span>(b), <span class="st">"\n"</span>) {
+		f := strings.<span class="ty">Fields</span>(line)
+		<span class="kw">if</span> <span class="kw">len</span>(f) &gt;= <span class="st">3</span> &amp;&amp; f[<span class="st">2</span>] == fstype {
+			n++
+		}
+	}
+	<span class="kw">return</span> n, <span class="kw">nil</span>
+}</code></pre>
+
+    <p><code>/proc/mounts</code> の各行は「デバイス マウント先 種類 オプション …」という並びです。3 番目（<code>f[2]</code>）が種類なので、そこが <code>overlay</code> の行を数えればいい。第06章で見た、<code>mydocker</code> が実際に作る行はこうでした。</p>
+
+<pre class="term"><code><span class="ps">$</span> cat /proc/mounts
+<span class="out">overlay /var/lib/mydocker/containers/a10f2703bb37/merged overlay rw,relatime,lowerdir=/var/lib/mydocker/layers/sha256_55afa1ecc21d2bb5e5045f32dafee56272ffd89860bac26f6c32123439af26a4,upperdir=/var/lib/mydocker/containers/a10f2703bb37/upper,workdir=/var/lib/mydocker/containers/a10f2703bb37/work 0 0</span></code></pre>
+
+    <p>3 番目のフィールドが <code>overlay</code>。この行が 1 コンテナにつき 1 本現れ、片付いたら消えるはずです。</p>
+
+    <p>この関数を <code>mydocker info</code> に繋いであります。</p>
+
+    <div class="file-tag">internal/cli/cli.go — cmdInfo</div>
+<pre><code><span class="kw">func</span> cmdInfo([]<span class="kw">string</span>) <span class="kw">error</span> {
+	fmt.<span class="ty">Printf</span>(<span class="st">"状態の置き場: %s\n"</span>, container.<span class="ty">Root</span>)
+	fmt.<span class="ty">Printf</span>(<span class="st">"資源制限:     %s\n"</span>, cgroup.<span class="ty">Describe</span>())
+	fmt.<span class="ty">Printf</span>(<span class="st">"overlayfs:    %s\n"</span>, yesNo(overlay.<span class="ty">Supported</span>()))
+	<span class="kw">if</span> n, err := overlay.<span class="ty">CountMounts</span>(<span class="st">"overlay"</span>); err == <span class="kw">nil</span> {
+		<span class="cm">// ★マウントのリークは静かに進行する。件数を実数で出しておけば、</span>
+		<span class="cm">//   コンテナを何度も起動したあとにこの数が増え続けていないかを目視できる。</span>
+		fmt.<span class="ty">Printf</span>(<span class="st">"overlay 数:   %d 件\n"</span>, n)
+	}
+	list, _ := container.<span class="ty">List</span>()
+	fmt.<span class="ty">Printf</span>(<span class="st">"実行中:       %d 件\n"</span>, <span class="kw">len</span>(list))
+	<span class="kw">return</span> <span class="kw">nil</span>
+}
+
+<span class="kw">func</span> yesNo(b <span class="kw">bool</span>) <span class="kw">string</span> {
+	<span class="kw">if</span> b {
+		<span class="kw">return</span> <span class="st">"利用可能"</span>
+	}
+	<span class="kw">return</span> <span class="st">"利用不可"</span>
+}</code></pre>
+
+    <p>これが Step 1 で見た <code>mydocker info</code> の 4 行目、<code>overlay 数:   0 件</code> の正体です。<strong>「利用可能／利用不可」ではなく、実数で出す</strong>ことに意味があります。</p>
+
+    <p>使い方は簡単です。<strong>作業を始める前に <code>mydocker info</code> を打って数を控え、ひとしきり遊んだ後にもう一度打つ。</strong>数が戻っていれば漏れていません。増えていれば漏れています。それだけで、静かに進行するリークが<strong>目に見えるもの</strong>になります。</p>
+
+    <p>E2E テストは、これを自動でやっています。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>E2E テストの「後片付けとリーク」の節を走らせた結果です。</p>
+      <pre class="term"><code><span class="ps">$</span> python3 e2e_test.py
+<span class="out">== 8. 後片付けとリーク (FR-10) ==
+  OK   10 回連続で起動・終了してもすべて成功する（実数で確認: 10/10 件成功）
+  OK   10 回起動しても overlay のマウント数が増えない（前 0 件 → 後 0 件）
+  OK   テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）
+
+RESULT: 56 passed, 0 failed</span></code></pre>
+      <p>3 行それぞれが違うことを見ています。</p>
+      <ul>
+        <li><strong>1 行目</strong>は「10 回とも成功した」。<code>10/10 件成功</code> と実数で書いてあるのは、<code>ps</code> の <code>合計 N 件</code> と同じ理由です。0 回しか走らなくても緑になる、を防ぎます</li>
+        <li><strong>2 行目</strong>が今回の主役。<strong>10 回起動する前と後で overlay のマウント数を数え、<code>0 件 → 0 件</code> と一致した。</strong>1 回でも漏れていたら <code>0 件 → 1 件</code> になり、そこで落ちます</li>
+        <li><strong>3 行目</strong>はもっと広い網です。overlay に限らず、<strong>ホストのマウント表全体の行数</strong>をテストの最初と最後で比べている。<code>開始 22 → 終了 22</code>。これは「<code>mydocker</code> がホストに何も置き土産をしていない」ことの証明です。overlay 以外の、たとえば <code>/proc</code> や <code>/dev</code> の貼り忘れも、この 1 行が捕まえます</li>
+      </ul>
+      <p>3 行目の網が広いのは意図的です。<strong>自分が想定した種類のリークしか数えていないテストは、想定外のリークを見逃します。</strong>だから「総数が元に戻ること」という、種類を問わない検査を最後に置いています。</p>
+    </div>
+
+    <p>この「前と後で数を比べる」という形は、地味ですがとても強力です。<strong>何を漏らすかを事前に知らなくても、漏れたことは分かる。</strong>ファイルディスクリプタでも、一時ファイルでも、プロセス数でも、同じ形が使えます。</p>
+
+    <h2 class="step" id="step-9"><span class="step-no">Step 9</span>強制終了された場合</h2>
+
+    <p>ここまでの後片付けは、すべて <code>mydocker</code> 自身が生きていることを前提にしていました。<code>Run</code> の最後で <code>cleanup</code> を呼ぶ。<code>rm</code> で <code>Cleanup</code> を呼ぶ。どちらも、<strong>コードが実行される機会がある</strong>から成り立ちます。</p>
+
+    <p>では——<strong><code>mydocker</code> 自身が <code>SIGKILL</code> されたら?</strong></p>
+
+    <p><code>SIGKILL</code>（<code>kill -9</code>）は捕まえられません。ハンドラを書くことも、<code>defer</code> を走らせることも、ログを残すこともできません。プロセスはその場で消えます。OOM killer が動いたときも、管理者が痺れを切らして <code>kill -9</code> を打ったときも同じです。</p>
+
+    <p>そのとき何が残るか。</p>
+
+    <div class="ascii">mydocker が SIGKILL されたときに残るもの
+
+  残るもの                                   残らないもの
+  ──────────────────────────────         ────────────────────
+  containers/&lt;ID&gt;/state.json                 コンテナのプロセス
+    └ pid が書いてある（そのプロセスは死んでいる）  └ 親が死ぬと道連れ
+  containers/&lt;ID&gt;/merged  ★マウントされたまま       （PID 1 が死ねば
+  containers/&lt;ID&gt;/upper                             名前空間ごと消える）
+  cgroup ディレクトリ
+
+  ★ この状態は「壊れている」わけではない。
+    ただ、片付けるべきものが片付いていないだけ。
+    → mydocker rm &lt;ID&gt; で回収できるようにしておく</div>
+
+    <p>ここで <code>mydocker</code> が取っている態度が、Step 5 で見た <code>List</code> のコメントです。もう一度読んでください。</p>
+
+    <div class="file-tag">internal/container/state.go — List のコメント（再掲）</div>
+<pre><code><span class="cm">// List は実行中のコンテナだけを返す。</span>
+<span class="cm">//</span>
+<span class="cm">// 死んだのに記録が残っているもの（mydocker 自身が強制終了された場合など）は</span>
+<span class="cm">// 一覧には出さないが、**勝手に消しもしない**。マウントが残っている可能性があり、</span>
+<span class="cm">// 確認せずに消すのが最も危険だからである。片付けは mydocker rm で明示的に行う。</span></code></pre>
+
+    <p>2 つのことを同時に言っています。</p>
+
+    <p><strong>1. 死んだものは <code>ps</code> に出さない。</strong>「実行中のコンテナを一覧する」コマンドなので、死んでいるものが混ざっていては嘘になります。<code>IsAlive()</code> が偽なら並べません。</p>
+
+    <p><strong>2. しかし勝手に消しもしない。</strong>ここが肝心です。「死んでいると分かったのだから、ついでに片付けてしまえばいいのでは?」と思うでしょう。<strong>それがいちばん危険です。</strong></p>
+
+    <p>理由は 2 つあります。</p>
+
+    <p>1 つ目。<strong><code>ps</code> は「見るだけ」のコマンドだと誰もが思っている</strong>から。読み取り専用のつもりで打ったコマンドが、裏でディスクを消していたら、それは道具として信用できません。<em>問い合わせるコマンドは、状態を変えない。</em></p>
+
+    <p>2 つ目。<strong>マウントが残っている可能性がある</strong>から。Step 7 でさんざん見たとおり、マウントされたまま削除に進むとイメージの実体まで消えます。それを <code>ps</code> の副作用として、利用者が何も知らないうちにやるなど、あり得ません。</p>
+
+    <p>だから <code>mydocker</code> は「見えないが、そこにある」という状態を許容します。片付けは <code>mydocker rm &lt;ID&gt;</code> で<strong>人間が明示的に指示したときだけ</strong>行う。そして <code>rm</code> は Step 7 の順序を守るので、安全に回収できます。</p>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p><code>mydocker</code> 自身を <code>SIGKILL</code> して残骸を作り、それを <code>rm</code> で回収した実際の記録です。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker ps
+<span class="out">CONTAINER ID   IMAGE   COMMAND   PID   STATUS   CREATED
+合計 0 件</span>
+<span class="ps">$</span> mount | grep -c overlay
+<span class="out">1</span>
+<span class="ps">$</span> mydocker rm f280be2460e3
+<span class="out">f280be2460e3</span>
+<span class="ps">$</span> mount | grep -c overlay
+<span class="out">0</span></code></pre>
+      <p>この 4 手をよく見てください。</p>
+      <ol>
+        <li><code>mydocker ps</code> は <strong><code>合計 0 件</code></strong>。実行中のコンテナは無い、と正しく答えています</li>
+        <li>しかし <code>mount</code> を数えると <strong>overlay が 1 個残っている</strong>。<code>ps</code> が嘘をついているのではありません。「実行中ではないが、片付いてもいない」ものが 1 つあるだけです</li>
+        <li><code>mydocker rm f280be2460e3</code> で回収。片付けた ID が出力されます</li>
+        <li>もう一度数えると <strong>0 個</strong>。マウントが外れ、ディレクトリも消えました</li>
+      </ol>
+      <p>2 と 3 の間が、この設計の要です。<strong>残骸は残るが、残骸だと分かる形で残り、明示的な指示で安全に回収できる。</strong>これが「勝手に消さない」の見返りです。</p>
+      <p>なお、残骸の ID は <code>ls /var/lib/mydocker/containers/</code> で見つけられます。<code>ps</code> に出ないものを探すには、記録そのものを見るのがいちばん確実です。</p>
+    </div>
+
+    <p>ここで 1 つ、正直に書いておきます。<strong>本物の <code>docker</code> は、この問題をもっと大掛かりに解いています。</strong>常駐するデーモン（<code>dockerd</code>）が全体を見張り、起動時に前回の残骸を検出して回収する仕組みを持っています。<code>mydocker</code> にはデーモンがなく、コマンドを打ったときにだけ動きます。だから「起動時に自動回収」ができません。</p>
+
+    <p>それでも <code>rm</code> で回収できるようにしてあること、そして「残骸が残る場合がある」ことを隠さず書いてあることが、この設計の誠実さです。<strong>できないことを黙って隠すと、それは利用者が踏む地雷になります。</strong></p>
+
+    <h2 class="step" id="step-10"><span class="step-no">Step 10</span>終了コードの翻訳</h2>
+
+    <p>道具として最後に必要なのが、<strong>終了コードを正しく伝えること</strong>です。Step 1 で <code>ExitError</code> を作ったのは、この準備でした。</p>
+
+    <p>実装中に、こういう問題に当たりました。<strong>メモリ上限で殺されたコンテナの終了コードが <code>255</code> になっていた</strong>のです。</p>
+
+    <p>原因は Go の <code>ExitError.ExitCode()</code> の仕様です。<strong>シグナルで殺された場合、この関数は <code>-1</code> を返します。</strong>「終了コードなど無い（シグナルで死んだのだから）」という意味で、これは正しい設計です。しかし、その <code>-1</code> をそのまま <code>os.Exit</code> に渡すと——<code>os.Exit</code> は下位 8 ビットしか使わないので——<strong><code>255</code> になります</strong>。</p>
+
+    <p><code>255</code> では何も伝わりません。「OOM で殺された」のか「単にコマンドが 255 を返した」のか、区別がつかない。E2E テストも、この値では「上限が効いた」ことを検査できません。</p>
+
+    <p>シェルには昔からの慣習があります。<strong>シグナル <code>N</code> で死んだプロセスの終了コードは <code>128 + N</code> とする。</strong><code>bash</code> も <code>sh</code> もこうしています。</p>
+
+    <table>
+      <tr><th>終了コード</th><th>意味</th><th>由来</th></tr>
+      <tr><td><code>0</code></td><td>正常終了</td><td>—</td></tr>
+      <tr><td><code>1</code>〜<code>125</code></td><td>コマンド自身が返した終了コード</td><td>—</td></tr>
+      <tr><td><code>130</code></td><td>Ctrl-C で中断された</td><td>128 + 2（SIGINT）</td></tr>
+      <tr><td><code>137</code></td><td><strong>強制終了された（OOM kill を含む）</strong></td><td>128 + 9（SIGKILL）</td></tr>
+      <tr><td><code>143</code></td><td>終了を要求されて終わった</td><td>128 + 15（SIGTERM）</td></tr>
+    </table>
+
+    <p>この翻訳を行うのが <code>exitCode</code> です。</p>
+
+    <div class="file-tag">internal/container/run.go — exitCode</div>
+<pre><code><span class="cm">// exitCode は子プロセスの終了状況をシェルの終了コードに翻訳する。</span>
+<span class="cm">//</span>
+<span class="cm">// ⚠ シグナルで殺されたプロセスの ExitCode() は -1 を返す。これをそのまま os.Exit に渡すと</span>
+<span class="cm">// 255 になり、「OOM で殺された」ことが利用者に伝わらない。</span>
+<span class="cm">// シェルの慣習に合わせて 128+シグナル番号 を返す（OOM kill なら SIGKILL(9) で 137）。</span>
+<span class="kw">func</span> exitCode(err <span class="kw">error</span>) <span class="kw">int</span> {
+	<span class="kw">if</span> err == <span class="kw">nil</span> {
+		<span class="kw">return</span> <span class="st">0</span>
+	}
+	<span class="kw">var</span> ee *exec.<span class="ty">ExitError</span>
+	<span class="kw">if</span> errors.<span class="ty">As</span>(err, &amp;ee) {
+		<span class="kw">if</span> ws, ok := ee.<span class="ty">Sys</span>().(syscall.<span class="ty">WaitStatus</span>); ok &amp;&amp; ws.<span class="ty">Signaled</span>() {
+			<span class="kw">return</span> <span class="st">128</span> + <span class="kw">int</span>(ws.<span class="ty">Signal</span>())
+		}
+		<span class="kw">return</span> ee.<span class="ty">ExitCode</span>()
+	}
+	<span class="kw">return</span> <span class="st">1</span>
+}</code></pre>
+
+    <p><code>ee.Sys()</code> は OS 固有の生の終了状態を返します。Linux では <code>syscall.WaitStatus</code>。これに対して <code>Signaled()</code> を聞けば「シグナルで死んだか」が、<code>Signal()</code> を聞けば「どのシグナルか」が分かります。</p>
+
+    <p>シグナルで死んだなら <code>128 + シグナル番号</code>。そうでなければ普通の終了コード。<code>*exec.ExitError</code> ですらない（＝そもそも起動に失敗したような）エラーなら <code>1</code>。</p>
+
+    <p>そしてこの数値が <code>cmdRun</code> で <code>&amp;ExitError{Code: code}</code> に包まれ、<code>main</code> の <code>errors.As</code> で取り出され、<code>os.Exit(ee.Code)</code> で利用者に届きます。<strong>Step 1 で「なぜ <code>ExitError</code> が要るのか」と言っていた話が、ここで一周して閉じます。</strong></p>
+
+    <div class="ascii">終了コードが利用者に届くまで
+
+  コンテナの中のコマンドが SIGKILL で死ぬ
+      ↓
+  cmd.Wait() が *exec.ExitError を返す（ExitCode() は -1）
+      ↓
+  exitCode(err)
+      ├ ws.Signaled() → true
+      └ 128 + 9 = 137 を返す
+      ↓
+  container.Run が (137, nil) を返す
+      ↓
+  cmdRun: code != 0 なので &amp;ExitError{Code: 137} を返す
+      ↓
+  main: errors.As で拾って os.Exit(137)
+      ↓
+  $ echo $?
+  137        ← 利用者に「強制終了された」と伝わる</div>
+
+    <div class="box do"><div class="box-k">▸ 動かして確認</div>
+      <p>第04章の対照実験をもう一度、今度は<strong>終了コードだけを見るつもりで</strong>打ってみてください。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="out">1+0 records in
+1+0 records out
+104857600 bytes (100.0MB) copied, 0.047161 seconds, 2.1GB/s</span>
+<span class="ps">$</span> echo $?
+<span class="out">0</span>
+
+<span class="ps">$</span> mydocker run --quiet --memory 10m alpine /bin/sh -c 'dd if=/dev/zero of=/dev/null bs=100M count=1'
+<span class="ps">$</span> echo $?
+<span class="out">137</span></code></pre>
+      <p>上限なしなら <code>0</code>、10MB の上限をかけると <code>137</code>。しかも 2 つ目は<strong>何も出力せずに</strong>終わっています（<code>dd</code> がバッファを確保しようとした瞬間に殺されたので）。</p>
+      <p>もしこの <code>137</code> が <code>255</code> のままだったら、E2E テストの「<code>OK   上限超過が OOM による強制終了として報告される (exit 137)</code>」という検査は書けませんでした。<strong>正しい終了コードは、道具としての作法であると同時に、テストが検査できる形をつくることでもあります。</strong></p>
+    </div>
+
+    <h2 class="step" id="step-11"><span class="step-no">Step 11</span>dead code の検査</h2>
+
+    <p>最後に、この章を書き終えた後にやった検査の話をします。教材の本筋からは少し外れますが、<strong>「道具にする」という章の締めくくりとしては、これがいちばん大事かもしれません。</strong></p>
+
+    <p>問いはこうです。<strong>「実装した」と言えるのはどういう状態か?</strong></p>
+
+    <p>関数を書いた。ビルドが通る。テストも書いて、通った。——これで実装済みでしょうか。</p>
+
+    <p>違います。<strong>CLI から呼ばれていない機能は、利用者にとって存在しないのと同じです。</strong>要件が「イメージの <code>WorkingDir</code> をコンテナに反映する」なら、その値をレジストリから読んでいるだけでは<strong>要件未達</strong>です。読んだ値がコンテナの <code>chdir</code> まで届いていなければ、利用者は何も得ていません。</p>
+
+    <p>そこで、コマンドの入口から末端まで経路を辿って確認しました。<strong>3 か所見つかりました。</strong></p>
+
+    <table>
+      <tr><th>見つかったもの</th><th>状態</th><th>対処</th></tr>
+      <tr><td><code>container.DefaultBase</code></td><td>定義しただけで誰も呼ばない</td><td><strong>削除</strong></td></tr>
+      <tr><td><code>State.Base</code></td><td><code>state.json</code> に書いているが<strong>誰も読まない</strong></td><td><strong>削除</strong>（<code>ID</code> から導出できる）</td></tr>
+      <tr><td><code>overlay.CountMounts</code></td><td>定義しただけ</td><td><strong><code>mydocker info</code> に接続</strong>（overlay の件数を実数で表示。リークの目視に使える）</td></tr>
+      <tr><td><code>image.Image.WorkingDir</code></td><td>レジストリから読んでいるが<strong>コンテナに反映していなかった</strong></td><td><strong>実装</strong>（<code>init</code> に位置引数で渡し、<code>pivot_root</code> 後に <code>chdir</code>）</td></tr>
+    </table>
+
+    <p>4 行あるのは、<code>State.Base</code> と <code>DefaultBase</code> が対で見つかったからです。それぞれ性質が違うので、対処も違います。</p>
+
+    <p><strong><code>DefaultBase</code> と <code>State.Base</code> は削除しました。</strong>使われていない定数とフィールドです。<code>State.Base</code> のほうは <code>state.json</code> にも書き出されていたので、<em>読む人にとっては「何か意味がある値」に見えてしまう</em> のがたちが悪い。<code>ID</code> から <code>stateDir(id)</code> で導出できるものを二重に持っていただけでした。<strong>導出できるものを持たない</strong>——Step 3 で書いた方針の実践です。</p>
+
+    <p><strong><code>overlay.CountMounts</code> は繋ぎました。</strong>これは削除の候補でもありました。使われていないのだから消してもいい。しかし、この関数が数えているのは<strong>まさにこの章で問題にしているリーク</strong>です。消すのではなく、<code>mydocker info</code> の <code>overlay 数:   %d 件</code> に繋いだ。Step 8 で見たあの行は、この検査から生まれたものです。<strong>dead code の発見が、機能の追加につながった</strong>珍しい例でした。</p>
+
+    <p><strong><code>Image.WorkingDir</code> は実装しました。</strong>これがいちばん深刻でした。レジストリからイメージ設定を読み、<code>WorkingDir</code> フィールドに格納するところまではできていた。しかし<strong>その値がコンテナに届いていなかった</strong>のです。<code>Dockerfile</code> に <code>WORKDIR /app</code> と書かれたイメージを動かしても、コンテナは <code>/</code> で起動していました。</p>
+
+    <p>ビルドは通ります。テストも（<code>WorkingDir</code> を検査していなければ）通ります。<strong>そして機能は存在しません。</strong></p>
+
+    <p>直した経路がこれです。<code>cmdRun</code> が <code>cfg.Workdir = img.WorkingDir</code> で設定に入れ、<code>Run</code> が <code>orSlash(cfg.Workdir)</code> として <code>init</code> に位置引数で渡し、<code>Init</code> が <code>pivot_root</code> のあとで <code>chdir</code> する。<strong>入口から末端まで、切れ目なく繋がってはじめて「実装した」</strong>と言えます。</p>
+
+    <div class="gonote"><div class="box-k">GO メモ · <code>go vet</code> は未使用の関数を検出しない</div>
+      <p>「そんなものはコンパイラが教えてくれるのでは?」と思うかもしれません。Go は未使用の<strong>ローカル変数</strong>や未使用の<strong>import</strong> をコンパイルエラーにする、厳しめの言語です。</p>
+      <p>しかし——<strong>未使用の関数・メソッド・型・定数・構造体フィールドは、エラーにも警告にもなりません。</strong><code>go vet</code> も教えてくれません。</p>
+      <p>理由は明快です。Go にはパッケージという単位があり、<strong>エクスポートされた関数は「まだ誰も呼んでいないだけで、外から呼ばれるかもしれない」</strong>からです。ライブラリを書いている場合、パッケージ内から呼ばれていない公開関数はごく普通に存在します。コンパイラにはそれが「ライブラリの API」なのか「消し忘れ」なのか区別できません。</p>
+      <p>だから、この検査は自分でやるしかありません。<code>mydocker</code> では、関数名を全ファイルで数える素朴な走査を使いました。</p>
+      <pre><code>for sym in $(grep -rhoP '^func (\([^)]*\) )?\K[A-Za-z_][A-Za-z0-9_]*' --include=*.go .|sort -u); do
+  n=$(grep -rho "\b$sym\b" --include=*.go . | wc -l)
+  [ "$n" -le 1 ] &amp;&amp; echo "UNUSED?: $sym"
+done</code></pre>
+      <p>「定義の行以外にその名前が 1 度も出てこない関数」を探しているだけです。<code>UNUSED?</code> と疑問符が付いているのは、これが<strong>候補を挙げるだけ</strong>のものだから。テストからだけ呼ばれる関数や、リフレクション経由で使われるものは誤検出します。<strong>最終的な判断は人間がします。</strong></p>
+      <p>もっと賢い道具（<code>staticcheck</code> の <code>U1000</code> など）もありますが、この教材は外部ツールに依存しない方針なので、<code>grep</code> 2 行で済ませました。<strong>粗くても、やらないよりはるかにましです。</strong></p>
+    </div>
+
+    <p>この検査から得た教訓を、一般化して書いておきます。</p>
+
+    <ul>
+      <li><strong>「実装済み・テスト通過」は「要件達成」ではない。</strong>利用者の入口から末端まで経路が繋がっているかを、要件ごとに辿る</li>
+      <li><strong>使われていないコードは、消すか繋ぐかの二択。</strong>放置は「あとで使うかもしれない」という名の負債です。読む人を毎回迷わせます</li>
+      <li><strong>コンパイラが教えてくれる範囲を過信しない。</strong>Go は厳しい言語ですが、厳しいのは関数の<em>内側</em>だけです</li>
+    </ul>
+
+    <h2>つまずき FAQ</h2>
+
+    <details class="qa"><summary><code>state.json</code> をファイルに置くと、複数の <code>mydocker</code> が同時に走ったとき壊れませんか?</summary>
+      <div class="qa-body">
+        <p>いい着眼点です。結論から言うと、<strong>この実装は完全な排他制御をしていません</strong>。ただし、壊れにくい形にはなっています。</p>
+        <p>まず、コンテナ ID は 6 バイトの乱数から作るので、別々の <code>mydocker run</code> が同じ <code>containers/&lt;ID&gt;/</code> を触ることは実質ありません。<strong>書き込み先が最初から分かれている</strong>ので、同時に <code>run</code> を打っても互いの記録を壊しません。</p>
+        <p>危ないのは「同じ ID に対して <code>rm</code> と <code>exec</code> を同時に打つ」ような場合です。<code>Cleanup</code> が <code>IsAlive()</code> を確認した直後にコンテナが起動して…といった隙間は理屈の上では存在します。本物の <code>docker</code> はデーモンが 1 つだけ状態を握ることでこれを避けています。</p>
+        <p><code>mydocker</code> にデーモンを持ち込まなかったのは、<strong>この教材で説明したいものがカーネルの機能であって、分散状態管理ではないから</strong>です。ロックファイル（<code>flock(2)</code>）を 1 枚挟むだけでもかなり改善するので、手を動かしたい人にはよい練習課題になります。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>ps</code> で「死んでいるが残っているもの」も一覧に出してくれたほうが親切では? <code>docker ps -a</code> みたいに。</summary>
+      <div class="qa-body">
+        <p>親切です。実際、<code>docker</code> はそうしています。この実装がそうしていないのは、<strong>機能を絞ったから</strong>で、原理的な理由ではありません。</p>
+        <p>ただ、もし追加するなら気をつけるべき点があります。<strong>「死んでいるものを表示する」ことと「死んでいるものを片付ける」ことを、絶対に同じコマンドでやらない</strong>ことです。</p>
+        <p>Step 9 で書いたとおり、<code>ps</code> は「見るだけ」のコマンドだと誰もが思っています。そこに削除の副作用を混ぜると、うっかり打った <code>ps</code> がイメージを壊す可能性を生みます。<strong>問い合わせるコマンドは状態を変えない</strong>——これは守ったほうがいい線です。</p>
+        <p>実装するなら <code>mydocker ps -a</code> のように別のオプションにして、<code>STATUS</code> 列を <code>Up</code> / <code>Exited</code> と出し分けるのが素直でしょう。<code>State</code> に終了時刻や終了コードを足す必要も出てきます。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>exec</code> のマウント名前空間の割り切りって、結局どこで困るんですか? 実害が無いなら気にしなくていいのでは。</summary>
+      <div class="qa-body">
+        <p>「日常的な使い方では困らない」が正確なところです。困る場面を具体的に挙げてみます。</p>
+        <ul>
+          <li><strong>コンテナ本体が起動後に自分でマウントをした場合。</strong>たとえばコンテナの中のプロセスが <code>mount -t tmpfs</code> を実行したとします。そのマウントはコンテナ本体のマウント名前空間にできるので、<code>exec</code> で入ったプロセスからは<strong>見えません</strong>。<code>docker exec</code> なら見えます</li>
+          <li><strong><code>exec</code> の中でマウントをした場合。</strong>逆も同じで、<code>exec</code> 側で行ったマウントはコンテナ本体からは見えません</li>
+          <li><strong><code>/proc/self/mounts</code> の中身が違う。</strong>マウント表そのものを見ると、本体と <code>exec</code> 側で違うものが並びます</li>
+        </ul>
+        <p>逆に言えば、それ以外は同一です。<strong>ファイルの読み書きは完全に同じものを見ています</strong>（同じ overlay の <code>merged</code> が根なので）。プロセス一覧もホスト名も本物です。</p>
+        <p>「気にしなくていいか」については、<strong>気にしなくていいが、知っておくべき</strong>と答えます。境界を知らずに使うと、いつか原因不明の挙動として跳ね返ってきます。だから <code>README.md</code> の「既知の割り切り」に書いてあります。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>umount</code> が失敗したまま <code>MNT_DETACH</code> で外すのは、乱暴じゃないですか?</summary>
+      <div class="qa-body">
+        <p>乱暴です。だから<strong>一度だけ</strong>しか試しません。</p>
+        <p><code>MNT_DETACH</code> は「今すぐマウント表から切り離す。ただし実際の解放は、まだ使っている人がいなくなってから」という遅延アンマウントです。使用中でも成功します。</p>
+        <p>これが安全なのは、<strong>「その場所からは確実に見えなくなる」</strong>からです。<code>MNT_DETACH</code> が成功すれば、<code>containers/&lt;ID&gt;/merged</code> はもうただの空ディレクトリです。<code>RemoveAll</code> しても、下層のイメージには届きません。私たちが恐れていた事故は起きません。</p>
+        <p>そしてそのあと、<code>IsMountPoint</code> で<strong>本当に外れたかを確認します</strong>。ここで外れていなければエラーにして削除に進まない。<code>MNT_DETACH</code> は「最後の手段だが、確認は省かない」という位置づけです。</p>
+        <p>本当に乱暴なのは、失敗を握りつぶして削除に進むことのほうです。<code>MNT_DETACH</code> はそれを避けるための手段であって、手抜きではありません。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>今のコンテナは、ネットワークも隔離されているんですか?</summary>
+      <div class="qa-body">
+        <p><strong>されていません。</strong>ここははっきり書いておきます。</p>
+        <p>第01章で <code>Cloneflags</code> に並べたのは <code>CLONE_NEWUTS</code>・<code>CLONE_NEWPID</code>・<code>CLONE_NEWNS</code>・<code>CLONE_NEWIPC</code> の 4 つでした。<strong><code>CLONE_NEWNET</code> がありません。</strong>つまりコンテナは、ホストのネットワーク名前空間を<strong>そのまま共有しています</strong>。</p>
+        <p>確かめるのは簡単です。</p>
+        <pre class="term"><code><span class="ps">$</span> mydocker run --quiet alpine /bin/sh -c 'ip -o addr'
+<span class="out">1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+2: eth0    inet 192.0.2.2/24 brd 192.0.2.255 scope global eth0\       valid_lft forever preferred_lft forever</span></code></pre>
+        <p>この <code>eth0</code> の <code>192.0.2.2/24</code> は<strong>ホストのアドレスそのもの</strong>です。コンテナから見ているのはホストの網です。ポートを開けばホストのポートが開き、ホストが見える先はすべて見えます。</p>
+        <p>これは <code>docker run --network host</code> に相当する状態で、隔離としては明らかに不完全です。<strong>なぜ実装しなかったのか、実装するなら何が必要なのかは、まるごと次章の主題です。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary><code>mydocker info</code> の「overlay 数」は、他のプログラムが作った overlay も数えてしまいませんか?</summary>
+      <div class="qa-body">
+        <p>数えます。<code>CountMounts("overlay")</code> は <code>/proc/mounts</code> の 3 番目のフィールドが <code>overlay</code> の行を全部数えるので、<code>docker</code> が動いていればその分も入ります。</p>
+        <p>それでも構わない、という判断です。この数字の使い方は<strong>「作業の前と後で比べる」</strong>だからです。前後で他のプログラムが overlay を増減させていなければ、差分は <code>mydocker</code> の分だけになります。</p>
+        <p>厳密にやるなら、マウント先のパスが <code>/var/lib/mydocker/containers/</code> で始まる行だけを数えればいい。実際 E2E テストは、それに近いことをしています。</p>
+        <p><code>info</code> のほうを素朴なままにしてあるのは、<strong>この数字が「絶対値としての正しさ」ではなく「増えていないこと」を見るためのもの</strong>だからです。目的に対して必要十分なら、それ以上作り込まないというのも設計の一部です。</p>
+      </div>
+    </details>
+
+    <h2>理解度チェック</h2>
+    <p>次の問いに自分の言葉で答えてから、答えを開いてください。答えを見て「知っていた」と思えるかではなく、<strong>先に自分で言葉にできるか</strong>が分かれ目です。</p>
+
+    <details class="qa"><summary>Q1. <code>/proc/&lt;pid&gt;</code> が存在すれば「そのコンテナは生きている」と言えないのはなぜですか? どうすれば言えるようになりますか?</summary>
+      <div class="qa-body">
+        <p><strong>PID は再利用されるから</strong>です。プロセスが終わるとその番号は空き番号に戻り、番号が一周すると別のプロセスに配られます。終了したコンテナの PID がたまたま別のプロセスに割り当てられると、<code>/proc/&lt;pid&gt;</code> は存在するので「まだ生きている」と誤判定します。</p>
+        <p>この誤判定は 3 つの形で現れます。<code>ps</code> に幽霊が出る。<code>rm</code> が「まだ実行中です」と言って拒否する。<strong>結果として、片付けたくても永久に片付けられなくなる。</strong></p>
+        <p>解決は、<strong>PID と一緒に起動時刻を記録し、両方が一致したときだけ生存とみなす</strong>ことです。起動時刻は <code>/proc/&lt;pid&gt;/stat</code> の 22 番目のフィールドにあります。PID と起動時刻の組は事実上一意なので、これで別人を確実に見分けられます。</p>
+        <p><code>mydocker</code> では <code>State.StartTime</code> に記録し、<code>IsAlive()</code> が <code>st.startTime != s.StartTime</code> を見ています。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q2. <code>/proc/&lt;pid&gt;/stat</code> を空白で分割して 22 番目を取ってはいけないのはなぜですか?</summary>
+      <div class="qa-body">
+        <p><strong>2 番目のフィールドがコマンド名で、そこに空白や丸括弧が入り得るから</strong>です。コマンド名は丸括弧で包まれていますが、その中身は自由です。<code>(my prog)</code> のように空白が入れば、素朴に空白で分割したときにフィールドの位置が 1 つずれます。</p>
+        <p>ずれた位置から読んだ数値は、まったく別の意味の数です。<strong>エラーにならず、静かに間違った値が返ります。</strong>だから、この誤りは気づきにくい。</p>
+        <p>定石は、<strong>行の最後の <code>)</code> を探して、その先だけを空白で分割する</strong>ことです。3 番目以降のフィールドには括弧が出てこないので、最後の <code>)</code> は必ずコマンド名の閉じ括弧になります。</p>
+        <p>切った先を数え直すと <code>fields[0]</code> が元の 3 番目にあたるので、元の 22 番目は <code>fields[19]</code> です。<code>mydocker</code> の <code>readProcStat</code> はこれをやっています。</p>
+        <p>ついでに——これと同じ形の失敗を、この章でもう一度踏みました。<code>mydocker ps</code> の出力を <code>awk '{print $4}'</code> で解析して、<code>sleep 40</code> の <code>40</code> を掴んだ話です。<strong>「空白区切りは、値に空白が入った瞬間に壊れる」</strong>は覚えて帰ってください。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q3. 後片付けで「アンマウント → 削除」の順序を守り、しかも前者の失敗で止まらなければならないのはなぜですか? 守らないと何が消えますか?</summary>
+      <div class="qa-body">
+        <p><strong>イメージの実体が消えます。</strong></p>
+        <p><code>umount</code> は <code>EBUSY</code> で日常的に失敗します。プロセスが残っている、シェルの作業ディレクトリがその中にある——それだけで起きます。このとき失敗を無視して <code>os.RemoveAll(containers/&lt;ID&gt;/)</code> に進むと、その下の <code>merged/</code> は<strong>まだマウントされたまま</strong>です。</p>
+        <p><code>rm -rf</code> はマウントポイントを特別扱いしません。<code>merged/</code> の中を再帰的に辿って消そうとします。そこに見えているのは overlay 越しの <strong><code>lowerdir</code>、つまり展開済みのイメージレイヤそのもの</strong>です。共有資産なので、他のコンテナも巻き添えになります。</p>
+        <p>恐ろしいのは<strong>エラーが出ないこと</strong>です。プログラムは正常終了します。気づくのは次に <code>run</code> を打って「レイヤのディレクトリがありません」と言われたときです。</p>
+        <p><code>mydocker</code> は 3 つの関所で防いでいます。<code>Unmount()</code> が <code>IsMountPoint</code> で本当に外れたかを確認する。呼び出し元が失敗したらそこで <code>return</code> する。<code>RemoveRecord</code> が削除の直前にもう一度確認する。<strong>取り返しのつかない操作には二重の関所を置く。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q4. <code>exec</code> でマウント名前空間だけ新しく作るのはなぜですか? それで実害が無いと言えるのはなぜですか?</summary>
+      <div class="qa-body">
+        <p><strong>マウント名前空間への <code>setns(2)</code> は、呼び出し元がシングルスレッドでなければならない</strong>からです。マルチスレッドだと <code>EINVAL</code> で失敗します。そして <strong>Go のランタイムは常にマルチスレッド</strong>なので、cgo を使わずにこの条件は満たせません。<code>runc</code> はこの一点のために cgo で C のコンストラクタを書いています。</p>
+        <p>そこで <code>mydocker</code> は、PID / UTS / IPC には <code>setns</code> で参加し、<strong>マウントだけ <code>CLONE_NEWNS</code> で新しく作って、同じ <code>merged</code> を根にする</strong>という手を取りました。</p>
+        <p>実害が無いと言えるのは、<strong>根にしているのが同一の overlay の <code>merged</code> だから</strong>です。同じディレクトリを 2 つの名前空間から見ているだけなので、見えるファイルは完全に同一です。プロセス一覧もホスト名も本物の名前空間に参加しています。</p>
+        <p>ただし<strong>完全ではありません</strong>。コンテナ本体が起動後に自分でマウントをした場合、それは <code>exec</code> 側からは見えません。この割り切りは <code>README.md</code> の「既知の割り切り」に明記してあります。<strong>できていないことを、できているかのように書かない。</strong></p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q5. <code>mydocker ps</code> が末尾に <code>合計 N 件</code> を必ず出すのはなぜですか?</summary>
+      <div class="qa-body">
+        <p><strong>テストが空振りしても緑になるのを防ぐため</strong>です。</p>
+        <p>「コンテナを起動して <code>ps</code> に出ることを確かめる」というテストを、<code>grep</code> の成否だけで書いたとします。すると、<code>ps</code> の実装が壊れて 1 行も出さなくなっても、テストの側に「何件出るはずか」という期待値がなければ、<strong>0 件でも「失敗 0 件」で緑になります</strong>。</p>
+        <p>「何も起きなかった」と「正しく動いた」を、テストが区別できていない状態です。</p>
+        <p>そこで <code>ps</code> は必ず件数を実数で出し、テストはその数を読んで期待値と突き合わせます。<strong>0 件なら 0 件だと明示的に主張させる。</strong>同じ考え方が <code>mydocker info</code> の <code>overlay 数:   %d 件</code> や、E2E の <code>10/10 件成功</code> にも使われています。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q6. <code>mydocker</code> 自身が <code>SIGKILL</code> されて残った記録を、<code>ps</code> が勝手に片付けないのはなぜですか?</summary>
+      <div class="qa-body">
+        <p>理由は 2 つあります。</p>
+        <p>1 つ目。<strong><code>ps</code> は「見るだけ」のコマンドだと誰もが思っている</strong>から。読み取り専用のつもりで打ったコマンドが裏でディスクを消していたら、道具として信用できません。<em>問い合わせるコマンドは状態を変えない。</em></p>
+        <p>2 つ目。<strong>マウントが残っている可能性がある</strong>から。Q3 で見たとおり、マウントされたまま削除に進むとイメージの実体まで消えます。それを <code>ps</code> の副作用として、利用者が何も知らないうちにやるのは論外です。</p>
+        <p>そこで <code>mydocker</code> は「一覧には出さないが、勝手に消しもしない」という態度を取ります。片付けは <code>mydocker rm &lt;ID&gt;</code> で人間が明示的に指示したときだけ。<code>rm</code> は Step 7 の順序を守るので安全に回収できます。</p>
+        <p><strong>残骸は残るが、残骸だと分かる形で残り、明示的な指示で安全に回収できる。</strong>これが「勝手に消さない」の見返りです。</p>
+      </div>
+    </details>
+
+    <details class="qa"><summary>Q7. 「実装済み・テスト通過」でも要件未達になり得るのはなぜですか? <code>go vet</code> では見つからないのですか?</summary>
+      <div class="qa-body">
+        <p><strong>CLI から呼ばれていない機能は、利用者にとって存在しないのと同じ</strong>だからです。関数を書き、テストを書き、そのテストが通っても、<em>コマンドの入口から末端まで経路が繋がっていなければ</em>、利用者は何も得ていません。</p>
+        <p>実際に <code>mydocker</code> で 3 か所見つかりました。<code>container.DefaultBase</code> と <code>State.Base</code>（誰も読まないので削除）、<code>overlay.CountMounts</code>（<code>mydocker info</code> に接続）、そして <code>image.Image.WorkingDir</code>（レジストリから読んでいたのにコンテナに反映していなかったので実装）。</p>
+        <p><code>go vet</code> はこれを教えてくれません。Go は未使用の<strong>ローカル変数</strong>や<strong>import</strong> をエラーにしますが、<strong>未使用の関数・メソッド・型・定数・フィールドは検出しません</strong>。エクスポートされた関数は「まだ誰も呼んでいないだけで、外から呼ばれるかもしれない」からです。ライブラリとしては正当な状態なので、コンパイラには区別できません。</p>
+        <p>だから自分で検査します。<code>mydocker</code> では「定義の行以外にその名前が 1 度も出てこない関数」を <code>grep</code> で数える素朴な走査を使いました。粗いですが、やらないよりはるかにましです。</p>
+      </div>
+    </details>
+
+    <div class="box done"><div class="box-k">✓ 完了の合図</div>
+      <p>この章の完了は「動いた」ではなく<strong>「漏れていないことを数えて確かめた」</strong>で判定します。E2E テストの後片付けの節が、次のように緑になればこの章は完了です。</p>
+      <pre class="term"><code><span class="ps">$</span> python3 e2e_test.py
+<span class="out">== 7. 実行中コンテナの一覧 (FR-8) と追加コマンド実行 (FR-9) ==
+== 8. 後片付けとリーク (FR-10) ==
+  OK   10 回連続で起動・終了してもすべて成功する（実数で確認: 10/10 件成功）
+  OK   10 回起動しても overlay のマウント数が増えない（前 0 件 → 後 0 件）
+  OK   テスト全体を通してホストのマウント数が元に戻る（開始 22 → 終了 22）
+
+RESULT: 56 passed, 0 failed</span></code></pre>
+      <p>手で確かめるなら、作業の前後で <code>mydocker info</code> を打って <code>overlay 数</code> が同じ数に戻っていることを見てください。</p>
+      <pre class="term"><code><span class="ps">$</span> mydocker info
+<span class="out">状態の置き場: /var/lib/mydocker
+資源制限:     cgroup v1 (/sys/fs/cgroup, 利用可能: memory cpu pids)
+overlayfs:    利用可能
+overlay 数:   0 件
+実行中:       0 件</span></code></pre>
+    </div>
+
+    <h2>まとめ — 次の層へ</h2>
+
+    <p>この章で、<code>run</code> しかできなかったものが<strong>道具</strong>になりました。<code>mydocker ps</code> で今動いているものを<strong>一覧でき</strong>、<code>mydocker exec</code> で動いているものの<strong>中を覗け</strong>、<code>mydocker rm</code> で<strong>後片付けもできる</strong>。そのすべてを支えているのは、<code>/var/lib/mydocker/containers/&lt;ID&gt;/state.json</code> というただ 1 つの記録と、そこに書いた <strong>PID + 起動時刻</strong>という小さな工夫でした。そして本番は後片付けのほうでした。<strong>「アンマウント → 削除」の順序を崩さない。前者が失敗したら後者に進まない。</strong>この一線を守るために、<code>Unmount</code> の確認・呼び出し元の <code>return</code>・<code>RemoveRecord</code> の再確認という三重の関所を置きました。守らなければ、<code>umount</code> の <code>EBUSY</code> ひとつでイメージの実体が消えます。エラーも出さずに。さらに、片付いたことを<strong>数えて確かめる</strong>ところまでやりました。マウントのリークは静かに進行するので、症状が出るのを待っていては手遅れだからです。</p>
+
+    <p>しかし、このコンテナはまだ<strong>外とつながっていません</strong>。より正確に言えば、<strong>つながりすぎています</strong>。第01章で <code>Cloneflags</code> に並べたのは UTS・PID・MNT・IPC の 4 つで、<code>CLONE_NEWNET</code> がありません。つまり今のコンテナは<strong>ホストのネットワーク名前空間をそのまま共有している</strong>のです。コンテナの中で <code>ip addr</code> を打つと、ホストの <code>eth0</code> がそのまま見えます。アドレスもホストのものです。これは <code>docker run --network host</code> に相当する状態で、隔離としては明らかに穴が空いています。プロセスもファイルシステムもホスト名も区切ったのに、網だけが素通しになっている。ここまで積んできた 6 枚の層の上に、最後の 1 枚が乗っていない状態です。</p>
+
+    <p>次章はネットワークの話をします。ただし、先に正直に書いておきます。<strong>この教材ではネットワークを実装していません。</strong><code>src/internal/network/network.go</code> は存在しません。<code>CLONE_NEWNET</code> を足すだけなら 1 行ですが、それをやった瞬間にコンテナは<strong>外と一切通信できなくなります</strong>——新しいネットワーク名前空間には <code>lo</code> しかないからです。そこから使えるようにするには veth ペア・ブリッジ・IP アドレスの管理・NAT・ルーティングと、実装すべきものが一気に増えます。だから次章は「できたふり」をせず、<strong>なぜ着手しなかったのか、実装するなら何が必要になるのか、どこが難所なのか</strong>を地図として渡す章にしてあります。作らなかったものについて誠実に書くことも、道具を作ることの一部です。</p>
+
+    <div class="chap-foot">
+      <a class="pager" href="06-overlay.html"><span class="dir">← 前へ</span>第06章 · 層を重ねる</a>
+      <a class="pager next" href="08-network.html"><span class="dir">次へ →</span>第08章 · 外とつながる</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
